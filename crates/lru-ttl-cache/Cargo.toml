@@ -1,0 +1,14 @@
+[package]
+publish = false
+name = "lru-ttl-cache"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "Thread-safe LRU cache with ttl enforcement and async refresh support"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

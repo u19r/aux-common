@@ -1,0 +1,20 @@
+[package]
+publish = false
+name = "opt-loop-probe"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+mimalloc = "0.1.46"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[lints.rust]
+unsafe_code = "allow"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"

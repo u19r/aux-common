@@ -1,0 +1,686 @@
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use http::{HeaderMap, HeaderValue};
+use reqwest::{Method, Request, StatusCode, Url};
+use serde_json::json;
+
+use crate::{
+    HttpClientBuilder, HttpRequestError, HttpResponse, RetryConfig, Transport, TransportFuture,
+};
+
+struct SequenceTransport {
+    responses: Mutex<VecDeque<Result<HttpResponse, HttpRequestError>>>,
+}
+
+impl std::fmt::Debug for SequenceTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SequenceTransport(..)")
+    }
+}
+
+impl SequenceTransport {
+    fn from_responses(responses: Vec<Result<HttpResponse, HttpRequestError>>) -> Self {
+        Self {
+            responses: Mutex::new(VecDeque::from(responses)),
+        }
+    }
+}
+
+impl Transport for SequenceTransport {
+    fn send(&self, _request: Request) -> TransportFuture {
+        let response = self
+            .responses
+            .lock()
+            .expect("sequence transport lock")
+            .pop_front()
+            .expect("sequence transport response");
+        Box::pin(async move { response })
+    }
+}
+
+struct CountingTransport {
+    attempts: Arc<Mutex<u32>>,
+    responses: Mutex<VecDeque<Result<HttpResponse, HttpRequestError>>>,
+}
+
+impl std::fmt::Debug for CountingTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CountingTransport(..)")
+    }
+}
+
+impl CountingTransport {
+    fn from_responses(responses: Vec<Result<HttpResponse, HttpRequestError>>) -> Self {
+        Self {
+            attempts: Arc::new(Mutex::new(0)),
+            responses: Mutex::new(VecDeque::from(responses)),
+        }
+    }
+}
+
+impl Transport for CountingTransport {
+    fn send(&self, _request: Request) -> TransportFuture {
+        *self
+            .attempts
+            .lock()
+            .expect("counting transport attempts lock") += 1;
+        let response = self
+            .responses
+            .lock()
+            .expect("counting transport responses lock")
+            .pop_front()
+            .expect("counting transport response");
+        Box::pin(async move { response })
+    }
+}
+
+struct RecordingTransport {
+    requests: Arc<Mutex<Vec<Request>>>,
+    responses: Mutex<VecDeque<Result<HttpResponse, HttpRequestError>>>,
+}
+
+impl std::fmt::Debug for RecordingTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RecordingTransport(..)")
+    }
+}
+
+impl RecordingTransport {
+    fn from_responses(responses: Vec<Result<HttpResponse, HttpRequestError>>) -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            responses: Mutex::new(VecDeque::from(responses)),
+        }
+    }
+}
+
+impl Transport for RecordingTransport {
+    fn send(&self, request: Request) -> TransportFuture {
+        self.requests
+            .lock()
+            .expect("recording transport requests lock")
+            .push(request);
+        let response = self
+            .responses
+            .lock()
+            .expect("recording transport responses lock")
+            .pop_front()
+            .expect("recording transport response");
+        Box::pin(async move { response })
+    }
+}
+
+fn mock_json_response(headers: HeaderMap, body: &serde_json::Value) -> HttpResponse {
+    HttpResponse::from_mock(
+        StatusCode::OK,
+        headers,
+        serde_json::to_vec(&body).expect("encode mock json body"),
+        Url::parse("https://example.test/resource").expect("mock response url"),
+    )
+}
+
+#[tokio::test]
+async fn get_json_with_cache_treats_cache_control_no_store_as_immediately_expired_even_with_max_age()
+ {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=600"),
+    );
+    let client = HttpClientBuilder::new()
+        .with_transport(SequenceTransport::from_responses(vec![Ok(
+            mock_json_response(headers, &json!({ "issuer": "https://issuer.example.test" })),
+        )]))
+        .build()
+        .expect("build http client");
+
+    let response = client
+        .get_json_with_cache::<serde_json::Value>(
+            "https://example.test/resource",
+            Duration::from_secs(300),
+        )
+        .await
+        .expect("cached json response");
+
+    assert!(
+        response.expired(),
+        "no-store responses must not stay cacheable, got future expiry for {:?}",
+        response.value
+    );
+}
+
+#[tokio::test]
+async fn get_json_with_cache_treats_cache_control_no_cache_as_immediately_expired_even_with_max_age()
+ {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("max-age=600, no-cache"),
+    );
+    let client = HttpClientBuilder::new()
+        .with_transport(SequenceTransport::from_responses(vec![Ok(
+            mock_json_response(headers, &json!({ "issuer": "https://issuer.example.test" })),
+        )]))
+        .build()
+        .expect("build http client");
+
+    let response = client
+        .get_json_with_cache::<serde_json::Value>(
+            "https://example.test/resource",
+            Duration::from_secs(300),
+        )
+        .await
+        .expect("cached json response");
+
+    assert!(
+        response.expired(),
+        "no-cache responses must expire immediately so callers revalidate before reuse"
+    );
+}
+
+#[tokio::test]
+async fn execute_retries_idempotent_get_after_transient_server_error_until_the_request_succeeds() {
+    let transport = CountingTransport::from_responses(vec![
+        Ok(HttpResponse::from_mock(
+            StatusCode::SERVICE_UNAVAILABLE,
+            HeaderMap::new(),
+            Vec::new(),
+            Url::parse("https://example.test/resource").expect("503 response url"),
+        )),
+        Ok(HttpResponse::from_mock(
+            StatusCode::OK,
+            HeaderMap::new(),
+            br#"{"ok":true}"#.to_vec(),
+            Url::parse("https://example.test/resource").expect("200 response url"),
+        )),
+    ]);
+    let attempts = transport.attempts.clone();
+    let client = HttpClientBuilder::new()
+        .retry(RetryConfig {
+            max_retries: 1,
+            base_delay: Duration::from_millis(0),
+            max_delay: Duration::from_millis(0),
+            retry_non_idempotent: false,
+        })
+        .with_transport(transport)
+        .build()
+        .expect("build http client");
+
+    let response = client
+        .request(Method::GET, "https://example.test/resource")
+        .send()
+        .await
+        .expect("retried GET response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*attempts.lock().expect("attempts lock"), 2);
+}
+
+#[tokio::test]
+async fn execute_does_not_retry_post_after_server_error_when_non_idempotent_retries_are_disabled() {
+    let transport = CountingTransport::from_responses(vec![Ok(HttpResponse::from_mock(
+        StatusCode::SERVICE_UNAVAILABLE,
+        HeaderMap::new(),
+        Vec::new(),
+        Url::parse("https://example.test/resource").expect("503 response url"),
+    ))]);
+    let attempts = transport.attempts.clone();
+    let client = HttpClientBuilder::new()
+        .retry(RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(0),
+            max_delay: Duration::from_millis(0),
+            retry_non_idempotent: false,
+        })
+        .with_transport(transport)
+        .build()
+        .expect("build http client");
+
+    let response = client
+        .request(Method::POST, "https://example.test/resource")
+        .send()
+        .await
+        .expect("POST response");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        *attempts.lock().expect("attempts lock"),
+        1,
+        "non-idempotent POST must not be retried by default"
+    );
+}
+
+#[tokio::test]
+async fn error_for_status_with_body_preserves_response_body_for_non_success_responses() {
+    let result = HttpResponse::from_mock(
+        StatusCode::BAD_REQUEST,
+        HeaderMap::new(),
+        br#"{"message":"bad request"}"#.to_vec(),
+        Url::parse("https://example.test/resource").expect("400 response url"),
+    )
+    .error_for_status_with_body()
+    .await;
+
+    match result {
+        Err(HttpRequestError::HttpStatus {
+            status,
+            body: Some(body),
+        }) => {
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body, "{\"message\":\"bad request\"}");
+        }
+        Err(other) => panic!("expected status error with body, got {other:?}"),
+        Ok(_) => panic!("expected non-success response to fail"),
+    }
+}
+
+#[tokio::test]
+async fn mock_response_text_respects_max_body_size_limit() {
+    let error = HttpResponse::from_mock(
+        StatusCode::OK,
+        HeaderMap::new(),
+        b"too-large".to_vec(),
+        Url::parse("https://example.test/resource").expect("mock response url"),
+    )
+    .with_max_body_size(Some(3))
+    .text()
+    .await
+    .expect_err("response larger than limit should fail");
+
+    assert!(matches!(
+        error,
+        HttpRequestError::ResponseTooLarge { size: 9, max: 3 }
+    ));
+}
+
+#[tokio::test]
+async fn execute_retries_idempotent_get_after_too_many_requests_until_success() {
+    let transport = CountingTransport::from_responses(vec![
+        Ok(HttpResponse::from_mock(
+            StatusCode::TOO_MANY_REQUESTS,
+            HeaderMap::new(),
+            Vec::new(),
+            Url::parse("https://example.test/resource").expect("429 response url"),
+        )),
+        Ok(HttpResponse::from_mock(
+            StatusCode::OK,
+            HeaderMap::new(),
+            br#"{"ok":true}"#.to_vec(),
+            Url::parse("https://example.test/resource").expect("200 response url"),
+        )),
+    ]);
+    let attempts = transport.attempts.clone();
+    let client = HttpClientBuilder::new()
+        .retry(RetryConfig {
+            max_retries: 1,
+            base_delay: Duration::from_millis(0),
+            max_delay: Duration::from_millis(0),
+            retry_non_idempotent: false,
+        })
+        .with_transport(transport)
+        .build()
+        .expect("build http client");
+
+    let response = client
+        .request(Method::GET, "https://example.test/resource")
+        .send()
+        .await
+        .expect("retried GET response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        *attempts.lock().expect("attempts lock"),
+        2,
+        "429 responses should follow the same retry contract as transient 5xx responses"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn execute_uses_retry_after_header_delay_for_retryable_status() {
+    let mut headers = HeaderMap::new();
+    headers.insert(http::header::RETRY_AFTER, HeaderValue::from_static("2"));
+    let transport = CountingTransport::from_responses(vec![
+        Ok(HttpResponse::from_mock(
+            StatusCode::TOO_MANY_REQUESTS,
+            headers,
+            Vec::new(),
+            Url::parse("https://example.test/resource").expect("429 response url"),
+        )),
+        Ok(HttpResponse::from_mock(
+            StatusCode::OK,
+            HeaderMap::new(),
+            br#"{"ok":true}"#.to_vec(),
+            Url::parse("https://example.test/resource").expect("200 response url"),
+        )),
+    ]);
+    let attempts = transport.attempts.clone();
+    let client = HttpClientBuilder::new()
+        .retry(RetryConfig {
+            max_retries: 1,
+            base_delay: Duration::from_millis(0),
+            max_delay: Duration::from_millis(0),
+            retry_non_idempotent: false,
+        })
+        .with_transport(transport)
+        .build()
+        .expect("build http client");
+
+    let started_at = tokio::time::Instant::now();
+    let response = client
+        .request(Method::GET, "https://example.test/resource")
+        .send()
+        .await
+        .expect("retried GET response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*attempts.lock().expect("attempts lock"), 2);
+    assert_eq!(
+        tokio::time::Instant::now() - started_at,
+        Duration::from_secs(2)
+    );
+}
+
+#[tokio::test]
+async fn execute_does_not_retry_non_retryable_server_status() {
+    let transport = CountingTransport::from_responses(vec![Ok(HttpResponse::from_mock(
+        StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+        HeaderMap::new(),
+        Vec::new(),
+        Url::parse("https://example.test/resource").expect("505 response url"),
+    ))]);
+    let attempts = transport.attempts.clone();
+    let client = HttpClientBuilder::new()
+        .retry(RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(0),
+            max_delay: Duration::from_millis(0),
+            retry_non_idempotent: false,
+        })
+        .with_transport(transport)
+        .build()
+        .expect("build http client");
+
+    let response = client
+        .request(Method::GET, "https://example.test/resource")
+        .send()
+        .await
+        .expect("GET response");
+
+    assert_eq!(response.status(), StatusCode::HTTP_VERSION_NOT_SUPPORTED);
+    assert_eq!(*attempts.lock().expect("attempts lock"), 1);
+}
+
+#[tokio::test]
+async fn convenience_helpers_send_expected_methods_headers_and_payload_encodings() {
+    let transport = RecordingTransport::from_responses(vec![
+        Ok(mock_json_response(
+            HeaderMap::new(),
+            &json!({ "issuer": "https://issuer.example.test" }),
+        )),
+        Ok(mock_json_response(
+            HeaderMap::new(),
+            &json!({ "sub": "user-123" }),
+        )),
+        Ok(mock_json_response(
+            HeaderMap::new(),
+            &json!({ "access_token": "token-123" }),
+        )),
+        Ok(mock_json_response(
+            HeaderMap::new(),
+            &json!({ "status": "created" }),
+        )),
+    ]);
+    let recorded_requests = transport.requests.clone();
+    let client = HttpClientBuilder::new()
+        .with_transport(transport)
+        .build()
+        .expect("build http client");
+
+    let issuer = client
+        .get_json::<serde_json::Value>("https://example.test/openid-configuration")
+        .await
+        .expect("openid configuration");
+    let me = client
+        .get_json_with_bearer::<serde_json::Value>("https://example.test/me", "opaque-bearer")
+        .await
+        .expect("bearer request");
+    let token = client
+        .post_form::<serde_json::Value, _>(
+            "https://example.test/oauth/token",
+            &[("grant_type", "client_credentials")],
+        )
+        .await
+        .expect("form request");
+    let created = client
+        .post_json::<serde_json::Value, _>(
+            "https://example.test/resources",
+            &json!({ "name": "example" }),
+        )
+        .await
+        .expect("json request");
+
+    assert_eq!(issuer["issuer"], "https://issuer.example.test");
+    assert_eq!(me["sub"], "user-123");
+    assert_eq!(token["access_token"], "token-123");
+    assert_eq!(created["status"], "created");
+
+    let requests = recorded_requests.lock().expect("recorded requests lock");
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0].method(), Method::GET);
+    assert_eq!(requests[1].method(), Method::GET);
+    assert_eq!(requests[2].method(), Method::POST);
+    assert_eq!(requests[3].method(), Method::POST);
+    assert_eq!(
+        requests[1]
+            .headers()
+            .get(http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer opaque-bearer")
+    );
+    assert!(
+        requests[2]
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/x-www-form-urlencoded")),
+        "post_form should encode bodies as application/x-www-form-urlencoded"
+    );
+    assert!(
+        requests[3]
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json")),
+        "post_json should encode bodies as application/json"
+    );
+}
+
+#[test]
+fn request_builder_build_and_try_clone_preserve_headers_query_and_auth() {
+    let client = HttpClientBuilder::default()
+        .with_reqwest_builder(|builder| builder.user_agent("http-request-client-tests"))
+        .build()
+        .expect("build http client");
+
+    let mut extra_headers = HeaderMap::new();
+    extra_headers.insert("x-extra", HeaderValue::from_static("from-map"));
+
+    let builder = client
+        .patch("https://example.test/resource")
+        .header("x-inline", "inline-value")
+        .headers(extra_headers)
+        .query(&[("query", "value")])
+        .basic_auth("aladdin", Some("open sesame"))
+        .timeout(Duration::from_secs(7))
+        .body("payload");
+    let cloned_builder = builder.try_clone().expect("cloneable builder");
+
+    let request = builder.build().expect("build request");
+    let cloned_request = cloned_builder.build().expect("build cloned request");
+
+    assert_eq!(request.method(), Method::PATCH);
+    assert_eq!(cloned_request.method(), Method::PATCH);
+    assert_eq!(
+        request.url().as_str(),
+        "https://example.test/resource?query=value"
+    );
+    assert_eq!(
+        request
+            .headers()
+            .get("x-inline")
+            .and_then(|value| value.to_str().ok()),
+        Some("inline-value")
+    );
+    assert_eq!(
+        request
+            .headers()
+            .get("x-extra")
+            .and_then(|value| value.to_str().ok()),
+        Some("from-map")
+    );
+    assert_eq!(
+        request
+            .headers()
+            .get(http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("Basic YWxhZGRpbjpvcGVuIHNlc2FtZQ==")
+    );
+}
+
+#[test]
+fn verb_helpers_build_requests_with_expected_methods() {
+    let client = crate::HttpClient::new().expect("build default client");
+    let client_with_inner =
+        crate::HttpClient::with_client(client.inner().clone(), RetryConfig::default());
+
+    let put = client_with_inner
+        .put("https://example.test/resource")
+        .build()
+        .expect("put request");
+    let delete = client_with_inner
+        .delete("https://example.test/resource")
+        .build()
+        .expect("delete request");
+    let head = client_with_inner
+        .head("https://example.test/resource")
+        .build()
+        .expect("head request");
+
+    assert_eq!(put.method(), Method::PUT);
+    assert_eq!(delete.method(), Method::DELETE);
+    assert_eq!(head.method(), Method::HEAD);
+}
+
+#[tokio::test]
+async fn response_helpers_fail_closed_for_invalid_status_and_decode_errors() {
+    let status_error = HttpResponse::from_mock(
+        StatusCode::BAD_REQUEST,
+        HeaderMap::new(),
+        Vec::new(),
+        Url::parse("https://example.test/resource").expect("400 response url"),
+    )
+    .error_for_status();
+    assert!(matches!(
+        status_error,
+        Err(HttpRequestError::HttpStatus {
+            status: StatusCode::BAD_REQUEST,
+            body: None
+        })
+    ));
+
+    let response = HttpResponse::from_mock(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        HeaderMap::new(),
+        Vec::new(),
+        Url::parse("https://example.test/resource").expect("500 response url"),
+    );
+    let status_ref_error = response.error_for_status_ref();
+    assert!(matches!(
+        status_ref_error,
+        Err(HttpRequestError::HttpStatus {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: None
+        })
+    ));
+
+    let decode_error = HttpResponse::from_mock(
+        StatusCode::OK,
+        HeaderMap::new(),
+        vec![0xff, 0xfe],
+        Url::parse("https://example.test/resource").expect("mock response url"),
+    )
+    .text()
+    .await
+    .expect_err("invalid utf-8 should fail");
+    assert!(matches!(decode_error, HttpRequestError::Decode { .. }));
+
+    let json_error = HttpResponse::from_mock(
+        StatusCode::OK,
+        HeaderMap::new(),
+        br#"{"missing":"brace""#.to_vec(),
+        Url::parse("https://example.test/resource").expect("mock response url"),
+    )
+    .json::<serde_json::Value>()
+    .await
+    .expect_err("invalid json should fail");
+    assert!(matches!(json_error, HttpRequestError::Decode { .. }));
+}
+
+#[tokio::test]
+async fn mock_response_bytes_url_and_cache_ttl_fallback_are_preserved() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("max-age=not-a-number"),
+    );
+    let url = Url::parse("https://example.test/resource").expect("mock response url");
+    let response = HttpResponse::from_mock(
+        StatusCode::OK,
+        headers.clone(),
+        b"body".to_vec(),
+        url.clone(),
+    );
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.url(), &url);
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("max-age=not-a-number")
+    );
+    assert!(
+        response.into_reqwest().is_none(),
+        "mock responses should not pretend to be reqwest responses"
+    );
+
+    let bytes = HttpResponse::from_mock(StatusCode::OK, HeaderMap::new(), b"body".to_vec(), url)
+        .bytes()
+        .await
+        .expect("mock bytes");
+    assert_eq!(bytes.as_ref(), b"body");
+
+    let client = HttpClientBuilder::new()
+        .with_transport(SequenceTransport::from_responses(vec![Ok(
+            mock_json_response(headers, &json!({ "issuer": "https://issuer.example.test" })),
+        )]))
+        .build()
+        .expect("build http client");
+    let response = client
+        .get_json_with_cache::<serde_json::Value>(
+            "https://example.test/resource",
+            Duration::from_millis(25),
+        )
+        .await
+        .expect("cached json response");
+
+    assert!(
+        !response.expired(),
+        "invalid max-age directives should fall back to the caller-provided ttl"
+    );
+}
