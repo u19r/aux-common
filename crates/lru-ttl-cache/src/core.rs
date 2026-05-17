@@ -96,6 +96,36 @@ where
         EntryState::Fresh(entry)
     }
 
+    pub(super) fn inspect_entry_with_stale(&self, key: &K, stale_ttl: Duration) -> EntryState<V> {
+        if self.disabled {
+            self.record_miss();
+            return EntryState::Missing;
+        }
+
+        let mut inner = self.lock_inner();
+        let Some(entry_ref) = inner.entries.get(key) else {
+            self.record_miss();
+            return EntryState::Missing;
+        };
+        let entry = entry_ref.clone();
+        let now = Instant::now();
+        if !entry.is_expired_at(now) {
+            entry.touch(self.next_access_order());
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return EntryState::Fresh(entry);
+        }
+
+        if entry.is_stale_at(now, stale_ttl) {
+            entry.touch(self.next_access_order());
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return EntryState::Stale(entry);
+        }
+
+        inner.entries.remove(key);
+        self.record_miss();
+        EntryState::Expired
+    }
+
     pub(super) fn stats(&self) -> CacheStats {
         CacheStats {
             hits: self.hits.load(Ordering::Relaxed),
@@ -197,6 +227,16 @@ impl<V> CacheEntry<V> {
         now >= self.inner.expires_at
     }
 
+    fn is_stale_at(&self, now: Instant, stale_ttl: Duration) -> bool {
+        if stale_ttl.is_zero() {
+            return false;
+        }
+        self.inner
+            .expires_at
+            .checked_add(stale_ttl)
+            .is_some_and(|stale_until| now < stale_until)
+    }
+
     fn touch(&self, access_order: u64) {
         self.inner
             .last_access_order
@@ -231,6 +271,7 @@ pub(super) enum EntryState<V> {
     Missing,
     Expired,
     Fresh(CacheEntry<V>),
+    Stale(CacheEntry<V>),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

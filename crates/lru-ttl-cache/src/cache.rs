@@ -83,7 +83,7 @@ where
     pub fn cached(&self, key: &K) -> Option<V> {
         match self.core.inspect_entry(key) {
             EntryState::Fresh(entry) => Some(entry.value().clone()),
-            EntryState::Expired | EntryState::Missing => None,
+            EntryState::Expired | EntryState::Missing | EntryState::Stale(_) => None,
         }
     }
 
@@ -132,7 +132,7 @@ where
                 self.maybe_spawn_refresh(key, entry);
                 Some(value)
             }
-            EntryState::Expired | EntryState::Missing => None,
+            EntryState::Expired | EntryState::Missing | EntryState::Stale(_) => None,
         }
     }
 
@@ -143,6 +143,31 @@ where
                 self.maybe_spawn_refresh(key, entry);
                 Ok(Some(value))
             }
+            EntryState::Expired | EntryState::Missing | EntryState::Stale(_) => {
+                self.fetch_and_store(key).await
+            }
+        }
+    }
+
+    pub async fn get_or_fetch_stale_on_error(
+        &self,
+        key: &K,
+        stale_ttl: Duration,
+    ) -> Result<Option<V>, E> {
+        match self.core.inspect_entry_with_stale(key, stale_ttl) {
+            EntryState::Fresh(entry) => {
+                let value = entry.value().clone();
+                self.maybe_spawn_refresh(key, entry);
+                Ok(Some(value))
+            }
+            EntryState::Stale(entry) => match self.fetch_and_store(key).await {
+                Ok(value) => Ok(value),
+                Err(err) => {
+                    self.core.refresh_errors().fetch_add(1, Ordering::Relaxed);
+                    warn!(error = ?err, "cache_fetch_failed_serving_stale");
+                    Ok(Some(entry.value().clone()))
+                }
+            },
             EntryState::Expired | EntryState::Missing => self.fetch_and_store(key).await,
         }
     }

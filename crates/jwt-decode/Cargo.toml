@@ -1,0 +1,26 @@
+[package]
+publish = false
+name = "jwt-decode"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "Reusable signed JWT verification utilities"
+
+[dependencies]
+base64 = { workspace = true }
+http-request = { workspace = true }
+jsonwebtoken = { workspace = true, default-features = false, features = ["aws_lc_rs"] }
+lru-ttl-cache = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+alloc-counter = { workspace = true }
+jsonwebtoken = { workspace = true, default-features = false, features = ["aws_lc_rs", "use_pem"] }
+opt-loop-probe = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

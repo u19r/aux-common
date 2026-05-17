@@ -15,8 +15,10 @@ license = "BUSL-1.1"
 [workspace.dependencies]
 alloc-counter = { path = "crates/alloc-counter" }
 alloc-counter-macros = { path = "crates/alloc-counter-macros" }
+http-request = { path = "crates/http-request" }
 lru-ttl-cache = { path = "crates/lru-ttl-cache" }
 metrics-facade = { path = "crates/metrics-facade" }
+opt-loop-probe = { path = "crates/opt-loop-probe" }
 telemetry = { path = "crates/telemetry" }
 
 aws-credential-types = "1.2.14"
@@ -25,11 +27,13 @@ aws-smithy-runtime-api = "1.12.0"
 aws-smithy-types = "1.4.7"
 axum = "0.8.9"
 axum-prometheus = "0.10.0"
+base64 = "0.22.1"
 bytes = "1.11.1"
 futures-util = "0.3.31"
 http = "1.4.0"
 httpdate = "1.0.3"
 ipnet = "2.12.0"
+jsonwebtoken = { version = "10.4.0", default-features = false, features = ["aws_lc_rs"] }
 metrics = "0.24.5"
 mimalloc = "0.1.46"
 quote = "1.0.44"

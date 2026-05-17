@@ -123,6 +123,84 @@ async fn expires_entries() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serves_bounded_stale_value_when_refresh_fails() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fetch: FetchFn<String, usize, &'static str> = {
+        let calls = Arc::clone(&calls);
+        arc_fetch_fn(move |_key: String| {
+            let calls = Arc::clone(&calls);
+            async move {
+                let next = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if next == 1 {
+                    return Ok(Some(7));
+                }
+                Err("fetch failed")
+            }
+        })
+    };
+    let cache = FetchingLruTtlCache::new(
+        CacheConfig::<String, usize>::new()
+            .with_ttl(Duration::from_millis(5))
+            .with_fetch(fetch),
+    );
+    let key = "stale".to_string();
+
+    assert_eq!(
+        Some(7),
+        cache
+            .get_or_fetch_stale_on_error(&key, Duration::from_millis(50))
+            .await
+            .expect("initial fetch succeeds")
+    );
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    assert_eq!(
+        Some(7),
+        cache
+            .get_or_fetch_stale_on_error(&key, Duration::from_millis(50))
+            .await
+            .expect("stale value served after refresh failure")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refuses_stale_value_after_stale_ttl() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fetch: FetchFn<String, usize, &'static str> = {
+        let calls = Arc::clone(&calls);
+        arc_fetch_fn(move |_key: String| {
+            let calls = Arc::clone(&calls);
+            async move {
+                let next = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if next == 1 {
+                    return Ok(Some(7));
+                }
+                Err("fetch failed")
+            }
+        })
+    };
+    let cache = FetchingLruTtlCache::new(
+        CacheConfig::<String, usize>::new()
+            .with_ttl(Duration::from_millis(5))
+            .with_fetch(fetch),
+    );
+    let key = "stale-expired".to_string();
+
+    cache
+        .get_or_fetch_stale_on_error(&key, Duration::from_millis(5))
+        .await
+        .expect("initial fetch succeeds");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert_eq!(
+        Err("fetch failed"),
+        cache
+            .get_or_fetch_stale_on_error(&key, Duration::from_millis(5))
+            .await
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supports_per_entry_ttl() {
     let cache =
         LruTtlCache::new(CacheConfig::<String, i32>::new().with_ttl(Duration::from_millis(5)));
