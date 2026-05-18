@@ -10,7 +10,7 @@ readme = "README.md"
 description = "Shared crates."
 keywords = []
 categories = []
-license = "BUSL-1.1"
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 alloc-counter = { path = "crates/alloc-counter" }
