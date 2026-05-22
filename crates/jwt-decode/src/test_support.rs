@@ -7,6 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use base64::Engine;
 use http_request::{
     HttpClientBuilder, HttpRequestError, HttpResponse, StatusCode, Transport, TransportFuture, Url,
 };
@@ -127,10 +128,10 @@ pub(super) fn registered_claims(exp: i64, iat: i64) -> RegisteredClaims {
     RegisteredClaims {
         iss: "https://issuer.example".to_owned(),
         sub: Some("subject".to_owned()),
-        aud: crate::Audience::Single("aux-api".to_owned()),
+        aud: Some(crate::Audience::Single("aux-api".to_owned())),
         exp,
         nbf: None,
-        iat,
+        iat: Some(iat),
         jti: None,
     }
 }
@@ -157,6 +158,15 @@ pub(super) fn signed_token(header: Header, claims: Claims) -> String {
 pub(super) fn signed_value_token(header: Header, claims: Value) -> String {
     let key = EncodingKey::from_rsa_pem(PRIVATE_KEY).unwrap();
     jsonwebtoken::encode(&header, &claims, &key).unwrap()
+}
+
+pub(super) fn signed_raw_token(header_json: &[u8], claims_json: &[u8]) -> String {
+    let key = EncodingKey::from_rsa_pem(PRIVATE_KEY).unwrap();
+    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(header_json);
+    let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims_json);
+    let message = format!("{header}.{claims}");
+    let signature = jsonwebtoken::crypto::sign(message.as_bytes(), &key, Algorithm::RS256).unwrap();
+    format!("{message}.{signature}")
 }
 
 pub(super) fn id_header() -> Header {

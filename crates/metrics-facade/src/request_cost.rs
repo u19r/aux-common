@@ -291,34 +291,33 @@ fn registry() -> &'static ActiveRequestRegistry {
 }
 
 fn register_request(request_id: &str, collector: &RequestCostCollectorHandle) {
-    let mut requests = registry()
-        .requests
-        .lock()
-        .expect("request cost registry poisoned");
+    let Ok(mut requests) = registry().requests.lock() else {
+        return;
+    };
     requests.insert(request_id.to_string(), Arc::downgrade(collector));
 }
 
 fn unregister_request(request_id: &str) {
-    let mut requests = registry()
-        .requests
-        .lock()
-        .expect("request cost registry poisoned");
+    let Ok(mut requests) = registry().requests.lock() else {
+        return;
+    };
     requests.remove(request_id);
 }
 
 fn with_active_collector<F>(request_id: &str, f: F)
 where F: FnOnce(&mut RequestCostCollector) {
     let collector = {
-        let requests = registry()
-            .requests
-            .lock()
-            .expect("request cost registry poisoned");
+        let Ok(requests) = registry().requests.lock() else {
+            return;
+        };
         requests.get(request_id).and_then(Weak::upgrade)
     };
     let Some(collector) = collector else {
         return;
     };
-    let mut collector = collector.lock().expect("request cost collector poisoned");
+    let Ok(mut collector) = collector.lock() else {
+        return;
+    };
     f(&mut collector);
 }
 
@@ -357,7 +356,9 @@ pub async fn finish_request_cost_collection(
 ) -> RequestCostSnapshot {
     let snapshot = REQUEST_COST_COLLECTOR
         .try_with(|collector| {
-            let mut collector = collector.lock().expect("request cost collector poisoned");
+            let Ok(mut collector) = collector.lock() else {
+                return RequestCostSnapshot::default();
+            };
             collector.wall_ms = Some(wall_ms);
             collector.response_bytes = response_bytes;
             collector.mark_updated();
@@ -370,8 +371,8 @@ pub async fn finish_request_cost_collection(
             .try_with(|collector| {
                 collector
                     .lock()
-                    .expect("request cost collector poisoned")
-                    .snapshot()
+                    .map(|collector| collector.snapshot())
+                    .unwrap_or_else(|_| snapshot.clone())
             })
             .unwrap_or_else(|_| snapshot.clone());
         unregister_request(request_id);
@@ -385,16 +386,17 @@ async fn wait_for_cost_settle(request_id: &str) {
     loop {
         let settled = {
             let collector = {
-                let requests = registry()
-                    .requests
-                    .lock()
-                    .expect("request cost registry poisoned");
+                let Ok(requests) = registry().requests.lock() else {
+                    return;
+                };
                 requests.get(request_id).and_then(Weak::upgrade)
             };
             let Some(collector) = collector else {
                 return;
             };
-            let collector = collector.lock().expect("request cost collector poisoned");
+            let Ok(collector) = collector.lock() else {
+                return;
+            };
             collector
                 .last_update_at
                 .is_none_or(|ts| ts.elapsed() >= COST_STABILIZE_IDLE_WINDOW)
@@ -409,7 +411,9 @@ async fn wait_for_cost_settle(request_id: &str) {
 pub(crate) fn record_counter(metric: CounterMetric, labels: &[MetricLabel], value: u64) {
     REQUEST_COST_COLLECTOR
         .try_with(|collector| {
-            let mut collector = collector.lock().expect("request cost collector poisoned");
+            let Ok(mut collector) = collector.lock() else {
+                return;
+            };
             match metric {
                 CounterMetric::HttpRequestBytesTotalMetric => {
                     collector.request_bytes = collector.request_bytes.saturating_add(value);
@@ -454,7 +458,9 @@ pub(crate) fn record_counter(metric: CounterMetric, labels: &[MetricLabel], valu
 pub(crate) fn record_gauge(metric: GaugeMetric, _labels: &[MetricLabel], update: GaugeUpdate) {
     REQUEST_COST_COLLECTOR
         .try_with(|collector| {
-            let mut collector = collector.lock().expect("request cost collector poisoned");
+            let Ok(mut collector) = collector.lock() else {
+                return;
+            };
             if let (GaugeMetric::AnalyticsIngestionQueueDepthMetric, GaugeUpdate::Set) =
                 (metric, update)
             {
@@ -467,7 +473,9 @@ pub(crate) fn record_gauge(metric: GaugeMetric, _labels: &[MetricLabel], update:
 pub(crate) fn record_histogram(metric: HistogramMetric, _labels: &[MetricLabel], value: f64) {
     REQUEST_COST_COLLECTOR
         .try_with(|collector| {
-            let mut collector = collector.lock().expect("request cost collector poisoned");
+            let Ok(mut collector) = collector.lock() else {
+                return;
+            };
             match metric {
                 HistogramMetric::RequestLatencyMetric => collector.wall_ms = Some(value),
                 HistogramMetric::RemoteStorageRequestLatencyMs => {

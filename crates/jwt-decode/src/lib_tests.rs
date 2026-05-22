@@ -13,8 +13,8 @@ use crate::{
     test_support::{
         Claims, CountingTransport, FixedClock, build_remote_verifier,
         build_remote_verifier_with_policy, build_verifier, id_header, jwk, jwks,
-        jwks_without_test_key, mock_response, policy, registered_claims, signed_token,
-        signed_value_token, token, token_without_iat, valid_claims,
+        jwks_without_test_key, mock_response, policy, registered_claims, signed_raw_token,
+        signed_token, signed_value_token, token, token_without_iat, valid_claims,
     },
 };
 
@@ -33,6 +33,51 @@ async fn given_valid_static_jwks_when_verifying_access_token_then_returns_typed_
     assert_eq!(verified.algorithm, SignatureAlgorithm::RS256);
     assert_eq!(verified.key_id, "test-key");
     assert_eq!(verified.claims.client_id, "client-123");
+}
+
+#[tokio::test]
+async fn given_claims_only_verification_when_token_is_valid_then_returns_json_claims() {
+    let verifier = build_verifier();
+    let policy = policy();
+    let token = token(valid_claims());
+
+    let claims = verifier
+        .verify_json_claims_only(&token, &policy)
+        .await
+        .unwrap();
+
+    assert_eq!(claims["client_id"], "client-123");
+}
+
+#[test]
+fn given_static_claims_only_verification_when_token_is_valid_then_returns_json_claims() {
+    let verifier = build_verifier();
+    let policy = policy();
+    let token = token(valid_claims());
+
+    let claims = verifier
+        .verify_static_json_claims_only(&token, &policy)
+        .unwrap();
+
+    assert_eq!(claims["client_id"], "client-123");
+}
+
+#[tokio::test]
+async fn given_claims_only_verification_when_payload_has_duplicate_member_then_rejects_token() {
+    let token = signed_raw_token(
+        br#"{"alg":"RS256","kid":"test-key","typ":"at+jwt"}"#,
+        br#"{"iss":"https://issuer.example","iss":"https://issuer.example","aud":"aux-api","exp":1700000300,"iat":1699999990,"token_type":"access","client_id":"client-123"}"#,
+    );
+
+    let error = build_verifier()
+        .verify_json_claims_only(&token, &policy())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error.kind(),
+        JwtDecodeErrorKind::ClaimsInvalid(crate::ClaimErrorKind::DuplicateJsonMember)
+    ));
 }
 
 #[tokio::test]
@@ -62,6 +107,50 @@ async fn given_generic_jwt_policy_when_token_has_no_product_type_then_accepts() 
 }
 
 #[tokio::test]
+async fn given_generic_jwt_policy_without_audience_when_token_has_no_audience_then_accepts() {
+    let verifier = build_verifier();
+    let policy = VerificationPolicy::generic_jwt()
+        .issuer("https://issuer.example")
+        .unwrap()
+        .without_audience()
+        .build()
+        .unwrap();
+    let claims = serde_json::json!({
+        "iss": "https://issuer.example",
+        "sub": "subject",
+        "exp": 1_700_000_300_i64,
+        "iat": 1_699_999_990_i64
+    });
+
+    let verified = verifier
+        .verify_json_claims(&signed_value_token(id_header(), claims), &policy)
+        .await
+        .unwrap();
+
+    assert_eq!(verified.claims["sub"], "subject");
+}
+
+#[tokio::test]
+async fn given_policy_allowing_missing_iat_when_token_has_no_iat_then_accepts() {
+    let verifier = build_verifier();
+    let policy = VerificationPolicy::generic_jwt()
+        .issuer("https://issuer.example")
+        .unwrap()
+        .audience("aux-api")
+        .unwrap()
+        .allow_missing_issued_at()
+        .build()
+        .unwrap();
+
+    let verified = verifier
+        .verify_json_claims(&token_without_iat(), &policy)
+        .await
+        .unwrap();
+
+    assert_eq!(verified.claims["aud"], "aux-api");
+}
+
+#[tokio::test]
 async fn given_expired_token_when_verifying_then_rejects_expiration() {
     let verifier = build_verifier();
     let policy = policy();
@@ -87,7 +176,7 @@ async fn given_wrong_audience_when_verifying_then_rejects_audience() {
         token_type: TokenKind::Access,
         client_id: "client-123".to_owned(),
     };
-    claims.registered.aud = crate::Audience::Single("other-api".to_owned());
+    claims.registered.aud = Some(crate::Audience::Single("other-api".to_owned()));
     let token = token(claims);
 
     let error = verifier
@@ -108,7 +197,7 @@ async fn given_missing_iat_when_verifying_then_rejects_claims() {
         .await
         .unwrap_err();
 
-    assert!(matches!(error.kind(), JwtDecodeErrorKind::ClaimsInvalid(_)));
+    assert_eq!(error.kind(), &JwtDecodeErrorKind::IssuedAtInvalid);
 }
 
 #[tokio::test]
@@ -390,7 +479,7 @@ async fn given_stale_remote_jwks_when_refresh_fails_then_stale_value_is_used() {
         transport,
         JwksCachePolicy {
             fallback_ttl: Duration::from_millis(5),
-            stale_ttl: Duration::from_millis(100),
+            stale_ttl: Duration::from_secs(5),
             ..JwksCachePolicy::default()
         },
     );

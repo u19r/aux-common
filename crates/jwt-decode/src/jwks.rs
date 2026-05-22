@@ -1,18 +1,29 @@
+#[cfg(not(target_arch = "wasm32"))]
+use std::hash::{Hash, Hasher};
 use std::{
-    hash::{Hash, Hasher},
-    sync::Arc,
+    collections::HashMap,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
 use http_request::{HttpClient, Url};
-use jsonwebtoken::jwk::{AlgorithmParameters, Jwk, JwkSet};
+use jsonwebtoken::{
+    DecodingKey,
+    jwk::{AlgorithmParameters, Jwk, JwkSet},
+};
+#[cfg(not(target_arch = "wasm32"))]
 use lru_ttl_cache::{CacheConfig, FetchingLruTtlCache, arc_fetch_fn};
 
-use crate::{JwtDecodeError, JwtDecodeErrorKind, Result, json::JsonDocument};
+use crate::{
+    JwtDecodeError, JwtDecodeErrorKind, Result, SignatureAlgorithm, json::JsonDocument,
+    key_policy::KeyPolicy,
+};
 
 #[derive(Debug, Clone)]
 pub struct JwksDocument {
     keys: Arc<JwkSet>,
+    decoding_keys: Arc<RwLock<HashMap<String, DecodingKey>>>,
 }
 
 impl JwksDocument {
@@ -24,6 +35,7 @@ impl JwksDocument {
         Self::prevalidate(&keys)?;
         Ok(Self {
             keys: Arc::new(keys),
+            decoding_keys: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -43,6 +55,41 @@ impl JwksDocument {
         }
 
         Ok(first)
+    }
+
+    pub(crate) fn decoding_key_for(
+        &self,
+        kid: &str,
+        algorithm: SignatureAlgorithm,
+        allow_symmetric: bool,
+    ) -> Result<DecodingKey> {
+        let jwk = self.find_unique_key(kid)?;
+        KeyPolicy::new(jwk, algorithm, allow_symmetric).validate()?;
+        if let Some(key) = self.cached_decoding_key(kid)? {
+            return Ok(key);
+        }
+
+        let key = DecodingKey::from_jwk(jwk)
+            .map_err(|_| JwtDecodeError::new(JwtDecodeErrorKind::InvalidKey))?;
+        self.store_decoding_key(kid, key.clone())?;
+        Ok(key)
+    }
+
+    fn cached_decoding_key(&self, kid: &str) -> Result<Option<DecodingKey>> {
+        let guard = self
+            .decoding_keys
+            .read()
+            .map_err(|_| JwtDecodeError::new(JwtDecodeErrorKind::InvalidKey))?;
+        Ok(guard.get(kid).cloned())
+    }
+
+    fn store_decoding_key(&self, kid: &str, key: DecodingKey) -> Result<()> {
+        let mut guard = self
+            .decoding_keys
+            .write()
+            .map_err(|_| JwtDecodeError::new(JwtDecodeErrorKind::InvalidKey))?;
+        guard.insert(kid.to_owned(), key);
+        Ok(())
     }
 
     fn prevalidate(jwks: &JwkSet) -> Result<()> {
@@ -65,16 +112,20 @@ impl JwksDocument {
 
 #[derive(Debug, Clone)]
 pub enum JwksSource {
-    Jwks(JwksDocument),
+    Jwks(Arc<JwksDocument>),
     LocalSymmetric(LocalSymmetricKey),
+    #[cfg(not(target_arch = "wasm32"))]
     Url(Box<RemoteJwksSource>),
 }
 
 impl JwksSource {
     pub fn json_string(json: impl AsRef<str>) -> Result<Self> {
-        Ok(Self::Jwks(JwksDocument::from_json_str(json.as_ref())?))
+        Ok(Self::Jwks(Arc::new(JwksDocument::from_json_str(
+            json.as_ref(),
+        )?)))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn url(url: impl AsRef<str>) -> Result<Self> {
         Ok(Self::Url(Box::new(RemoteJwksSource::new(
             JwksUrl::parse_https(url.as_ref())?,
@@ -83,6 +134,7 @@ impl JwksSource {
         ))))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn insecure_test_url(url: impl AsRef<str>) -> Result<Self> {
         Ok(Self::Url(Box::new(RemoteJwksSource::new(
             JwksUrl::parse_for_tests(url.as_ref())?,
@@ -99,10 +151,22 @@ impl JwksSource {
     }
 
     pub(crate) async fn document_for_issuer(&self, issuer: &str) -> Result<Arc<JwksDocument>> {
+        #[cfg(target_arch = "wasm32")]
+        let _ = issuer;
         match self {
-            Self::Jwks(document) => Ok(Arc::new(document.clone())),
+            Self::Jwks(document) => Ok(Arc::clone(document)),
             Self::LocalSymmetric(_) => Err(JwtDecodeError::new(JwtDecodeErrorKind::InvalidKey)),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Url(source) => source.document_for_issuer(issuer).await,
+        }
+    }
+
+    pub(crate) fn static_document_for_issuer(&self, _issuer: &str) -> Result<Arc<JwksDocument>> {
+        match self {
+            Self::Jwks(document) => Ok(Arc::clone(document)),
+            Self::LocalSymmetric(_) => Err(JwtDecodeError::new(JwtDecodeErrorKind::InvalidKey)),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Url(_) => Err(JwtDecodeError::new(JwtDecodeErrorKind::JwksFetch)),
         }
     }
 
@@ -110,9 +174,12 @@ impl JwksSource {
         &self,
         issuer: &str,
     ) -> Result<Arc<JwksDocument>> {
+        #[cfg(target_arch = "wasm32")]
+        let _ = issuer;
         match self {
-            Self::Jwks(document) => Ok(Arc::new(document.clone())),
+            Self::Jwks(document) => Ok(Arc::clone(document)),
             Self::LocalSymmetric(_) => Err(JwtDecodeError::new(JwtDecodeErrorKind::InvalidKey)),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Url(source) => source.refresh_document_for_issuer(issuer).await,
         }
     }
@@ -128,16 +195,19 @@ impl JwksSource {
     }
 
     pub fn invalidate_issuer(&self, issuer: &str) {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Self::Url(source) = self {
             source.invalidate_issuer(issuer);
         }
+        #[cfg(target_arch = "wasm32")]
+        let _ = issuer;
     }
 }
 
 #[derive(Clone)]
 pub struct LocalSymmetricKey {
     key_id: String,
-    secret: Arc<[u8]>,
+    decoding_key: DecodingKey,
 }
 
 impl LocalSymmetricKey {
@@ -145,9 +215,10 @@ impl LocalSymmetricKey {
         if key_id.is_empty() || secret.is_empty() {
             return Err(JwtDecodeError::new(JwtDecodeErrorKind::InvalidKey));
         }
+        let decoding_key = DecodingKey::from_secret(&secret);
         Ok(Self {
             key_id,
-            secret: Arc::from(secret),
+            decoding_key,
         })
     }
 
@@ -155,8 +226,8 @@ impl LocalSymmetricKey {
         &self.key_id
     }
 
-    pub(crate) fn secret(&self) -> &[u8] {
-        &self.secret
+    pub(crate) fn decoding_key(&self) -> DecodingKey {
+        self.decoding_key.clone()
     }
 }
 
@@ -169,10 +240,12 @@ impl std::fmt::Debug for LocalSymmetricKey {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct JwksUrl {
     url: Url,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl JwksUrl {
     pub fn parse_https(value: &str) -> Result<Self> {
         let url =
@@ -218,12 +291,14 @@ impl Default for JwksCachePolicy {
 }
 
 #[derive(Clone)]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct RemoteJwksSource {
     url: JwksUrl,
     cache: FetchingLruTtlCache<JwksCacheKey, Arc<JwksDocument>, JwtDecodeError>,
     policy: JwksCachePolicy,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl std::fmt::Debug for RemoteJwksSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteJwksSource")
@@ -233,6 +308,7 @@ impl std::fmt::Debug for RemoteJwksSource {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl RemoteJwksSource {
     pub fn new(url: JwksUrl, policy: JwksCachePolicy, http_client: HttpClient) -> Self {
         let fetch_url = url.clone();
@@ -290,17 +366,20 @@ impl RemoteJwksSource {
 }
 
 #[derive(Clone, Eq)]
+#[cfg(not(target_arch = "wasm32"))]
 struct JwksCacheKey {
     url: String,
     issuer: String,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl PartialEq for JwksCacheKey {
     fn eq(&self, other: &Self) -> bool {
         self.url == other.url && self.issuer == other.issuer
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Hash for JwksCacheKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.url.hash(state);
@@ -308,6 +387,7 @@ impl Hash for JwksCacheKey {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn fetch_remote_jwks(
     client: &HttpClient,
     url: &JwksUrl,
@@ -329,6 +409,7 @@ async fn fetch_remote_jwks(
     JwksDocument::from_json_str(&value)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl JwksDocument {
     fn with_expected_issuer(self, _issuer: String) -> Self {
         self

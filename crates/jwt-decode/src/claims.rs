@@ -25,11 +25,13 @@ pub struct RegisteredClaims {
     pub iss: String,
     #[serde(default)]
     pub sub: Option<String>,
-    pub aud: Audience,
+    #[serde(default)]
+    pub aud: Option<Audience>,
     pub exp: i64,
     #[serde(default)]
     pub nbf: Option<i64>,
-    pub iat: i64,
+    #[serde(default)]
+    pub iat: Option<i64>,
     #[serde(default)]
     pub jti: Option<String>,
 }

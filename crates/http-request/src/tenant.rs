@@ -602,7 +602,7 @@ fn reserved_ip_ranges() -> &'static [IpNet] {
     RANGES.get_or_init(|| {
         RESERVED_IP_RANGES
             .iter()
-            .map(|range| range.parse::<IpNet>().expect("reserved ip range"))
+            .filter_map(|range| range.parse::<IpNet>().ok())
             .collect()
     })
 }

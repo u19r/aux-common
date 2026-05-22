@@ -8,7 +8,7 @@ const DEFAULT_LEEWAY: Duration = Duration::from_secs(30);
 pub struct VerificationPolicy {
     pub(crate) token_kind: TokenKind,
     pub(crate) issuer: String,
-    pub(crate) audience: String,
+    pub(crate) audience: Option<String>,
     pub(crate) require_token_type: bool,
     pub(crate) validate_access_typ: bool,
     pub(crate) token_type_claim: String,
@@ -18,6 +18,7 @@ pub struct VerificationPolicy {
     pub(crate) max_issued_age: Option<Duration>,
     pub(crate) leeway: Duration,
     pub(crate) allowed_header_types: Vec<String>,
+    pub(crate) require_issued_at: bool,
 }
 
 impl VerificationPolicy {
@@ -55,6 +56,7 @@ pub struct VerificationPolicyBuilder {
     token_kind: TokenKind,
     issuer: Option<String>,
     audience: Option<String>,
+    require_audience: bool,
     require_token_type: bool,
     validate_access_typ: bool,
     token_type_claim: String,
@@ -64,6 +66,7 @@ pub struct VerificationPolicyBuilder {
     max_issued_age: Option<Duration>,
     leeway: Duration,
     allowed_header_types: Vec<String>,
+    require_issued_at: bool,
 }
 
 impl VerificationPolicyBuilder {
@@ -72,6 +75,7 @@ impl VerificationPolicyBuilder {
             token_kind,
             issuer: None,
             audience: None,
+            require_audience: true,
             require_token_type: true,
             validate_access_typ: token_kind == TokenKind::Access,
             token_type_claim: String::new(),
@@ -81,6 +85,7 @@ impl VerificationPolicyBuilder {
             max_issued_age: None,
             leeway: DEFAULT_LEEWAY,
             allowed_header_types: default_header_types(token_kind),
+            require_issued_at: true,
         }
     }
 
@@ -92,6 +97,13 @@ impl VerificationPolicyBuilder {
     pub fn audience(mut self, audience: impl Into<String>) -> Result<Self> {
         self.audience = Some(Self::non_empty(audience.into(), "audience")?);
         Ok(self)
+    }
+
+    #[must_use]
+    pub fn without_audience(mut self) -> Self {
+        self.audience = None;
+        self.require_audience = false;
+        self
     }
 
     pub fn client_id(mut self, client_id: impl Into<String>) -> Result<Self> {
@@ -113,6 +125,12 @@ impl VerificationPolicyBuilder {
     #[must_use]
     pub fn max_issued_age(mut self, max_issued_age: Duration) -> Self {
         self.max_issued_age = Some(max_issued_age);
+        self
+    }
+
+    #[must_use]
+    pub fn allow_missing_issued_at(mut self) -> Self {
+        self.require_issued_at = false;
         self
     }
 
@@ -160,6 +178,7 @@ impl VerificationPolicyBuilder {
             max_issued_age: self.max_issued_age,
             leeway: self.leeway,
             allowed_header_types: self.allowed_header_types,
+            require_issued_at: self.require_issued_at,
         })
     }
 
@@ -194,8 +213,11 @@ impl VerificationPolicyBuilder {
         })
     }
 
-    fn required_audience(&self) -> Result<String> {
-        self.audience.clone().ok_or_else(|| {
+    fn required_audience(&self) -> Result<Option<String>> {
+        if !self.require_audience {
+            return Ok(None);
+        }
+        self.audience.clone().map(Some).ok_or_else(|| {
             JwtDecodeError::new(JwtDecodeErrorKind::PolicyInvalid(
                 PolicyErrorKind::MissingAudience,
             ))

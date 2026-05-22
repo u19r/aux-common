@@ -8,13 +8,18 @@ description = "Reusable signed JWT verification utilities"
 
 [dependencies]
 base64 = { workspace = true }
-http-request = { workspace = true }
-jsonwebtoken = { workspace = true, default-features = false, features = ["aws_lc_rs"] }
-lru-ttl-cache = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+http-request = { workspace = true }
+jsonwebtoken = { workspace = true, default-features = false, features = ["aws_lc_rs"] }
+lru-ttl-cache = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["js"] }
+jsonwebtoken = { workspace = true, default-features = false, features = ["rust_crypto"] }
 
 [dev-dependencies]
 alloc-counter = { workspace = true }

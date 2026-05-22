@@ -121,6 +121,10 @@ impl AllowedAlgorithms {
         self.algorithms.contains(&algorithm)
     }
 
+    pub(crate) fn iter(&self) -> impl Iterator<Item = SignatureAlgorithm> + '_ {
+        self.algorithms.iter().copied()
+    }
+
     pub(crate) fn allow_symmetric(&self) -> bool {
         self.allow_symmetric
     }

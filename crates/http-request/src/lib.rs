@@ -5,6 +5,9 @@ mod client;
 mod client_tests;
 mod constants;
 mod error;
+mod oauth;
+#[cfg(test)]
+mod oauth_tests;
 mod retry;
 mod tenant;
 #[cfg(test)]
@@ -15,6 +18,10 @@ pub use client::{
     TransportFuture,
 };
 pub use error::{HttpRequestError, HttpRequestErrorKind, Result};
+pub use oauth::{
+    OAuthAuthorizationCodeRequest, OAuthRefreshTokenRequest, OAuthRevocationEndpoint,
+    OAuthRevocationRequest, OAuthTokenEndpoint, OAuthTokenResponse, OAuthUserinfoEndpoint,
+};
 pub use reqwest::{self, Method, StatusCode, Url, header};
 pub use retry::RetryConfig;
 pub use tenant::{
