@@ -10,7 +10,7 @@ use std::{
 use http_request::{HttpClient, Url};
 use jsonwebtoken::{
     DecodingKey,
-    jwk::{AlgorithmParameters, Jwk, JwkSet},
+    jwk::{Jwk, JwkSet},
 };
 #[cfg(not(target_arch = "wasm32"))]
 use lru_ttl_cache::{CacheConfig, FetchingLruTtlCache, arc_fetch_fn};
@@ -98,9 +98,6 @@ impl JwksDocument {
         }
 
         for key in &jwks.keys {
-            if matches!(key.algorithm, AlgorithmParameters::OctetKey(_)) {
-                return Err(JwtDecodeError::new(JwtDecodeErrorKind::InvalidKey));
-            }
             if key.common.key_id.as_deref().is_some_and(str::is_empty) {
                 return Err(JwtDecodeError::new(JwtDecodeErrorKind::InvalidKey));
             }

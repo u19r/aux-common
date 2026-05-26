@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     CounterMetric, GaugeMetric, HistogramMetric, MetricLabel, MetricsCrateFacade, MetricsFacade,
-    counter, gauge, histogram, set_metrics_facade,
+    counter, gauge, histogram, metrics_crate_facade_cache_snapshot, set_metrics_facade,
 };
 
 static METRICS_FACADE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -123,6 +123,30 @@ fn storage_cache_metric_names_match_expected_ddb_operation_pattern() {
 }
 
 #[test]
+fn managed_tenant_metric_names_match_expected_operational_surface() {
+    assert_eq!(
+        CounterMetric::ManagedTenantDecisionsTotal.name(),
+        "managed_tenant_decisions_total"
+    );
+    assert_eq!(
+        CounterMetric::ManagedTenantQuotaDenialsTotal.name(),
+        "managed_tenant_quota_denials_total"
+    );
+    assert_eq!(
+        CounterMetric::ManagedTenantTemplateApplyTotal.name(),
+        "managed_tenant_template_apply_total"
+    );
+    assert_eq!(
+        CounterMetric::ManagedTenantSupportSessionTransitionsTotal.name(),
+        "managed_tenant_support_session_transitions_total"
+    );
+    assert_eq!(
+        CounterMetric::ManagedTenantSuspensionsTotal.name(),
+        "managed_tenant_suspensions_total"
+    );
+}
+
+#[test]
 fn metrics_handles_delegate_to_installed_facade() {
     let _guard = METRICS_FACADE_TEST_LOCK.lock().unwrap();
     let facade = CapturingMetricsFacade::default();
@@ -164,4 +188,22 @@ fn metrics_crate_facade_re_registers_against_active_recorder() {
     for thread in threads {
         thread.join().expect("metrics thread should not panic");
     }
+}
+
+#[test]
+fn metrics_crate_facade_reuses_thread_local_handles() {
+    let _guard = METRICS_FACADE_TEST_LOCK.lock().unwrap();
+    let before = metrics_crate_facade_cache_snapshot();
+    let facade = MetricsCrateFacade;
+
+    for _ in 0..10 {
+        facade.record_histogram(
+            HistogramMetric::StorageOperationLatencyMsMetric,
+            &[MetricLabel::new("operation", "thread_local_cache_test")],
+            1.0,
+        );
+    }
+
+    let after = metrics_crate_facade_cache_snapshot();
+    assert_eq!(after.histograms - before.histograms, 1);
 }

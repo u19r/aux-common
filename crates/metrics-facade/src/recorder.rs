@@ -1,4 +1,11 @@
-use std::sync::{Arc, OnceLock, RwLock};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    sync::{
+        Arc, OnceLock, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use metrics::{Key, Label, Level, Metadata, with_recorder};
 
@@ -68,6 +75,11 @@ pub trait MetricsFacade: std::fmt::Debug + Send + Sync + 'static {
 #[derive(Debug, Default)]
 pub struct MetricsCrateFacade;
 
+/// Cumulative thread-local handle cache insertions by metric kind.
+///
+/// Metric handles are cached per thread to avoid contended global bookkeeping
+/// in hot record paths. The snapshot counts cache misses that populated those
+/// per-thread maps; it is not a live global map length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetricsCrateFacadeCacheSnapshot {
     pub counters: usize,
@@ -75,21 +87,104 @@ pub struct MetricsCrateFacadeCacheSnapshot {
     pub histograms: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CounterCacheKey {
+    metric: CounterMetric,
+    labels: Vec<MetricLabel>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct GaugeCacheKey {
+    metric: GaugeMetric,
+    labels: Vec<MetricLabel>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct HistogramCacheKey {
+    metric: HistogramMetric,
+    labels: Vec<MetricLabel>,
+}
+
+thread_local! {
+    static COUNTER_HANDLES: RefCell<HashMap<CounterCacheKey, metrics::Counter>> =
+        RefCell::new(HashMap::new());
+    static GAUGE_HANDLES: RefCell<HashMap<GaugeCacheKey, metrics::Gauge>> =
+        RefCell::new(HashMap::new());
+    static HISTOGRAM_HANDLES: RefCell<HashMap<HistogramCacheKey, metrics::Histogram>> =
+        RefCell::new(HashMap::new());
+}
+
+static COUNTER_HANDLE_CACHE_INSERTS: AtomicUsize = AtomicUsize::new(0);
+static GAUGE_HANDLE_CACHE_INSERTS: AtomicUsize = AtomicUsize::new(0);
+static HISTOGRAM_HANDLE_CACHE_INSERTS: AtomicUsize = AtomicUsize::new(0);
+
 impl MetricsCrateFacade {
     fn counter_handle(metric: CounterMetric, labels: &[MetricLabel]) -> metrics::Counter {
-        let key = labels_to_key(metric.name(), labels);
-        with_recorder(|recorder| recorder.register_counter(&key, metadata()))
+        let key = CounterCacheKey {
+            metric,
+            labels: labels.to_vec(),
+        };
+        if let Some(handle) = COUNTER_HANDLES.with(|handles| handles.borrow().get(&key).cloned()) {
+            return handle;
+        }
+        let handle = register_counter_handle(metric, labels);
+        COUNTER_HANDLES.with(|handles| {
+            handles.borrow_mut().insert(key, handle.clone());
+            COUNTER_HANDLE_CACHE_INSERTS.fetch_add(1, Ordering::Relaxed);
+        });
+        handle
     }
 
     fn gauge_handle(metric: GaugeMetric, labels: &[MetricLabel]) -> metrics::Gauge {
-        let key = labels_to_key(metric.name(), labels);
-        with_recorder(|recorder| recorder.register_gauge(&key, metadata()))
+        let key = GaugeCacheKey {
+            metric,
+            labels: labels.to_vec(),
+        };
+        if let Some(handle) = GAUGE_HANDLES.with(|handles| handles.borrow().get(&key).cloned()) {
+            return handle;
+        }
+        let handle = register_gauge_handle(metric, labels);
+        GAUGE_HANDLES.with(|handles| {
+            handles.borrow_mut().insert(key, handle.clone());
+            GAUGE_HANDLE_CACHE_INSERTS.fetch_add(1, Ordering::Relaxed);
+        });
+        handle
     }
 
     fn histogram_handle(metric: HistogramMetric, labels: &[MetricLabel]) -> metrics::Histogram {
-        let key = labels_to_key(metric.name(), labels);
-        with_recorder(|recorder| recorder.register_histogram(&key, metadata()))
+        let key = HistogramCacheKey {
+            metric,
+            labels: labels.to_vec(),
+        };
+        if let Some(handle) = HISTOGRAM_HANDLES.with(|handles| handles.borrow().get(&key).cloned())
+        {
+            return handle;
+        }
+        let handle = register_histogram_handle(metric, labels);
+        HISTOGRAM_HANDLES.with(|handles| {
+            handles.borrow_mut().insert(key, handle.clone());
+            HISTOGRAM_HANDLE_CACHE_INSERTS.fetch_add(1, Ordering::Relaxed);
+        });
+        handle
     }
+}
+
+fn register_counter_handle(metric: CounterMetric, labels: &[MetricLabel]) -> metrics::Counter {
+    let key = labels_to_key(metric.name(), labels);
+    with_recorder(|recorder| recorder.register_counter(&key, metadata()))
+}
+
+fn register_gauge_handle(metric: GaugeMetric, labels: &[MetricLabel]) -> metrics::Gauge {
+    let key = labels_to_key(metric.name(), labels);
+    with_recorder(|recorder| recorder.register_gauge(&key, metadata()))
+}
+
+fn register_histogram_handle(
+    metric: HistogramMetric,
+    labels: &[MetricLabel],
+) -> metrics::Histogram {
+    let key = labels_to_key(metric.name(), labels);
+    with_recorder(|recorder| recorder.register_histogram(&key, metadata()))
 }
 
 impl MetricsFacade for MetricsCrateFacade {
@@ -153,9 +248,9 @@ pub fn reset_metrics_facade() -> Arc<dyn MetricsFacade> {
 #[must_use]
 pub fn metrics_crate_facade_cache_snapshot() -> MetricsCrateFacadeCacheSnapshot {
     MetricsCrateFacadeCacheSnapshot {
-        counters: 0,
-        gauges: 0,
-        histograms: 0,
+        counters: COUNTER_HANDLE_CACHE_INSERTS.load(Ordering::Relaxed),
+        gauges: GAUGE_HANDLE_CACHE_INSERTS.load(Ordering::Relaxed),
+        histograms: HISTOGRAM_HANDLE_CACHE_INSERTS.load(Ordering::Relaxed),
     }
 }
 

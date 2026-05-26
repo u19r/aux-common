@@ -83,6 +83,11 @@ pub enum CounterMetric {
     MetricOauthUserinfoFallbackTotal,
     MetricQueueEmptyReceivesTotal,
     MetricOutboxItemsProcessedTotal,
+    ManagedTenantDecisionsTotal,
+    ManagedTenantQuotaDenialsTotal,
+    ManagedTenantSupportSessionTransitionsTotal,
+    ManagedTenantSuspensionsTotal,
+    ManagedTenantTemplateApplyTotal,
     PrefetchBatchGetTotal,
     PrefetchFallbackGetTotal,
     PrefetchKeysTotal,
@@ -313,6 +318,13 @@ impl CounterMetric {
             Self::MetricOauthUserinfoFallbackTotal => "authn.oauth.userinfo_fallback_total",
             Self::MetricQueueEmptyReceivesTotal => "jobs.immediate.empty.receives.total",
             Self::MetricOutboxItemsProcessedTotal => "jobs.immediate.outbox.items.processed.total",
+            Self::ManagedTenantDecisionsTotal => "managed_tenant_decisions_total",
+            Self::ManagedTenantQuotaDenialsTotal => "managed_tenant_quota_denials_total",
+            Self::ManagedTenantSupportSessionTransitionsTotal => {
+                "managed_tenant_support_session_transitions_total"
+            }
+            Self::ManagedTenantSuspensionsTotal => "managed_tenant_suspensions_total",
+            Self::ManagedTenantTemplateApplyTotal => "managed_tenant_template_apply_total",
             Self::PrefetchBatchGetTotal => "prefetch.batch.get.total",
             Self::PrefetchFallbackGetTotal => "prefetch.fallback.get.total",
             Self::PrefetchKeysTotal => "prefetch.keys.total",

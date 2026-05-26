@@ -37,20 +37,57 @@ async fn given_default_asymmetric_policy_when_verifying_hs256_then_rejects_algor
     );
 }
 
-#[test]
-fn given_oct_key_in_jwks_when_parsing_then_rejects_key() {
+#[tokio::test]
+async fn given_oct_key_in_jwks_with_symmetric_allowlist_when_verifying_hs256_then_accepts() {
+    let jwks = hmac_jwks();
+    let verifier = JwtVerifier::builder()
+        .jwks_source(JwksSource::json_string(jwks.to_string()).unwrap())
+        .allowed_algorithms(AllowedAlgorithms::symmetric([SignatureAlgorithm::HS256]).unwrap())
+        .clock(Arc::new(FixedClock))
+        .build()
+        .unwrap();
+
+    let verified = verifier
+        .verify::<Claims>(&hmac_token(valid_claims()), &policy())
+        .await
+        .unwrap();
+
+    assert_eq!(verified.algorithm, SignatureAlgorithm::HS256);
+    assert_eq!(verified.key_id, "hmac-key");
+}
+
+#[tokio::test]
+async fn given_oct_key_in_jwks_with_asymmetric_allowlist_when_verifying_hs256_then_rejects_algorithm()
+ {
+    let jwks = hmac_jwks();
+    let verifier = JwtVerifier::builder()
+        .jwks_source(JwksSource::json_string(jwks.to_string()).unwrap())
+        .allowed_algorithms(AllowedAlgorithms::asymmetric([SignatureAlgorithm::RS256]).unwrap())
+        .clock(Arc::new(FixedClock))
+        .build()
+        .unwrap();
+
+    let error = verifier
+        .verify::<Claims>(&hmac_token(valid_claims()), &policy())
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.kind(),
+        &JwtDecodeErrorKind::UnsupportedAlgorithm(SignatureAlgorithm::HS256)
+    );
+}
+
+fn hmac_jwks() -> serde_json::Value {
     let jwks = serde_json::json!({
         "keys": [{
             "kty": "oct",
             "kid": "hmac-key",
             "alg": "HS256",
-            "k": "c2VjcmV0"
+            "k": "bG9jYWwgdGVzdCBobWFjIHNlY3JldCB3aXRoIGVub3VnaCBlbnRyb3B5"
         }]
     });
-
-    let error = JwksSource::json_string(jwks.to_string()).unwrap_err();
-
-    assert_eq!(error.kind(), &JwtDecodeErrorKind::InvalidKey);
+    jwks
 }
 
 #[tokio::test]

@@ -193,7 +193,7 @@ impl JwtVerifier {
         algorithm: SignatureAlgorithm,
         issuer: &str,
     ) -> Result<DecodingKey> {
-        if algorithm.is_symmetric() {
+        if algorithm.is_symmetric() && matches!(self.jwks_source, JwksSource::LocalSymmetric(_)) {
             return self.local_symmetric_decoding_key(kid, algorithm);
         }
         self.jwks_decoding_key(kid, algorithm, issuer).await
@@ -205,7 +205,7 @@ impl JwtVerifier {
         algorithm: SignatureAlgorithm,
         issuer: &str,
     ) -> Result<DecodingKey> {
-        if algorithm.is_symmetric() {
+        if algorithm.is_symmetric() && matches!(self.jwks_source, JwksSource::LocalSymmetric(_)) {
             return self.local_symmetric_decoding_key(kid, algorithm);
         }
         self.static_jwks_decoding_key(kid, algorithm, issuer)
