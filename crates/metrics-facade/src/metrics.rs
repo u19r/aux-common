@@ -60,6 +60,13 @@ pub enum CounterMetric {
     GsiUpdateStreamItems,
     HttpRequestBytesTotalMetric,
     HttpResponseBytesTotalMetric,
+    MetricAuthnAuthenticationAttemptTotal,
+    MetricAuthnAuthenticatorDisabledTotal,
+    MetricAuthnAuthenticatorLifecycleTotal,
+    MetricAuthnFraudReportTotal,
+    MetricAuthnRecoveryAttemptTotal,
+    MetricAuthnSessionAssuranceTotal,
+    MetricAuthnSupportInterventionTotal,
     MetricBlocklistBatchWriteRetryExhaustedTotal,
     MetricBlocklistBatchWriteRetryTotal,
     MetricFederatedProvisionHookTotal,
@@ -281,6 +288,13 @@ impl CounterMetric {
             Self::GsiUpdateStreamItems => "gsi.update.stream.items",
             Self::HttpRequestBytesTotalMetric => "http.request.bytes.total",
             Self::HttpResponseBytesTotalMetric => "http.response.bytes.total",
+            Self::MetricAuthnAuthenticationAttemptTotal => "authn.authentication_attempt_total",
+            Self::MetricAuthnAuthenticatorDisabledTotal => "authn.authenticator_disabled_total",
+            Self::MetricAuthnAuthenticatorLifecycleTotal => "authn.authenticator_lifecycle_total",
+            Self::MetricAuthnFraudReportTotal => "authn.fraud_report_total",
+            Self::MetricAuthnRecoveryAttemptTotal => "authn.recovery_attempt_total",
+            Self::MetricAuthnSessionAssuranceTotal => "authn.session_assurance_total",
+            Self::MetricAuthnSupportInterventionTotal => "authn.support_intervention_total",
             Self::MetricBlocklistBatchWriteRetryExhaustedTotal => {
                 "blocklist.batch_write_retry_exhausted_total"
             }
@@ -511,6 +525,8 @@ pub enum HistogramMetric {
     BillingOperationUsageIngestionLagMs,
     FoundationdbGetReadVersionLatencyMs,
     GsiUpdateRuntimeMs,
+    MetricAuthnFraudResolutionMs,
+    MetricAuthnLockoutDurationMs,
     MetricFederatedProvisionHookLatencyMs,
     MetricFederatedProvisionLatencyMs,
     MetricFederatedProvisionStageLatencyMs,
@@ -549,6 +565,8 @@ impl HistogramMetric {
             Self::BillingOperationUsageIngestionLagMs => "billing_operation_usage_ingestion_lag_ms",
             Self::FoundationdbGetReadVersionLatencyMs => "foundationdb.get.read.version.latency.ms",
             Self::GsiUpdateRuntimeMs => "gsi.update.runtime.ms",
+            Self::MetricAuthnFraudResolutionMs => "authn.fraud_resolution_ms",
+            Self::MetricAuthnLockoutDurationMs => "authn.lockout_duration_ms",
             Self::MetricFederatedProvisionHookLatencyMs => {
                 "authn.federated.provision_hook_latency_ms"
             }

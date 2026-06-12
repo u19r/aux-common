@@ -147,6 +147,46 @@ fn managed_tenant_metric_names_match_expected_operational_surface() {
 }
 
 #[test]
+fn authn_identity_security_metric_names_match_expected_nist_surface() {
+    assert_eq!(
+        CounterMetric::MetricAuthnAuthenticationAttemptTotal.name(),
+        "authn.authentication_attempt_total"
+    );
+    assert_eq!(
+        CounterMetric::MetricAuthnAuthenticatorDisabledTotal.name(),
+        "authn.authenticator_disabled_total"
+    );
+    assert_eq!(
+        CounterMetric::MetricAuthnRecoveryAttemptTotal.name(),
+        "authn.recovery_attempt_total"
+    );
+    assert_eq!(
+        HistogramMetric::MetricAuthnLockoutDurationMs.name(),
+        "authn.lockout_duration_ms"
+    );
+    assert_eq!(
+        CounterMetric::MetricAuthnSupportInterventionTotal.name(),
+        "authn.support_intervention_total"
+    );
+    assert_eq!(
+        CounterMetric::MetricAuthnAuthenticatorLifecycleTotal.name(),
+        "authn.authenticator_lifecycle_total"
+    );
+    assert_eq!(
+        CounterMetric::MetricAuthnSessionAssuranceTotal.name(),
+        "authn.session_assurance_total"
+    );
+    assert_eq!(
+        CounterMetric::MetricAuthnFraudReportTotal.name(),
+        "authn.fraud_report_total"
+    );
+    assert_eq!(
+        HistogramMetric::MetricAuthnFraudResolutionMs.name(),
+        "authn.fraud_resolution_ms"
+    );
+}
+
+#[test]
 fn metrics_handles_delegate_to_installed_facade() {
     let _guard = METRICS_FACADE_TEST_LOCK.lock().unwrap();
     let facade = CapturingMetricsFacade::default();
