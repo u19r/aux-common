@@ -60,6 +60,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-credentials"
+version = "0.1.0"
+dependencies = [
+ "aws-credential-types",
+ "aws-smithy-types",
+ "lru-ttl-cache",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "aws-lc-rs"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -109,15 +122,11 @@ name = "aws-sigv4-signing"
 version = "0.1.0"
 dependencies = [
  "aws-credential-types",
+ "aws-credentials",
  "aws-sigv4",
  "aws-smithy-runtime-api",
- "aws-smithy-types",
  "http 1.4.0",
  "http-request",
- "lru-ttl-cache",
- "reqwest",
- "serde",
- "serde_json",
  "thiserror",
  "tokio",
  "url",

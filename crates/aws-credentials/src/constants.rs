@@ -15,9 +15,9 @@ pub(crate) const IMDS_TOKEN_HEADER: &str = "X-aws-ec2-metadata-token";
 
 pub(crate) const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 pub(crate) const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-pub(crate) const CREDENTIAL_REFRESH_SKEW: Duration = Duration::from_secs(5 * 60);
-pub(crate) const CREDENTIAL_REFRESH_FALLBACK: Duration = Duration::from_secs(10 * 60);
-pub(crate) const CREDENTIAL_CACHE_STATIC_TTL: Duration = Duration::from_secs(60 * 60 * 24);
+pub(crate) const CREDENTIAL_REFRESH_SKEW: Duration = Duration::from_mins(5);
+pub(crate) const CREDENTIAL_REFRESH_FALLBACK: Duration = Duration::from_mins(10);
+pub(crate) const CREDENTIAL_CACHE_STATIC_TTL: Duration = Duration::from_hours(24);
 pub(crate) const CREDENTIAL_CACHE_CAPACITY: usize = 1;
 pub(crate) const DEFAULT_CREDENTIAL_CACHE_KEY: &str = "default";
 

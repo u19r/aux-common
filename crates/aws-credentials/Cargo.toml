@@ -1,6 +1,6 @@
 [package]
 publish = false
-name = "aws-sigv4-signing"
+name = "aws-credentials"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
@@ -10,16 +10,12 @@ doctest = false
 
 [dependencies]
 aws-credential-types = { workspace = true }
-aws-credentials = { workspace = true }
-aws-sigv4 = { workspace = true, features = ["sign-http"] }
-aws-smithy-runtime-api = { workspace = true }
-http = { workspace = true }
-http-request = { path = "../http-request" }
-thiserror = { workspace = true }
+aws-smithy-types = { workspace = true }
+lru-ttl-cache = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 url = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints.rust]
 unsafe_code = "allow"

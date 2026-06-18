@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-rust-version = "1.94.0"
+rust-version = "1.96.0"
 edition = "2024"
 repository = "https://github.com/u19r/aux-common"
 readme = "README.md"
@@ -15,6 +15,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 alloc-counter = { path = "crates/alloc-counter" }
 alloc-counter-macros = { path = "crates/alloc-counter-macros" }
+aws-credentials = { path = "crates/aws-credentials" }
 http-request = { path = "crates/http-request" }
 lru-ttl-cache = { path = "crates/lru-ttl-cache" }
 metrics-facade = { path = "crates/metrics-facade" }
@@ -57,7 +58,11 @@ tokio = { version = "1.52.3", features = ["full", "tracing"] }
 tower = "0.5.3"
 tower-http = { version = "0.6.8", features = ["trace"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+tracing-subscriber = { version = "0.3.23", features = [
+    "env-filter",
+    "fmt",
+    "json",
+] }
 url = "2.5.8"
 uuid = "1.23.1"
 

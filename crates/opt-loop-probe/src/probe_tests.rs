@@ -17,8 +17,7 @@ use crate::probe::{
 fn unique_path(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_nanos());
     std::env::temp_dir().join(format!("opt-loop-probe-{name}-{nanos}.json"))
 }
 
