@@ -87,6 +87,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "authz-runtime"
+version = "0.1.0"
+dependencies = [
+ "authz-cedar",
+ "authz-types",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "authz-types"
 version = "0.1.0"
 dependencies = [
