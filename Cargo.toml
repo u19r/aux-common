@@ -15,6 +15,8 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 alloc-counter = { path = "crates/alloc-counter" }
 alloc-counter-macros = { path = "crates/alloc-counter-macros" }
+authz-cedar = { path = "crates/authz-cedar" }
+authz-types = { path = "crates/authz-types" }
 aws-credentials = { path = "crates/aws-credentials" }
 http-request = { path = "crates/http-request" }
 lru-ttl-cache = { path = "crates/lru-ttl-cache" }
@@ -30,6 +32,8 @@ axum = "0.8.9"
 axum-prometheus = "0.10.0"
 base64 = "0.22.1"
 bytes = "1.11.1"
+cedar-policy = "=4.11.2"
+chrono = { version = "0.4.43", features = ["clock", "serde"] }
 futures-util = "0.3.31"
 getrandom = "0.2.17"
 http = "1.4.0"
@@ -64,6 +68,7 @@ tracing-subscriber = { version = "0.3.23", features = [
     "json",
 ] }
 url = "2.5.8"
+utoipa = { version = "5.5.0", features = ["chrono", "uuid"] }
 uuid = "1.23.1"
 
 [workspace.lints.clippy]

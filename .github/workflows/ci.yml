@@ -1,0 +1,105 @@
+name: ci
+
+on:
+  pull_request:
+    types: [labeled, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci-check:
+    name: ci-check
+    if: ${{ github.repository_owner == 'u19r' && (github.event_name == 'workflow_dispatch' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'run-ci'))) }}
+    # Runner class: arm64/large maps to the approved 4xlarge-first Spot pool.
+    # Use x64 only for x86-only toolchains; use xlarge/docker or memory only
+    # for release, image, or integration jobs that cannot pass on large.
+    runs-on:
+      - self-hosted
+      - aux-build
+      - linux
+      - arm64
+      - large
+      - run-${{ github.run_id }}-${{ github.run_attempt }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_TARGET_DIR: /opt/cargo-target/
+      RUSTC_WRAPPER: sccache
+      SCCACHE_CACHE_SIZE: 40G
+      SCCACHE_DIR: /opt/sccache/
+    steps:
+      - name: Print workflow dispatch inputs
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          WORKFLOW_DISPATCH_INPUTS: ${{ toJson(inputs) }}
+        run: |
+          echo "workflow_dispatch inputs:"
+          printf '%s\n' "$WORKFLOW_DISPATCH_INPUTS"
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Run CI check
+        run: just ci-check
+
+  report:
+    name: report
+    if: ${{ always() && github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-ci') }}
+    needs: ci-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Comment PR status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.repository_owner }}" != "u19r" ]; then
+            status="skipped: repository is outside the u19r scope"
+          elif [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
+            status="skipped: fork pull requests do not run trusted Aux self-hosted runners"
+          else
+            status="${{ needs.ci-check.result }}"
+          fi
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --body "ci-check: ${status} in run ${{ github.run_id }}" || true
+
+  metadata:
+    name: metadata
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'run-ci') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Print workflow dispatch inputs
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          WORKFLOW_DISPATCH_INPUTS: ${{ toJson(inputs) }}
+        run: |
+          echo "workflow_dispatch inputs:"
+          printf '%s\n' "$WORKFLOW_DISPATCH_INPUTS"
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Validate workflow metadata
+        run: |
+          set -euo pipefail
+          test "${{ github.repository_owner }}" = "u19r"
+          test -f Cargo.toml
+          test -f justfile
+          test -d crates/alloc-counter

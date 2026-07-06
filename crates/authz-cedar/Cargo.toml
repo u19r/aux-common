@@ -1,0 +1,21 @@
+[package]
+name = "authz-cedar"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+authz-types = { path = "../authz-types" }
+cedar-policy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+alloc-counter = { workspace = true }
+
+[lints]
+workspace = true
