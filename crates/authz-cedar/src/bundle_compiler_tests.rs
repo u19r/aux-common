@@ -308,3 +308,44 @@ fn bundle_compilation_is_deterministic() {
     let bundle_b = compile_policy_bundle(&config, 1).expect("bundle b");
     assert_eq!(bundle_a.policy_slices, bundle_b.policy_slices);
 }
+
+#[test]
+fn compiled_bundle_round_trips_through_public_json() {
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![base_resource()],
+        permissions: vec![Permission {
+            id: "document:editor".into(),
+            name: "Editor".into(),
+            actions: permission_actions("document", &["read", "write"]),
+            not_actions: vec![],
+            description: None,
+        }],
+        roles: vec![Role {
+            id: "editor".into(),
+            name: "Editor".into(),
+            description: None,
+            permissions: vec![RolePermission {
+                permission_id: PermissionId::new("document:editor").expect("permission id"),
+                scopes: vec![Scope::Tenant],
+            }],
+            actions: vec![],
+            not_actions: vec![],
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: Vec::new(),
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+    }
+    .into_validated()
+    .expect("valid config");
+
+    let bundle = compile_policy_bundle(&config, 42).expect("bundle");
+    let json = bundle.as_json().expect("bundle json");
+    let decoded: crate::CompiledBundle = serde_json::from_str(&json).expect("decoded bundle");
+
+    assert_eq!(decoded, bundle);
+    assert_eq!(decoded.version, 42);
+}

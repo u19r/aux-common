@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use authz_types::ValidatedConfigurationModel;
 use cedar_policy::{Policy, PolicyId, Template};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::{
@@ -337,7 +337,7 @@ struct SerializedPolicySet {
 }
 
 /// Sharded compiled bundle.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledBundle {
     pub base_schema_json: String,
     pub schema_slices: Vec<SchemaSlice>,
