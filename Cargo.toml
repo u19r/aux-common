@@ -26,26 +26,26 @@ opt-loop-probe = { path = "crates/opt-loop-probe" }
 telemetry = { path = "crates/telemetry" }
 
 aws-credential-types = "1.2.14"
-aws-sigv4 = "1.4.3"
-aws-smithy-runtime-api = "1.12.0"
-aws-smithy-types = "1.4.7"
+aws-sigv4 = "1.4.5"
+aws-smithy-runtime-api = "1.12.3"
+aws-smithy-types = "1.5.0"
 axum = "0.8.9"
 axum-prometheus = "0.10.0"
 base64 = "0.22.1"
-bytes = "1.11.1"
+bytes = "1.12.0"
 cedar-policy = "=4.11.2"
-chrono = { version = "0.4.43", features = ["clock", "serde"] }
+chrono = { version = "0.4.45", features = ["clock", "serde"] }
 futures-util = "0.3.31"
 getrandom = "0.2.17"
-http = "1.4.0"
+http = "1.4.2"
 httpdate = "1.0.3"
 ipnet = "2.12.0"
 jsonwebtoken = { version = "10.4.0", default-features = false }
-metrics = "0.24.5"
-mimalloc = "0.1.46"
-quote = "1.0.44"
-rand = "0.10.1"
-reqwest = { version = "0.13.3", default-features = false, features = [
+metrics = "0.24.6"
+mimalloc = "0.1.52"
+quote = "1.0.46"
+rand = "0.10.2"
+reqwest = { version = "0.13.4", default-features = false, features = [
     "blocking",
     "form",
     "json",
@@ -55,13 +55,13 @@ reqwest = { version = "0.13.3", default-features = false, features = [
     "stream",
 ] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 subtle = "2.6.1"
-syn = { version = "2.0.117", features = ["full"] }
+syn = { version = "2.0.118", features = ["full"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full", "tracing"] }
 tower = "0.5.3"
-tower-http = { version = "0.6.8", features = ["trace"] }
+tower-http = { version = "0.7.0", features = ["trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = [
     "env-filter",
@@ -70,7 +70,7 @@ tracing-subscriber = { version = "0.3.23", features = [
 ] }
 url = "2.5.8"
 utoipa = { version = "5.5.0", features = ["chrono", "uuid"] }
-uuid = "1.23.1"
+uuid = "1.23.4"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

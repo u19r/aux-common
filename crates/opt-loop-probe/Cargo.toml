@@ -6,7 +6,7 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
-mimalloc = "0.1.46"
+mimalloc = "0.1.52"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
