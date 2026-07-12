@@ -267,16 +267,14 @@ fn traceparent_from_headers(headers: &HeaderMap) -> Option<ParsedTraceparent> {
 }
 
 fn parse_traceparent_bytes(bytes: &[u8]) -> Option<ParsedTraceparent> {
-    let bytes = if bytes.len() == 55 {
-        bytes
-    } else {
-        trim_ascii_bytes(bytes)
-    };
-    if bytes.len() != 55 {
+    let bytes = trim_ascii_bytes(bytes);
+    if bytes.len() < 55 {
         return None;
     }
-    if bytes[0] != b'0'
-        || bytes[1] != b'0'
+    let version = (decode_hex_nibble(bytes[0])? << 4) | decode_hex_nibble(bytes[1])?;
+    if version == u8::MAX
+        || (version == 0 && bytes.len() != 55)
+        || (version > 0 && bytes.len() > 55 && (bytes[55] != b'-' || bytes.len() == 56))
         || bytes[2] != b'-'
         || bytes[35] != b'-'
         || bytes[52] != b'-'

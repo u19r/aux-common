@@ -12,6 +12,7 @@ mod evaluator;
 mod policy_generator;
 mod schema_generator;
 mod slices;
+mod validation;
 
 pub use bundle_compiler::*;
 pub use error::*;

@@ -57,6 +57,9 @@ impl AwsSigv4HttpClient {
         credentials: CredentialSource,
         service_name: &str,
     ) -> Result<Self, SigningError> {
+        if !client.redirects_disabled() {
+            return Err(SigningError::RedirectPolicyRequired);
+        }
         let signer = AwsRequestSigner::new(region, credentials, service_name)?;
         Ok(Self {
             client,

@@ -463,8 +463,8 @@ fn action_masks_for_mut<'a>(
         .or_default()
 }
 
-fn permission_resource_type(permission_id: &str) -> String {
-    if let Some(resource_type) = permission_id.split(['.', ':']).next() {
+pub(crate) fn permission_resource_type(permission_id: &str) -> String {
+    if let Some((resource_type, _)) = permission_id.split_once(':') {
         return resource_type.to_string();
     }
     permission_id.to_string()

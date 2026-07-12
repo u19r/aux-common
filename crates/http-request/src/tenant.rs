@@ -1,12 +1,16 @@
 use std::{
+    io,
     net::{IpAddr, SocketAddr},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
 use http::HeaderMap;
 use ipnet::IpNet;
-use reqwest::{Method, Request, RequestBuilder, StatusCode, Url};
+use reqwest::{
+    Method, Request, RequestBuilder, StatusCode, Url,
+    dns::{Addrs, Name, Resolve, Resolving},
+};
 use tokio::net::lookup_host;
 
 use crate::{
@@ -189,20 +193,22 @@ impl TenantHttpClientBuilder {
             });
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(self.config.timeout)
-            .connect_timeout(self.config.connect_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|err| HttpRequestError::Build { source: err })?;
-
-        let http = HttpClient::with_client(client, self.retry);
-        let ssrf = SsrfProtector::new(SsrfProtectionConfig {
+        let ssrf_config = SsrfProtectionConfig {
             allowed_schemes: self.config.allowed_schemes.clone(),
             allowed_ports: self.config.allowed_ports.clone(),
             max_dns_addresses: self.config.max_dns_addresses,
             allow_loopback_ips: self.config.allow_loopback_ips,
-        });
+        };
+        let client = reqwest::Client::builder()
+            .timeout(self.config.timeout)
+            .connect_timeout(self.config.connect_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(SsrfDnsResolver::new(ssrf_config.clone()))
+            .build()
+            .map_err(|err| HttpRequestError::Build { source: err })?;
+
+        let http = HttpClient::with_client(client, self.retry);
+        let ssrf = SsrfProtector::new(ssrf_config);
 
         Ok(TenantHttpClient {
             tenant_id: self.tenant_id,
@@ -441,11 +447,53 @@ impl TenantRequestBuilder {
 }
 
 #[derive(Clone)]
-struct SsrfProtectionConfig {
-    allowed_schemes: Vec<String>,
-    allowed_ports: Vec<u16>,
-    max_dns_addresses: usize,
-    allow_loopback_ips: bool,
+pub(crate) struct SsrfProtectionConfig {
+    pub(crate) allowed_schemes: Vec<String>,
+    pub(crate) allowed_ports: Vec<u16>,
+    pub(crate) max_dns_addresses: usize,
+    pub(crate) allow_loopback_ips: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct SsrfDnsResolver {
+    config: SsrfProtectionConfig,
+    resolver: Arc<dyn Resolve>,
+}
+
+impl SsrfDnsResolver {
+    fn new(config: SsrfProtectionConfig) -> Self {
+        Self::with_resolver(config, Arc::new(TokioDnsResolver))
+    }
+
+    pub(crate) fn with_resolver(config: SsrfProtectionConfig, resolver: Arc<dyn Resolve>) -> Self {
+        Self { config, resolver }
+    }
+}
+
+impl Resolve for SsrfDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let resolving = self.resolver.resolve(name);
+        let max_dns_addresses = self.config.max_dns_addresses;
+        let allow_loopback_ips = self.config.allow_loopback_ips;
+        Box::pin(async move {
+            let mut addrs = resolving.await?.take(max_dns_addresses).collect::<Vec<_>>();
+            validate_resolved_addresses(&mut addrs, allow_loopback_ips)?;
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TokioDnsResolver;
+
+impl Resolve for TokioDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addrs = lookup_host(format!("{host}:0")).await?.collect::<Vec<_>>();
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -513,19 +561,33 @@ impl SsrfProtector {
             });
         }
 
-        addrs.sort_by_key(SocketAddr::ip);
-        addrs.dedup();
-
-        for addr in addrs {
-            if is_blocked_ip(addr.ip(), self.config.allow_loopback_ips) {
-                return Err(HttpRequestError::SsrfBlocked {
-                    reason: SSRF_BLOCKED_RESERVED_IP,
-                });
+        validate_resolved_addresses(&mut addrs, self.config.allow_loopback_ips).map_err(|_| {
+            HttpRequestError::SsrfBlocked {
+                reason: SSRF_BLOCKED_RESERVED_IP,
             }
-        }
+        })?;
 
         Ok(())
     }
+}
+
+fn validate_resolved_addresses(
+    addrs: &mut Vec<SocketAddr>,
+    allow_loopback_ips: bool,
+) -> io::Result<()> {
+    if addrs.is_empty() {
+        return Err(io::Error::other(SSRF_BLOCKED_DNS_EMPTY));
+    }
+
+    addrs.sort_by_key(SocketAddr::ip);
+    addrs.dedup();
+    if addrs
+        .iter()
+        .any(|addr| is_blocked_ip(addr.ip(), allow_loopback_ips))
+    {
+        return Err(io::Error::other(SSRF_BLOCKED_RESERVED_IP));
+    }
+    Ok(())
 }
 
 fn validate_request_size(request: &Request, max: usize) -> Result<()> {

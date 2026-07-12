@@ -62,6 +62,18 @@ impl AwsRequestSigner {
         base_headers: &HeaderMap,
         body: SignableBody<'_>,
     ) -> Result<HeaderMap, SigningError> {
+        self.sign_request_at(method, uri, base_headers, body, SystemTime::now())
+            .await
+    }
+
+    pub(crate) async fn sign_request_at(
+        &self,
+        method: &str,
+        uri: &Uri,
+        base_headers: &HeaderMap,
+        body: SignableBody<'_>,
+        signing_time: SystemTime,
+    ) -> Result<HeaderMap, SigningError> {
         let credentials = self
             .credentials
             .provide_credentials()
@@ -103,7 +115,7 @@ impl AwsRequestSigner {
             .identity(&identity)
             .region(&self.region)
             .name(&self.service_name)
-            .time(SystemTime::now())
+            .time(signing_time)
             .settings(settings)
             .build()
             .map_err(|err| SigningError::Signing(err.to_string()))?
@@ -116,12 +128,14 @@ impl AwsRequestSigner {
         for (name, value) in instructions.headers() {
             let header_name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| SigningError::InvalidHeaderName)?;
-            let mut header_value =
+            let header_value =
                 HeaderValue::from_str(value).map_err(|_| SigningError::InvalidHeaderValue)?;
-            if header_name == AUTHORIZATION {
-                header_value.set_sensitive(true);
-            }
             headers.insert(header_name, header_value);
+        }
+        for sensitive_name in [AUTHORIZATION.as_str(), "x-amz-security-token"] {
+            if let Some(value) = headers.get_mut(sensitive_name) {
+                value.set_sensitive(true);
+            }
         }
 
         Ok(headers)
@@ -134,6 +148,26 @@ impl AwsRequestSigner {
         base_headers: &HeaderMap,
         body: SignableBody<'_>,
         expires_in: Duration,
+    ) -> Result<Uri, SigningError> {
+        self.presign_request_at(
+            method,
+            uri,
+            base_headers,
+            body,
+            expires_in,
+            SystemTime::now(),
+        )
+        .await
+    }
+
+    pub(crate) async fn presign_request_at(
+        &self,
+        method: &str,
+        uri: &Uri,
+        base_headers: &HeaderMap,
+        body: SignableBody<'_>,
+        expires_in: Duration,
+        signing_time: SystemTime,
     ) -> Result<Uri, SigningError> {
         let credentials = self
             .credentials
@@ -178,7 +212,7 @@ impl AwsRequestSigner {
             .identity(&identity)
             .region(&self.region)
             .name(&self.service_name)
-            .time(SystemTime::now())
+            .time(signing_time)
             .settings(settings)
             .build()
             .map_err(|err| SigningError::Signing(err.to_string()))?

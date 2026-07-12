@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, str::FromStr};
 
 use authz_types::{
     AcrLevel, Action, BatchEvaluationRequest, ConfigurationModel, PermissionActionRef,
@@ -7,9 +7,75 @@ use authz_types::{
 use serde_json::{Map, Value};
 
 use crate::{
-    compile_policy_bundle, evaluate, evaluate_batch, evaluate_batch_with_policy_sets,
-    evaluate_owned_with_policy_sets, evaluate_with_policy_sets, parse_policy_sets,
+    EntityParentRef, compile_policy_bundle, evaluate as evaluate_untrusted, evaluate_batch,
+    evaluate_batch_with_policy_sets, evaluate_owned_with_policy_sets,
+    evaluate_owned_with_policy_sets_with_parents, evaluate_with_policy_sets, parse_policy_sets,
+    prepare_request_uids,
 };
+
+#[test]
+fn typed_uid_construction_round_trips_all_validated_identifier_shapes() {
+    let identifiers = [
+        "quote\"id".to_string(),
+        "slash/id".to_string(),
+        "colon:id".to_string(),
+        "unicode-用户-🚀".to_string(),
+        "x".repeat(authz_types::MAX_IDENTIFIER_LEN),
+    ];
+
+    for identifier in identifiers {
+        let request = authz_types::EvaluationRequest {
+            subject: Subject::user(identifier.clone()),
+            resource: Resource::new("document", identifier.clone()),
+            action: Action::new("read"),
+            context: None,
+            jwt_context: None,
+            session_context: None,
+            token_context: None,
+        };
+        let uids = prepare_request_uids(&request).expect("typed UIDs");
+        for uid in [uids.principal(), uids.action(), uids.resource()] {
+            let reparsed = cedar_policy::EntityUid::from_str(&uid.to_string())
+                .expect("rendered UID remains valid Cedar syntax");
+            assert_eq!(&reparsed, uid);
+        }
+    }
+}
+
+fn evaluate(
+    bundle: &crate::CompiledBundle,
+    request: &authz_types::EvaluationRequest,
+) -> Result<authz_types::EvaluationResponse, crate::CedarError> {
+    let policy_sets = parse_policy_sets(bundle)?;
+    let subject_parents = parent_refs_from_test_context(request, "subject_parents");
+    let resource_parents = parent_refs_from_test_context(request, "resource_parents");
+    evaluate_owned_with_policy_sets_with_parents(
+        &policy_sets,
+        request.clone(),
+        &subject_parents,
+        &resource_parents,
+    )
+}
+
+fn parent_refs_from_test_context(
+    request: &authz_types::EvaluationRequest,
+    key: &str,
+) -> Vec<EntityParentRef> {
+    request
+        .context
+        .as_ref()
+        .and_then(|context| context.attributes.get(key))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|parent| {
+            Some(EntityParentRef {
+                parent_type: parent.get("type")?.as_str()?.to_string(),
+                parent_id: parent.get("id")?.as_str()?.to_string(),
+            })
+        })
+        .collect()
+}
 
 fn default_internal_context() -> Value {
     serde_json::json!({
@@ -594,6 +660,33 @@ fn evaluator_allows_role_membership_parent() {
 }
 
 #[test]
+fn untrusted_context_cannot_inject_role_membership_parent() {
+    let config = config_with_reader_writer_roles();
+    let bundle = compile_policy_bundle(&config, 1).expect("bundle");
+    let request = authz_types::EvaluationRequest {
+        subject: Subject::user("u1"),
+        resource: Resource::new("document", "doc1"),
+        action: Action::new("write"),
+        context: Some(context_with_internal(
+            serde_json::json!({
+                "subject_parents": [ { "type": "role", "id": "editor" } ]
+            }),
+            default_internal_context(),
+        )),
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+
+    let response = evaluate_untrusted(&bundle, &request).expect("evaluation");
+
+    assert!(
+        !response.decision,
+        "reserved context keys must not grant role ancestry"
+    );
+}
+
+#[test]
 fn evaluator_denies_when_token_filter_excludes_resource() {
     let config = authz_types::ConfigurationModel {
         version: 1,
@@ -975,9 +1068,7 @@ fn evaluator_allows_org_relationship_scope() {
     let req = authz_types::EvaluationRequest {
         subject: Subject::user("u1"),
         resource: Resource::new("document", "doc1").with_properties(serde_json::json!({
-            "org_parents": [
-                { "__entity": { "type": "Authz::User", "id": "u1" } }
-            ]
+            "org_parents": ["u1"]
         })),
         action: Action::new("read"),
         context: Some(context_with_internal(
@@ -1005,9 +1096,7 @@ fn evaluator_allows_group_relationship_scope() {
     let req = authz_types::EvaluationRequest {
         subject: Subject::user("u1"),
         resource: Resource::new("document", "doc1").with_properties(serde_json::json!({
-            "group_parents": [
-                { "__entity": { "type": "Authz::User", "id": "u1" } }
-            ]
+            "group_parents": ["u1"]
         })),
         action: Action::new("read"),
         context: Some(context_with_internal(
@@ -1950,5 +2039,41 @@ fn evaluator_keeps_public_read_separate_from_role_policies() {
     assert!(
         !protected_write_res.decision,
         "write should still require a matching role link"
+    );
+}
+
+#[test]
+fn diagnostics_retain_determining_policy_and_evaluation_error_categories() {
+    use std::str::FromStr;
+
+    use cedar_policy::PolicySet;
+
+    let policies = PolicySet::from_str(
+        r#"
+        @id("allow_read") permit(principal, action, resource);
+        @id("error_read") permit(principal, action, resource)
+            when { resource.missing_attribute == "value" };
+        "#,
+    )
+    .expect("policies");
+    let request = authz_types::EvaluationRequest {
+        subject: Subject::user("u1"),
+        resource: Resource::new("document", "doc1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let prepared = crate::prepare_evaluation_owned(request).expect("prepared request");
+    let result =
+        crate::evaluator::evaluate_prepared_with_policy_set_diagnostics(&policies, prepared);
+
+    assert!(result.response.decision);
+    assert_eq!(result.determining_policy_ids.len(), 1);
+    assert!(!result.determining_policy_ids[0].is_empty());
+    assert_eq!(
+        result.evaluation_errors,
+        [crate::CedarEvaluationErrorCategory::AttributeMissing]
     );
 }

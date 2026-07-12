@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use http::{HeaderMap, HeaderValue, Uri, header::HOST};
 use url::Url;
@@ -67,6 +67,11 @@ async fn sign_request_adds_host_checksum_and_session_token_headers() {
             .and_then(|value| value.to_str().ok()),
         Some("session-token")
     );
+    assert!(
+        headers
+            .get("x-amz-security-token")
+            .is_some_and(HeaderValue::is_sensitive)
+    );
     assert!(headers.contains_key("x-amz-date"));
     assert!(headers.contains_key("x-amz-content-sha256"));
     assert!(
@@ -74,6 +79,85 @@ async fn sign_request_adds_host_checksum_and_session_token_headers() {
             .get("authorization")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256 "))
+    );
+}
+
+#[tokio::test]
+async fn sign_request_matches_aws_s3_lifecycle_golden_vector() {
+    let signer = AwsRequestSigner::new(
+        "us-east-1",
+        CredentialSource::Static(AwsStaticCredentials {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            session_token: None,
+        }),
+        "s3",
+    )
+    .expect("signer");
+    let uri: Uri = "https://examplebucket.s3.amazonaws.com/?lifecycle"
+        .parse()
+        .expect("uri");
+    let signing_time = UNIX_EPOCH + Duration::from_hours(380_376);
+
+    let headers = signer
+        .sign_request_at(
+            "GET",
+            &uri,
+            &HeaderMap::new(),
+            SignableBody::Bytes(&[]),
+            signing_time,
+        )
+        .await
+        .expect("signed request");
+
+    assert_eq!(
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some(concat!(
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, ",
+            "SignedHeaders=host;x-amz-content-sha256;x-amz-date, ",
+            "Signature=fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543"
+        ))
+    );
+}
+
+#[tokio::test]
+async fn presign_request_matches_aws_s3_golden_vector() {
+    let signer = AwsRequestSigner::new(
+        "us-east-1",
+        CredentialSource::Static(AwsStaticCredentials {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            session_token: None,
+        }),
+        "s3",
+    )
+    .expect("signer");
+    let uri: Uri = "https://examplebucket.s3.amazonaws.com/test.txt"
+        .parse()
+        .expect("uri");
+    let signing_time = UNIX_EPOCH + Duration::from_hours(380_376);
+
+    let presigned = signer
+        .presign_request_at(
+            "GET",
+            &uri,
+            &HeaderMap::new(),
+            SignableBody::UnsignedPayload,
+            Duration::from_hours(24),
+            signing_time,
+        )
+        .await
+        .expect("presigned request");
+    let url = Url::parse(&presigned.to_string()).expect("presigned url");
+    let signature = url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "X-Amz-Signature").then(|| value.into_owned()));
+
+    assert_eq!(
+        signature.as_deref(),
+        Some("aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404")
     );
 }
 

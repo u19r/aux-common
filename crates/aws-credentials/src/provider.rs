@@ -33,14 +33,14 @@ use crate::constants::{
 pub(crate) type CredentialProviderError = provider::error::CredentialsError;
 pub(crate) type CredentialProviderResult<T> = Result<T, CredentialProviderError>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AwsStaticCredentials {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub session_token: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AwsResolvedCredentials {
     pub credentials: AwsStaticCredentials,
     pub expires_after: Option<SystemTime>,
@@ -60,7 +60,7 @@ impl AwsResolvedCredentials {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum CredentialSource {
     DefaultChain,
     Static(AwsStaticCredentials),
@@ -82,7 +82,7 @@ pub struct DefaultChainCredentialsProvider {
     cache: LruTtlCache<&'static str, Credentials>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ResolvedCredentials {
     credentials: Credentials,
     refresh_after: Option<SystemTime>,
@@ -102,6 +102,52 @@ impl ResolvedCredentials {
                 .refresh_after
                 .or_else(|| half_life_refresh_after(now, expires_after)),
         }
+    }
+}
+
+impl fmt::Debug for AwsStaticCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AwsStaticCredentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"[REDACTED]")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Debug for AwsResolvedCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AwsResolvedCredentials")
+            .field("credentials", &self.credentials)
+            .field("expires_after", &self.expires_after)
+            .field("refresh_after", &self.refresh_after)
+            .finish()
+    }
+}
+
+impl fmt::Debug for CredentialSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DefaultChain => formatter.write_str("DefaultChain"),
+            Self::Static(credentials) => {
+                formatter.debug_tuple("Static").field(credentials).finish()
+            }
+        }
+    }
+}
+
+impl fmt::Debug for ResolvedCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedCredentials")
+            .field("credentials", &"[REDACTED]")
+            .field("refresh_after", &self.refresh_after)
+            .finish()
     }
 }
 

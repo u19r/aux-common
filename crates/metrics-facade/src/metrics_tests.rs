@@ -8,6 +8,14 @@ use crate::{
     counter, gauge, histogram, metrics_crate_facade_cache_snapshot, set_metrics_facade,
 };
 
+#[test]
+fn authz_projection_operation_metric_has_stable_name() {
+    assert_eq!(
+        CounterMetric::AuthzProjectionOperationsTotal.name(),
+        "authz.projection.operations_total"
+    );
+}
+
 static METRICS_FACADE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, Default)]

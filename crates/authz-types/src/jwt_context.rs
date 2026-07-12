@@ -115,6 +115,11 @@ pub enum RoleScope {
 }
 
 impl JwtContext {
+    /// Returns true only when every JWT-derived claim family is complete.
+    pub fn is_complete(&self) -> bool {
+        self.claims_complete && self.orgs_complete && self.groups_complete && self.roles_complete
+    }
+
     pub fn refresh_claims_complete(&mut self) {
         self.claims_complete = self.orgs_complete && self.groups_complete && self.roles_complete;
     }

@@ -4,8 +4,8 @@ Generic tracing, request telemetry, wide-log emission, and Prometheus helpers.
 
 Security-sensitive log field handling is explicit. Callers must either opt in to
 `TracingConfig::with_default_security()` or construct `TracingConfig::new(...)` with their own
-`FieldSecurityPolicy`. The default policy redacts common credential fields and only promotes a small
-set of request-safe fields from child spans to top-level log attributes.
+`FieldSecurityPolicy`. The default policy uses a strict allowlist and redacts common credential
+fields, so newly named free-text fields are omitted until callers explicitly approve them.
 
 ```rust
 use telemetry::{
@@ -45,6 +45,8 @@ impl TelemetryDisplay for OperationName {
 }
 
 let operation = SafeTelemetryValue::from_display(&OperationName("billing.invoice.create"));
+let span = tracing::info_span!("http.request", operation_name = tracing::field::Empty);
+operation.record_on(&span, "operation_name");
 ```
 
 Use `TraceContext::from_headers` to read inbound `traceparent`, `x-trace-id`, and `x-request-id`.

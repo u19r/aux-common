@@ -56,3 +56,42 @@ fn action_specific_rule_overrides_default_rule() {
 
     assert!(matches!(result, StepUpResult::Satisfied));
 }
+
+#[test]
+fn referenced_missing_rule_fails_closed() {
+    let rules = Vec::new();
+    let config = HashMap::from([(
+        "document".to_string(),
+        StepUpConfig {
+            default_rule: None,
+            action_rules: HashMap::from([("delete".to_string(), "missing".to_string())]),
+        },
+    )]);
+    let evaluator = StepUpEvaluator::new(&rules, &config, None);
+
+    let result = evaluator.evaluate("document", "delete", None, false);
+
+    let StepUpResult::ChallengeRequired(challenge) = result else {
+        panic!("an unresolved rule must not satisfy step-up");
+    };
+    assert_eq!(challenge.triggered_by_rule, "missing");
+    assert_eq!(challenge.challenge_type, ChallengeType::Custom);
+}
+
+#[test]
+fn future_auth_timestamp_fails_closed_at_evaluation_clock() {
+    let mut rule = StepUpRule::require_acr(
+        "recent",
+        "Require recent authentication",
+        AcrLevel::SingleFactor,
+    );
+    rule.max_auth_age_seconds = Some(300);
+    let rules = vec![rule];
+    let config = HashMap::new();
+    let evaluator = StepUpEvaluator::new(&rules, &config, Some("recent"));
+    let session = SessionContext::password_only(1_001);
+
+    let result = evaluator.evaluate_at("document", "read", Some(&session), false, 1_000);
+
+    assert!(matches!(result, StepUpResult::ChallengeRequired(_)));
+}

@@ -12,7 +12,7 @@ use crate::{compile_policy_bundle, evaluate_with_policy_sets, parse_policy_sets}
 const ITERATIONS: usize = 512;
 const MAX_ALLOCATIONS_PER_RUN: u64 = 1_050_000;
 const MAX_ALLOCATED_BYTES_PER_RUN: u64 = 320_000_000;
-const STRICT_ALLOC_GUARD_ENV: &str = "AUXFN_ENFORCE_ALLOC_GUARDS";
+const ISOLATED_ALLOC_GUARD_ENV: &str = "AUTHZ_CEDAR_ISOLATED_ALLOC_GUARD";
 
 fn default_internal_context() -> Value {
     serde_json::json!({
@@ -125,20 +125,30 @@ fn measure_direct_path(
 
 #[test]
 fn evaluate_with_policy_sets_direct_path_budget_tests() {
+    if std::env::var_os(ISOLATED_ALLOC_GUARD_ENV).is_none() {
+        let test_executable = std::env::current_exe().expect("current test executable");
+        let output = std::process::Command::new(test_executable)
+            .arg("--exact")
+            .arg("evaluator_alloc_tests::evaluate_with_policy_sets_direct_path_budget_tests")
+            .arg("--test-threads=1")
+            .env(ISOLATED_ALLOC_GUARD_ENV, "1")
+            .output()
+            .expect("run isolated allocation guard");
+        assert!(
+            output.status.success(),
+            "isolated allocation guard failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
     // Baseline snapshot (2026-03-24, template-linked policy payloads,
     // ITERATIONS=512): direct_path: 965,457 allocs, 297,774,768 bytes
     let (policy_sets, request) = allocation_fixture();
     let report = measure_direct_path(&policy_sets, &request);
 
     alloc_counter::emit_report(&report);
-
-    if std::env::var(STRICT_ALLOC_GUARD_ENV).ok().as_deref() != Some("1") {
-        eprintln!(
-            "allocation regression guard skipped; set {}=1 for a dedicated single-threaded run",
-            STRICT_ALLOC_GUARD_ENV
-        );
-        return;
-    }
 
     assert!(
         report.allocation_count <= MAX_ALLOCATIONS_PER_RUN,

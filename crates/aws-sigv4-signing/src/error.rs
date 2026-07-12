@@ -21,6 +21,8 @@ pub enum SigningError {
     InvalidUrl(String),
     #[error("signed HTTP request failed: {0}")]
     HttpRequest(String),
+    #[error("signed HTTP requests require a no-redirect HTTP client")]
+    RedirectPolicyRequired,
 }
 
 impl From<provider::error::CredentialsError> for SigningError {

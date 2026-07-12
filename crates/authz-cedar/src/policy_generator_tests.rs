@@ -118,6 +118,38 @@ fn policy_generation_emits_role_policies() {
 }
 
 #[test]
+fn write_only_resource_does_not_gain_implicit_public_read_policy() {
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "write".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![],
+        roles: vec![],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: Vec::new(),
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+    }
+    .into_validated()
+    .expect("valid config");
+
+    let policies_json = generate_static_policies(&config).expect("policies");
+    let policy_set = parse_policy_set(&policies_json);
+
+    assert_eq!(policy_set.num_of_policies(), 0);
+}
+
+#[test]
 fn org_owner_policy_is_scoped_to_org() {
     let config = ConfigurationModel {
         version: 1,
@@ -359,12 +391,13 @@ fn policy_generation_emits_scope_guards_for_all_scopes() {
         "public guard should be present"
     );
     assert!(
-        policy_text.contains("resource.org_parents") && policy_text.contains("contains(principal)"),
+        policy_text.contains("resource.org_parents")
+            && policy_text.contains("contains(principal.id)"),
         "org relationship guard should be present"
     );
     assert!(
         policy_text.contains("resource.group_parents")
-            && policy_text.contains("contains(principal)"),
+            && policy_text.contains("contains(principal.id)"),
         "group relationship guard should be present"
     );
     assert!(

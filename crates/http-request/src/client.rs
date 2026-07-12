@@ -12,9 +12,10 @@ use tracing::{debug, warn};
 
 use crate::{
     constants::{
-        DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, LABEL_METHOD, LABEL_OUTCOME,
-        LABEL_STATUS_CLASS, OUTCOME_ERROR, OUTCOME_RETRY, OUTCOME_SUCCESS, STATUS_CLASS_2XX,
-        STATUS_CLASS_3XX, STATUS_CLASS_4XX, STATUS_CLASS_5XX, STATUS_CLASS_ERROR,
+        DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_ERROR_BODY_LENGTH_BYTES, DEFAULT_REQUEST_TIMEOUT,
+        LABEL_METHOD, LABEL_OUTCOME, LABEL_STATUS_CLASS, OUTCOME_ERROR, OUTCOME_RETRY,
+        OUTCOME_SUCCESS, STATUS_CLASS_2XX, STATUS_CLASS_3XX, STATUS_CLASS_4XX, STATUS_CLASS_5XX,
+        STATUS_CLASS_ERROR,
     },
     error::{HttpRequestError, HttpRequestErrorKind, Result},
     retry::RetryConfig,
@@ -55,6 +56,7 @@ pub struct HttpClient {
     client: Client,
     retry: RetryConfig,
     transport: Arc<dyn Transport>,
+    redirects_disabled: bool,
 }
 
 #[derive(Debug)]
@@ -99,6 +101,7 @@ impl HttpClientBuilder {
     pub fn build(self) -> Result<HttpClient> {
         let client = self
             .builder
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|err| HttpRequestError::Build { source: err })?;
         let transport = self
@@ -108,6 +111,7 @@ impl HttpClientBuilder {
             client,
             retry: self.retry,
             transport,
+            redirects_disabled: true,
         })
     }
 }
@@ -135,7 +139,13 @@ impl HttpClient {
             client,
             retry,
             transport,
+            redirects_disabled: false,
         }
+    }
+
+    #[must_use]
+    pub fn redirects_disabled(&self) -> bool {
+        self.redirects_disabled
     }
 
     #[must_use]
@@ -544,11 +554,14 @@ impl HttpResponse {
         }
     }
 
-    pub async fn error_for_status_with_body(self) -> Result<Self> {
+    pub async fn error_for_status_with_body(mut self) -> Result<Self> {
         if self.status().is_success() {
             return Ok(self);
         }
         let status = self.status();
+        if self.max_body_size.is_none() {
+            self.max_body_size = Some(DEFAULT_MAX_ERROR_BODY_LENGTH_BYTES);
+        }
         let body = match self.text().await {
             Ok(body) => Some(body),
             Err(err) => return Err(err),
@@ -634,7 +647,7 @@ fn should_retry_status(status: StatusCode) -> bool {
     )
 }
 
-fn retry_delay_for_response(
+pub(crate) fn retry_delay_for_response(
     retry: &RetryConfig,
     response: &HttpResponse,
     retry_attempt: u32,
@@ -643,6 +656,7 @@ fn retry_delay_for_response(
         .headers()
         .get(http::header::RETRY_AFTER)
         .and_then(parse_retry_after)
+        .map(|delay| delay.min(retry.max_delay))
         .unwrap_or_else(|| retry.backoff_delay(retry_attempt))
 }
 

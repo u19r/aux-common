@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use authz_types::ValidatedConfigurationModel;
 
 use crate::CedarError;
@@ -8,6 +10,7 @@ use crate::CedarError;
 /// organizational entities, and resource/action definitions derived from the
 /// supplied configuration.
 pub fn generate_schema(config: &ValidatedConfigurationModel) -> Result<String, CedarError> {
+    ensure_unique_resource_entity_names(config)?;
     let mut schema_json = serde_json::json!({
         "Authz": {
             "entityTypes": {},
@@ -46,6 +49,7 @@ pub fn generate_schema_for_resource(
     config: &ValidatedConfigurationModel,
     resource_type_id: &str,
 ) -> Result<String, CedarError> {
+    ensure_unique_resource_entity_names(config)?;
     let mut schema_json = serde_json::json!({
         "Authz": {
             "entityTypes": {},
@@ -68,9 +72,48 @@ pub fn generate_schema_for_resource(
     Ok(schema_json.to_string())
 }
 
+pub(crate) fn ensure_unique_resource_entity_names(
+    config: &ValidatedConfigurationModel,
+) -> Result<(), CedarError> {
+    let mut canonical_names = HashMap::new();
+    for reserved in [
+        "User",
+        "Group",
+        "Role",
+        "ServiceAccount",
+        "ApiKey",
+        "Org",
+        "Tenant",
+    ] {
+        canonical_names.insert(
+            reserved.to_string(),
+            "reserved Cedar entity type".to_string(),
+        );
+    }
+
+    for resource_type in &config.resource_types {
+        let canonical = to_pascal_case(&resource_type.id);
+        if canonical.is_empty() {
+            return Err(CedarError::schema_generation(format!(
+                "resource type '{}' has an empty canonical Cedar entity name",
+                resource_type.id
+            )));
+        }
+        if let Some(existing) = canonical_names.insert(canonical.clone(), resource_type.id.clone())
+        {
+            return Err(CedarError::schema_generation(format!(
+                "resource types '{}' and '{}' collide as Cedar entity type '{}'",
+                existing, resource_type.id, canonical
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn add_principal_types(schema: &mut serde_json::Value) {
     let mut principal_attrs = serde_json::Map::new();
-    principal_attrs.insert("id".to_string(), cedar_attr(cedar_type("String"), false));
+    principal_attrs.insert("id".to_string(), cedar_attr(cedar_type("String"), true));
     principal_attrs.insert(
         "org_id".to_string(),
         cedar_attr(cedar_type("String"), false),
@@ -160,7 +203,7 @@ fn add_resource_entity_type(
         cedar_attr(
             serde_json::json!({
                 "type": "Set",
-                "element": { "type": "Entity", "name": "Authz::Org" }
+                "element": { "type": "String" }
             }),
             false,
         ),
@@ -170,7 +213,7 @@ fn add_resource_entity_type(
         cedar_attr(
             serde_json::json!({
                 "type": "Set",
-                "element": { "type": "Entity", "name": "Authz::Group" }
+                "element": { "type": "String" }
             }),
             false,
         ),
@@ -218,9 +261,12 @@ fn add_action(schema: &mut serde_json::Value, resource_id: &str, action: &str) {
                     "element": { "type": "Entity", "name": "Authz::Org" }
                 }),
                 false
-            )
+            ),
+            "_authz": cedar_attr(serde_json::json!({ "type": "AuthzContext" }), true)
         }
     });
+
+    schema["Authz"]["commonTypes"]["AuthzContext"] = internal_context_schema(&resource_entity);
 
     schema["Authz"]["actions"][action_name] = serde_json::json!({
         "appliesTo": {
@@ -229,6 +275,53 @@ fn add_action(schema: &mut serde_json::Value, resource_id: &str, action: &str) {
             "context": context_schema
         }
     });
+}
+
+fn internal_context_schema(resource_entity: &str) -> serde_json::Value {
+    let required = |value| cedar_attr(value, true);
+    serde_json::json!({
+        "type": "Record",
+        "attributes": {
+            "token_present": required(cedar_type("Boolean")),
+            "token_valid": required(cedar_type("Boolean")),
+            "token_resource_filter_enabled": required(cedar_type("Boolean")),
+            "token_resource_filter": required(serde_json::json!({
+                "type": "Set",
+                "element": { "type": "Entity", "name": format!("Authz::{resource_entity}") }
+            })),
+            "token_org_id_present": required(cedar_type("Boolean")),
+            "token_org_id": required(cedar_type("String")),
+            "token_owner_org_ids": required(serde_json::json!({
+                "type": "Set", "element": { "type": "String" }
+            })),
+            "allowed_actions": required(serde_json::json!({
+                "type": "Set", "element": { "type": "String" }
+            })),
+            "resource_scopes": required(serde_json::json!({
+                "type": "Set",
+                "element": {
+                    "type": "Record",
+                    "attributes": {
+                        "role": required(serde_json::json!({
+                            "type": "Entity", "name": "Authz::Role"
+                        })),
+                        "resource": required(serde_json::json!({
+                            "type": "Entity", "name": format!("Authz::{resource_entity}")
+                        }))
+                    }
+                }
+            })),
+            "session_present": required(cedar_type("Boolean")),
+            "session_acr": required(cedar_type("Long")),
+            "session_amr": required(serde_json::json!({
+                "type": "Set", "element": { "type": "String" }
+            })),
+            "session_auth_age_present": required(cedar_type("Boolean")),
+            "session_auth_age_seconds": required(cedar_type("Long")),
+            "session_mfa_age_present": required(cedar_type("Boolean")),
+            "session_mfa_age_seconds": required(cedar_type("Long"))
+        }
+    })
 }
 
 fn json_schema_to_cedar_type(schema: &serde_json::Value) -> Result<serde_json::Value, CedarError> {
@@ -252,16 +345,12 @@ fn cedar_type(name: &str) -> serde_json::Value {
 }
 
 fn cedar_attr(ty: serde_json::Value, required: bool) -> serde_json::Value {
-    if !required {
-        return ty;
-    }
-
     match ty {
         serde_json::Value::Object(mut map) => {
-            map.insert("required".to_string(), serde_json::Value::Bool(true));
+            map.insert("required".to_string(), serde_json::Value::Bool(required));
             serde_json::Value::Object(map)
         }
-        other => serde_json::json!({ "type": other, "required": true }),
+        other => serde_json::json!({ "type": other, "required": required }),
     }
 }
 

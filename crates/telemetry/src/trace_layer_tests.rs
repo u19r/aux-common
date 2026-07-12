@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use axum::{body::Body, http::Request};
+
 use crate::{
     FieldEmissionMode, FieldSecurityPolicy, RootSpanPolicy, SlowOperationThresholds, TracingConfig,
 };
@@ -21,6 +23,10 @@ fn tracing_config_given_default_security_opt_in_then_contains_redaction_blocklis
             .top_level_allowlist()
             .iter()
             .any(|field| field == crate::FIELD_TRACE_ID)
+    );
+    assert_eq!(
+        config.field_security.mode(),
+        FieldEmissionMode::StrictAllowlist
     );
 }
 
@@ -61,4 +67,18 @@ fn slow_thresholds_given_operation_override_then_uses_override() {
 
     assert_eq!(thresholds.threshold_ms_for("GET /health"), 20);
     assert_eq!(thresholds.threshold_ms_for("GET /other"), 500);
+}
+
+#[test]
+fn request_without_matched_path_uses_bounded_operation_name() {
+    let request = Request::builder()
+        .method("GET")
+        .uri("/attacker-controlled/unique/123")
+        .body(Body::empty())
+        .expect("request");
+    let method = request.method();
+    let operation_path = crate::trace_layer::bounded_operation_path(&request);
+
+    assert_eq!(format!("{method} {operation_path}"), "GET _unmatched");
+    assert_ne!(operation_path, request.uri().path());
 }

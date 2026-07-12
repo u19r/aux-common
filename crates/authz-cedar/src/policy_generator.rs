@@ -15,6 +15,7 @@ const ORG_SCOPE_GUARD: &str =
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PolicyShapeKey {
     effect: String,
+    action_operator: String,
     action_ident: String,
     resource_entity: String,
     condition_clause: String,
@@ -130,8 +131,28 @@ impl PolicyDocumentBuilder {
         resource_entity: &str,
         condition_clause: &str,
     ) {
+        self.add_role_policy_with_operator(
+            role_id,
+            effect,
+            "==",
+            action_ident,
+            resource_entity,
+            condition_clause,
+        );
+    }
+
+    fn add_role_policy_with_operator(
+        &mut self,
+        role_id: &str,
+        effect: &str,
+        action_operator: &str,
+        action_ident: &str,
+        resource_entity: &str,
+        condition_clause: &str,
+    ) {
         let key = PolicyShapeKey {
             effect: effect.to_string(),
+            action_operator: action_operator.to_string(),
             action_ident: action_ident.to_string(),
             resource_entity: resource_entity.to_string(),
             condition_clause: condition_clause.to_string(),
@@ -141,8 +162,13 @@ impl PolicyDocumentBuilder {
         } else {
             let template_id = format!("tpl_{}", self.next_template_idx);
             self.next_template_idx += 1;
-            let template_text =
-                build_template_text(effect, action_ident, resource_entity, condition_clause);
+            let template_text = build_template_text(
+                effect,
+                action_operator,
+                action_ident,
+                resource_entity,
+                condition_clause,
+            );
             self.document.template_groups.push(TemplateGroup {
                 template_id,
                 template_text,
@@ -267,10 +293,13 @@ fn build_policy_document(
         if resource_filter.is_some_and(|resource_type| resource_type != rt.id) {
             continue;
         }
+        if !rt.actions.iter().any(|action| action.name == "read") {
+            continue;
+        }
         let resource_entity = super::schema_generator::to_pascal_case(&rt.id);
         let action_id = format!("{}:read", rt.id);
         let mut conditions = vec![
-            "resource.is_public == true".to_string(),
+            "resource has is_public && resource.is_public == true".to_string(),
             token_guard_expr(&action_id),
         ];
         if let Some(step_up_guard) = step_up.guard_expr(&rt.id, "read") {
@@ -381,6 +410,7 @@ fn append_scoped_role_action_policies(
 
 fn build_template_text(
     effect: &str,
+    action_operator: &str,
     action_ident: &str,
     resource_entity: &str,
     condition_clause: &str,
@@ -388,7 +418,7 @@ fn build_template_text(
     format!(
         r#"{effect}(
   principal in ?principal,
-  action == {action_ident},
+  action {action_operator} {action_ident},
   resource is Authz::{resource_entity}
 ) {condition_clause};"#
     )
@@ -413,12 +443,19 @@ fn scope_expr(scope: &Scope) -> &'static str {
     match scope {
         Scope::Tenant => "",
         Scope::Org => ORG_SCOPE_GUARD,
-        Scope::Group => "resource.group_id == principal.group_id",
-        Scope::Own => "resource.owner_id == principal.id",
-        Scope::Shared => "resource.shared_with.contains(principal.id)",
-        Scope::Public => "resource.is_public == true",
-        Scope::OrgRelationship => "resource.org_parents.contains(principal)",
-        Scope::GroupRelationship => "resource.group_parents.contains(principal)",
+        Scope::Group => {
+            "resource has group_id && principal has group_id && resource.group_id == \
+             principal.group_id"
+        }
+        Scope::Own => "resource has owner_id && resource.owner_id == principal.id",
+        Scope::Shared => "resource has shared_with && resource.shared_with.contains(principal.id)",
+        Scope::Public => "resource has is_public && resource.is_public == true",
+        Scope::OrgRelationship => {
+            "resource has org_parents && resource.org_parents.contains(principal.id)"
+        }
+        Scope::GroupRelationship => {
+            "resource has group_parents && resource.group_parents.contains(principal.id)"
+        }
         Scope::Resource { .. } => "",
     }
 }
@@ -545,8 +582,12 @@ impl<'a> StepUpPolicyLookup<'a> {
 
     fn guard_expr(&self, resource_type: &str, action: &str) -> Option<String> {
         let rule_id = self.find_rule_id(resource_type, action)?;
-        let rule = self.rules.get(rule_id)?;
-        Some(step_up_guard_expr(rule))
+        Some(
+            self.rules
+                .get(rule_id)
+                .map(|rule| step_up_guard_expr(rule))
+                .unwrap_or_else(|| "false".to_string()),
+        )
     }
 
     fn find_rule_id(&self, resource_type: &str, action: &str) -> Option<&'a str> {

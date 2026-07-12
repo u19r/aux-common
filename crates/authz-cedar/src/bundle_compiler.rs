@@ -1,15 +1,18 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use authz_types::ValidatedConfigurationModel;
-use cedar_policy::{Policy, PolicyId, Template};
+use cedar_policy::{
+    EntityId, EntityTypeName, EntityUid, Policy, PolicyId, PolicySet, SlotId, Template,
+};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::{
     BundleManifest, CedarError, PolicyDocument, PolicySlice, SchemaSlice, SliceMeta,
     StaticPolicyEntry, TemplateGroup, TemplateLinkEntry, generate_base_schema,
     generate_policy_document_for_resource, generate_schema_for_resource,
+    schema_generator::ensure_unique_resource_entity_names,
     slices::{SLICE_SOFT_MAX_BYTES, enforce_size},
+    validation::validate_compiled_slices,
 };
 
 /// Compile a sharded policy bundle (per-resource slices) for a specific config
@@ -18,6 +21,7 @@ pub fn compile_policy_bundle(
     config: &ValidatedConfigurationModel,
     version: u64,
 ) -> Result<CompiledBundle, CedarError> {
+    ensure_unique_resource_entity_names(config)?;
     let base_schema_json = generate_base_schema()?;
     enforce_size("base schema", base_schema_json.len()).map_err(CedarError::bundle_compilation)?;
 
@@ -39,6 +43,7 @@ pub fn compile_policy_bundle(
     }
 
     let mut policy_slice_counts: HashMap<String, usize> = HashMap::new();
+    validate_compiled_slices(&schema_slices, &policy_slices)?;
     let manifest = BundleManifest {
         version,
         schema_slices: schema_slices
@@ -82,15 +87,10 @@ fn split_policy_slices(
     resource_type: &str,
     document: &PolicyDocument,
 ) -> Result<Vec<PolicySlice>, CedarError> {
-    let prepared = PreparedPolicyDocument::from_policy_document(document)?;
+    let prepared = NativePolicyDocument::from_policy_document(document)?;
     if prepared.template_groups.is_empty() {
-        let payload = serialize_policy_payload(prepared.static_policies.as_slice(), &[]).map_err(
-            |error| {
-                CedarError::bundle_compilation(format!(
-                    "failed serializing policy slice for resource {resource_type}: {error}"
-                ))
-            },
-        )?;
+        let payload = serialize_policy_payload(prepared.static_policies.as_slice(), &[])
+            .map_err(|error| policy_slice_error(resource_type, error))?;
         let size = payload.len();
         enforce_size("policy slice", size).map_err(CedarError::bundle_compilation)?;
         return Ok(vec![PolicySlice {
@@ -103,25 +103,20 @@ fn split_policy_slices(
     let mut slices = Vec::new();
     let mut include_static_policies = !prepared.static_policies.is_empty();
     let mut start_idx = 0_usize;
-    while start_idx < prepared.template_groups.len() {
+    'next_slice: while start_idx < prepared.template_groups.len() {
         let static_policies = if include_static_policies {
             prepared.static_policies.as_slice()
         } else {
             &[]
         };
+        let mut candidate_set = policy_set_with_static_policies(static_policies)?;
         let mut end_idx = start_idx;
         let mut largest_fitting_chunk: Option<(usize, String)> = None;
 
         while end_idx < prepared.template_groups.len() {
-            let candidate_payload = serialize_policy_payload(
-                static_policies,
-                &prepared.template_groups[start_idx..=end_idx],
-            )
-            .map_err(|error| {
-                CedarError::bundle_compilation(format!(
-                    "failed serializing policy slice for resource {resource_type}: {error}"
-                ))
-            })?;
+            add_template_group(&mut candidate_set, &prepared.template_groups[end_idx])?;
+            let candidate_payload = serialize_policy_set(&candidate_set)
+                .map_err(|error| policy_slice_error(resource_type, error))?;
 
             if candidate_payload.len() <= SLICE_SOFT_MAX_BYTES {
                 largest_fitting_chunk = Some((end_idx, candidate_payload));
@@ -138,16 +133,12 @@ fn split_policy_slices(
                 });
                 start_idx = last_fit_end_idx + 1;
                 include_static_policies = false;
-                continue;
+                continue 'next_slice;
             }
 
             if include_static_policies {
-                let static_only_payload =
-                    serialize_policy_payload(static_policies, &[]).map_err(|error| {
-                        CedarError::bundle_compilation(format!(
-                            "failed serializing policy slice for resource {resource_type}: {error}"
-                        ))
-                    })?;
+                let static_only_payload = serialize_policy_payload(static_policies, &[])
+                    .map_err(|error| policy_slice_error(resource_type, error))?;
                 let static_only_size = static_only_payload.len();
                 enforce_size("policy slice", static_only_size)
                     .map_err(CedarError::bundle_compilation)?;
@@ -157,7 +148,7 @@ fn split_policy_slices(
                     size_bytes: static_only_size,
                 });
                 include_static_policies = false;
-                continue;
+                continue 'next_slice;
             }
 
             return Err(CedarError::bundle_compilation(format!(
@@ -181,13 +172,8 @@ fn split_policy_slices(
 
     if include_static_policies {
         let static_only_payload =
-            serialize_policy_payload(prepared.static_policies.as_slice(), &[]).map_err(
-                |error| {
-                    CedarError::bundle_compilation(format!(
-                        "failed serializing policy slice for resource {resource_type}: {error}"
-                    ))
-                },
-            )?;
+            serialize_policy_payload(prepared.static_policies.as_slice(), &[])
+                .map_err(|error| policy_slice_error(resource_type, error))?;
         let static_only_size = static_only_payload.len();
         enforce_size("policy slice", static_only_size).map_err(CedarError::bundle_compilation)?;
         slices.push(PolicySlice {
@@ -201,139 +187,132 @@ fn split_policy_slices(
 }
 
 #[derive(Debug)]
-struct PreparedPolicyDocument {
-    static_policies: Vec<PreparedStaticPolicy>,
-    template_groups: Vec<PreparedTemplateGroup>,
+struct NativePolicyDocument {
+    static_policies: Vec<Policy>,
+    template_groups: Vec<NativeTemplateGroup>,
 }
 
-impl PreparedPolicyDocument {
+impl NativePolicyDocument {
     fn from_policy_document(document: &PolicyDocument) -> Result<Self, CedarError> {
         Ok(Self {
             static_policies: document
                 .static_policies
                 .iter()
-                .map(PreparedStaticPolicy::from_static_policy)
+                .map(parse_static_policy)
                 .collect::<Result<Vec<_>, _>>()?,
             template_groups: document
                 .template_groups
                 .iter()
-                .map(PreparedTemplateGroup::from_template_group)
+                .map(NativeTemplateGroup::from_template_group)
                 .collect::<Result<Vec<_>, _>>()?,
         })
     }
 }
 
-#[derive(Debug)]
-struct PreparedStaticPolicy {
-    policy_id: String,
-    policy_json: JsonValue,
-}
-
-impl PreparedStaticPolicy {
-    fn from_static_policy(policy: &StaticPolicyEntry) -> Result<Self, CedarError> {
-        let parsed_policy = Policy::parse(
-            Some(PolicyId::new(policy.policy_id.clone())),
-            policy.policy_text.as_str(),
-        )
-        .map_err(|error| CedarError::policy_generation(error.to_string()))?;
-        Ok(Self {
-            policy_id: policy.policy_id.clone(),
-            policy_json: parsed_policy
-                .to_json()
-                .map_err(|error| CedarError::policy_generation(error.to_string()))?,
-        })
-    }
+fn parse_static_policy(policy: &StaticPolicyEntry) -> Result<Policy, CedarError> {
+    Policy::parse(
+        Some(PolicyId::new(policy.policy_id.clone())),
+        policy.policy_text.as_str(),
+    )
+    .map_err(|error| CedarError::policy_generation(error.to_string()))
 }
 
 #[derive(Debug)]
-struct PreparedTemplateGroup {
-    template_id: String,
-    template_json: JsonValue,
-    links: Vec<PreparedTemplateLink>,
+struct NativeTemplateGroup {
+    template: Template,
+    links: Vec<NativeTemplateLink>,
 }
 
-impl PreparedTemplateGroup {
+impl NativeTemplateGroup {
     fn from_template_group(group: &TemplateGroup) -> Result<Self, CedarError> {
-        let parsed_template = Template::parse(
+        let template = Template::parse(
             Some(PolicyId::new(group.template_id.clone())),
             group.template_text.as_str(),
         )
         .map_err(|error| CedarError::policy_generation(error.to_string()))?;
         Ok(Self {
-            template_id: group.template_id.clone(),
-            template_json: parsed_template
-                .to_json()
-                .map_err(|error| CedarError::policy_generation(error.to_string()))?,
+            template,
             links: group
                 .links
                 .iter()
-                .map(|link| PreparedTemplateLink::from_template_link(&group.template_id, link))
-                .collect(),
+                .map(NativeTemplateLink::from_template_link)
+                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PreparedTemplateLink {
-    template_id: String,
-    new_id: String,
-    values: BTreeMap<String, EntityUidJson>,
+#[derive(Debug)]
+struct NativeTemplateLink {
+    policy_id: PolicyId,
+    principal: EntityUid,
 }
 
-impl PreparedTemplateLink {
-    fn from_template_link(template_id: &str, link: &TemplateLinkEntry) -> Self {
-        Self {
-            template_id: template_id.to_string(),
-            new_id: link.policy_id.clone(),
-            values: BTreeMap::from([(
-                "?principal".to_string(),
-                EntityUidJson {
-                    entity_type: "Authz::Role".to_string(),
-                    id: link.role_id.clone(),
-                },
-            )]),
-        }
+impl NativeTemplateLink {
+    fn from_template_link(link: &TemplateLinkEntry) -> Result<Self, CedarError> {
+        let entity_type = "Authz::Role"
+            .parse::<EntityTypeName>()
+            .map_err(|error| CedarError::policy_generation(error.to_string()))?;
+        let entity_id = EntityId::new(link.role_id.clone());
+        Ok(Self {
+            policy_id: PolicyId::new(link.policy_id.clone()),
+            principal: EntityUid::from_type_name_and_id(entity_type, entity_id),
+        })
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct EntityUidJson {
-    #[serde(rename = "type")]
-    entity_type: String,
-    id: String,
-}
-
 fn serialize_policy_payload(
-    static_policies: &[PreparedStaticPolicy],
-    template_groups: &[PreparedTemplateGroup],
-) -> Result<String, serde_json::Error> {
-    let static_policies = static_policies
-        .iter()
-        .map(|policy| (policy.policy_id.clone(), policy.policy_json.clone()))
-        .collect::<JsonMap<String, JsonValue>>();
-    let templates = template_groups
-        .iter()
-        .map(|group| (group.template_id.clone(), group.template_json.clone()))
-        .collect::<JsonMap<String, JsonValue>>();
-    let template_links = template_groups
-        .iter()
-        .flat_map(|group| group.links.iter().cloned())
-        .collect::<Vec<_>>();
-
-    serde_json::to_string(&SerializedPolicySet {
-        templates,
-        static_policies,
-        template_links,
-    })
+    static_policies: &[Policy],
+    template_groups: &[NativeTemplateGroup],
+) -> Result<String, CedarError> {
+    let mut policies = policy_set_with_static_policies(static_policies)?;
+    for group in template_groups {
+        add_template_group(&mut policies, group)?;
+    }
+    serialize_policy_set(&policies)
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SerializedPolicySet {
-    templates: JsonMap<String, JsonValue>,
-    static_policies: JsonMap<String, JsonValue>,
-    template_links: Vec<PreparedTemplateLink>,
+fn policy_set_with_static_policies(static_policies: &[Policy]) -> Result<PolicySet, CedarError> {
+    let mut policies = PolicySet::new();
+    for policy in static_policies {
+        policies
+            .add(policy.clone())
+            .map_err(|error| CedarError::policy_generation(error.to_string()))?;
+    }
+    Ok(policies)
+}
+
+fn add_template_group(
+    policies: &mut PolicySet,
+    group: &NativeTemplateGroup,
+) -> Result<(), CedarError> {
+    let template_id = group.template.id().clone();
+    policies
+        .add_template(group.template.clone())
+        .map_err(|error| CedarError::policy_generation(error.to_string()))?;
+    for link in &group.links {
+        policies
+            .link(
+                template_id.clone(),
+                link.policy_id.clone(),
+                HashMap::from([(SlotId::principal(), link.principal.clone())]),
+            )
+            .map_err(|error| CedarError::policy_generation(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn serialize_policy_set(policies: &PolicySet) -> Result<String, CedarError> {
+    let json = policies
+        .clone()
+        .to_json()
+        .map_err(|error| CedarError::policy_generation(error.to_string()))?;
+    serde_json::to_string(&json).map_err(|error| CedarError::policy_generation(error.to_string()))
+}
+
+fn policy_slice_error(resource_type: &str, error: CedarError) -> CedarError {
+    CedarError::bundle_compilation(format!(
+        "failed serializing policy slice for resource {resource_type}: {error}"
+    ))
 }
 
 /// Sharded compiled bundle.

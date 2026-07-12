@@ -92,16 +92,19 @@ impl JsonDocument {
         let mut deserializer = serde_json::Deserializer::from_slice(bytes);
         deserializer
             .deserialize_any(DuplicateRejectingVisitor)
-            .map_err(|_| ())
+            .map_err(|_| ())?;
+        deserializer.end().map_err(|_| ())
     }
 
     pub(crate) fn value_rejecting_duplicate_members(
         bytes: &[u8],
     ) -> std::result::Result<Value, ()> {
         let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-        deserializer
+        let value = deserializer
             .deserialize_any(DuplicateRejectingValueVisitor)
-            .map_err(|_| ())
+            .map_err(|_| ())?;
+        deserializer.end().map_err(|_| ())?;
+        Ok(value)
     }
 }
 

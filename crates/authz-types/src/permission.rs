@@ -1,10 +1,10 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 
 use crate::ValidationError;
 
 /// Validated permission identifier (format: {resource_type}:{name}).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[schema(
     value_type = String,
     pattern = "^[^:]+:[^:]+$",
@@ -17,17 +17,22 @@ impl PermissionId {
 
     pub fn new(s: impl Into<String>) -> Result<Self, ValidationError> {
         let s = s.into();
-        let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() != 2 {
+        if s.len() > Self::MAX_LENGTH {
+            return Err(ValidationError::OutOfRange {
+                field: "permission_id",
+                message: format!("max length is {}", Self::MAX_LENGTH),
+            });
+        }
+        let Some((resource_type, name)) = s.split_once(':') else {
             return Err(ValidationError::InvalidFormat {
                 field: "permission_id",
                 message: "must be {resource_type}:{name}".to_string(),
             });
-        }
-        if parts[0].is_empty() || parts[1].is_empty() {
+        };
+        if resource_type.is_empty() || name.is_empty() || name.contains(':') {
             return Err(ValidationError::InvalidFormat {
                 field: "permission_id",
-                message: "resource_type and name cannot be empty".to_string(),
+                message: "must contain exactly one ':' with non-empty components".to_string(),
             });
         }
         Ok(Self(s))
@@ -37,10 +42,24 @@ impl PermissionId {
         &self.0
     }
     pub fn resource_type(&self) -> &str {
-        self.0.split(':').next().unwrap()
+        self.0
+            .split_once(':')
+            .map(|(resource_type, _)| resource_type)
+            .unwrap_or_default()
     }
     pub fn name(&self) -> &str {
-        self.0.split(':').nth(1).unwrap()
+        self.0
+            .split_once(':')
+            .map(|(_, name)| name)
+            .unwrap_or_default()
+    }
+}
+
+impl<'de> Deserialize<'de> for PermissionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: Deserializer<'de> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 

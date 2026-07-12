@@ -1,7 +1,9 @@
 use std::{collections::VecDeque, sync::Mutex};
 
 use http::{HeaderMap, Method, StatusCode};
-use http_request::{HttpClient, HttpResponse, Transport, TransportFuture, reqwest::Request};
+use http_request::{
+    HttpClient, HttpResponse, RetryConfig, Transport, TransportFuture, reqwest::Request,
+};
 
 use crate::{AwsSigv4HttpClient, AwsStaticCredentials, CredentialSource};
 
@@ -80,6 +82,26 @@ fn static_credentials() -> CredentialSource {
         secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
         session_token: None,
     })
+}
+
+#[test]
+fn signed_client_rejects_http_clients_without_a_no_redirect_guarantee() {
+    let external = http_request::reqwest::Client::builder()
+        .build()
+        .expect("external reqwest client");
+    let client = HttpClient::with_client(external, RetryConfig::default());
+
+    let error = AwsSigv4HttpClient::new(
+        client,
+        "https://service.test",
+        "us-east-1",
+        static_credentials(),
+        "execute-api",
+    )
+    .err()
+    .expect("unconstrained redirect client must be rejected");
+
+    assert!(matches!(error, crate::SigningError::RedirectPolicyRequired));
 }
 
 #[tokio::test]

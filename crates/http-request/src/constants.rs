@@ -13,6 +13,7 @@ pub(crate) const DEFAULT_TENANT_REQUEST_TIMEOUT: Duration = Duration::from_secs(
 
 pub(crate) const DEFAULT_MAX_CONTENT_LENGTH_BYTES: usize = 256 * 1024;
 pub(crate) const DEFAULT_MAX_RESPONSE_LENGTH_BYTES: usize = 256 * 1024;
+pub(crate) const DEFAULT_MAX_ERROR_BODY_LENGTH_BYTES: usize = 256 * 1024;
 
 pub(crate) const DEFAULT_MAX_REDIRECTS: usize = 5;
 pub(crate) const DEFAULT_MAX_DNS_ADDRESSES: usize = 8;

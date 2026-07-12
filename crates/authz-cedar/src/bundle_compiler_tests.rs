@@ -1,12 +1,119 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, str::FromStr};
 
 use authz_types::{
     ActionDefinition, ConfigurationModel, Permission, PermissionActionRef, PermissionId,
     ResourceType, Role, RolePermission, Scope,
 };
-use cedar_policy::PolicySet;
+use cedar_policy::{EntityUid, Policy, PolicyId, PolicySet, SlotId, Template};
 
 use crate::{SLICE_SOFT_MAX_BYTES, compile_policy_bundle};
+
+#[test]
+fn validation_given_unknown_action_then_rejects_policy_set() {
+    use std::str::FromStr;
+
+    use cedar_policy::PolicySet;
+
+    let config = basic_config();
+    let schema = crate::generate_schema_for_resource(&config, "document").expect("schema");
+    let policies = PolicySet::from_str(
+        r#"permit(principal, action == Authz::Action::"document:unknown", resource);"#,
+    )
+    .expect("syntactically valid policy");
+
+    let result = crate::validation::validate_policy_set(&schema, &policies, 0);
+
+    assert!(
+        result.is_err(),
+        "unknown action must fail strict validation"
+    );
+}
+
+fn validate_policy_text(
+    config: &authz_types::ValidatedConfigurationModel,
+    policy: &str,
+) -> Result<(), crate::CedarError> {
+    use std::str::FromStr;
+
+    let schema = crate::generate_schema_for_resource(config, "document").expect("schema");
+    let policies = PolicySet::from_str(policy).expect("syntactically valid policy");
+    crate::validation::validate_policy_set(
+        &schema,
+        &policies,
+        crate::validation::GENERATED_POLICY_MAX_DEREF_LEVEL,
+    )
+}
+
+#[test]
+fn validation_given_action_resource_type_mismatch_then_rejects_policy_set() {
+    let result = validate_policy_text(
+        &basic_config(),
+        r#"permit(principal, action == Authz::Action::"document:read", resource is Authz::Org);"#,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn validation_given_optional_attribute_without_has_then_rejects_policy_set() {
+    let result = validate_policy_text(
+        &basic_config(),
+        r#"permit(principal, action == Authz::Action::"document:read", resource) when { resource.org_id == "org_acme" };"#,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn validation_given_incorrect_comparison_type_then_rejects_policy_set() {
+    let result = validate_policy_text(
+        &basic_config(),
+        r#"permit(principal, action == Authz::Action::"document:read", resource) when { resource.is_public == "true" };"#,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn validation_given_policy_from_another_schema_slice_then_rejects_policy_set() {
+    let result = validate_policy_text(
+        &basic_config(),
+        r#"permit(principal, action == Authz::Action::"issue:read", resource is Authz::Issue);"#,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn validation_given_template_link_bound_to_incompatible_principal_then_rejects_policy_set() {
+    use std::str::FromStr;
+
+    use cedar_policy::{EntityUid, PolicyId, SlotId, Template};
+
+    let config = basic_config();
+    let schema = crate::generate_schema_for_resource(&config, "document").expect("schema");
+    let template = Template::parse(
+        Some(PolicyId::new("template_read")),
+        r#"permit(principal in ?principal, action == Authz::Action::"document:read", resource);"#,
+    )
+    .expect("template");
+    let mut policies = PolicySet::new();
+    policies.add_template(template).expect("add template");
+    policies
+        .link(
+            PolicyId::new("template_read"),
+            PolicyId::new("linked_read"),
+            HashMap::from([(
+                SlotId::principal(),
+                EntityUid::from_str(r#"Authz::Document::"doc1""#).expect("uid"),
+            )]),
+        )
+        .expect("link is syntactically complete");
+
+    let result = crate::validation::validate_policy_set(
+        &schema,
+        &policies,
+        crate::validation::GENERATED_POLICY_MAX_DEREF_LEVEL,
+    );
+
+    assert!(result.is_err());
+}
 
 fn base_resource() -> ResourceType {
     ResourceType {
@@ -25,6 +132,23 @@ fn base_resource() -> ResourceType {
         ],
         context_schema: None,
     }
+}
+
+fn basic_config() -> authz_types::ValidatedConfigurationModel {
+    ConfigurationModel {
+        version: 1,
+        resource_types: vec![base_resource()],
+        permissions: vec![],
+        roles: vec![],
+        scope_mappings: vec![],
+        authn_providers: vec![],
+        step_up_rules: vec![],
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+        description: None,
+    }
+    .into_validated()
+    .expect("valid basic config")
 }
 
 fn permission_actions(resource_type: &str, action_names: &[&str]) -> Vec<PermissionActionRef> {
@@ -348,4 +472,100 @@ fn compiled_bundle_round_trips_through_public_json() {
 
     assert_eq!(decoded, bundle);
     assert_eq!(decoded.version, 42);
+}
+
+#[test]
+fn native_policy_set_rejects_policy_template_and_link_id_collisions() {
+    let mut policies = PolicySet::new();
+    let policy = Policy::parse(
+        Some(PolicyId::new("shared_id")),
+        r#"permit(principal, action, resource);"#,
+    )
+    .expect("static policy");
+    policies.add(policy.clone()).expect("first policy");
+    assert!(
+        policies.add(policy).is_err(),
+        "duplicate policy id must fail"
+    );
+
+    let colliding_template = Template::parse(
+        Some(PolicyId::new("shared_id")),
+        r#"permit(principal in ?principal, action, resource);"#,
+    )
+    .expect("template");
+    assert!(
+        policies.add_template(colliding_template).is_err(),
+        "template id must not collide with a policy id"
+    );
+
+    let template = Template::parse(
+        Some(PolicyId::new("template_id")),
+        r#"permit(principal in ?principal, action, resource);"#,
+    )
+    .expect("template");
+    policies.add_template(template).expect("unique template");
+    let values = HashMap::from([(
+        SlotId::principal(),
+        EntityUid::from_str(r#"Authz::Role::"reader""#).expect("role uid"),
+    )]);
+    policies
+        .link(
+            PolicyId::new("template_id"),
+            PolicyId::new("linked_id"),
+            values.clone(),
+        )
+        .expect("first link");
+    assert!(
+        policies
+            .link(
+                PolicyId::new("template_id"),
+                PolicyId::new("linked_id"),
+                values,
+            )
+            .is_err(),
+        "linked policy id collision must fail"
+    );
+}
+
+#[test]
+fn native_policy_set_rejects_incomplete_slot_binding() {
+    let template = Template::parse(
+        Some(PolicyId::new("template_id")),
+        r#"permit(principal in ?principal, action, resource);"#,
+    )
+    .expect("template");
+    let mut policies = PolicySet::new();
+    policies.add_template(template).expect("template");
+
+    assert!(
+        policies
+            .link(
+                PolicyId::new("template_id"),
+                PolicyId::new("linked_id"),
+                HashMap::new(),
+            )
+            .is_err(),
+        "missing principal slot must fail"
+    );
+}
+
+#[test]
+fn generated_policy_set_losslessly_round_trips_through_pst_json_and_cedar_text() {
+    let bundle = compile_policy_bundle(&basic_config(), 1).expect("bundle");
+    let original = PolicySet::from_json_str(&bundle.policy_slices[0].policies_json)
+        .expect("generated policy JSON");
+    let original_policy_count = original.num_of_policies();
+    let original_template_count = original.num_of_templates();
+    let pst = original.to_pst().expect("generated PST");
+    let from_pst = PolicySet::from_pst(pst.clone()).expect("PST policy set");
+    assert_eq!(from_pst.to_pst().expect("round-trip PST"), pst);
+
+    let json = from_pst.clone().to_json().expect("PST JSON");
+    let from_json = PolicySet::from_json_value(json).expect("parsed PST JSON");
+    assert_eq!(from_json.num_of_policies(), original_policy_count);
+    assert_eq!(from_json.num_of_templates(), original_template_count);
+
+    let cedar_text = from_json.to_string();
+    let from_text = PolicySet::from_str(&cedar_text).expect("diagnostic Cedar text");
+    assert_eq!(from_text.num_of_policies(), original_policy_count);
 }

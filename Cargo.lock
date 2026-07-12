@@ -87,9 +87,12 @@ dependencies = [
  "authz-cedar",
  "authz-types",
  "chrono",
+ "metrics-facade",
  "serde",
  "serde_json",
  "thiserror",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

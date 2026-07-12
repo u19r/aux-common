@@ -1,0 +1,11 @@
+[advisories]
+ignore = [
+    # jwt-decode only exposes verification with DecodingKey/decode. The affected
+    # rsa private-key operation is not reachable, including on wasm where
+    # jsonwebtoken's rust_crypto feature supplies RSA verification.
+    "RUSTSEC-2023-0071",
+    # cargo-audit matches the local workspace crate telemetry 0.1.0 by name and
+    # version to an unrelated crates.io package. cargo-deny correctly excludes
+    # this path dependency from the advisory match.
+    "RUSTSEC-2021-0046",
+]

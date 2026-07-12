@@ -1,6 +1,9 @@
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -221,6 +224,7 @@ impl CostResponseHeaders {
 
 #[derive(Default)]
 struct RequestCostCollector {
+    registration_id: Option<u64>,
     request_id: Option<String>,
     wall_ms: Option<f64>,
     remote_wait_ms: f64,
@@ -282,35 +286,66 @@ impl RequestCostCollector {
 
 #[derive(Default)]
 struct ActiveRequestRegistry {
-    requests: Mutex<BTreeMap<String, Weak<Mutex<RequestCostCollector>>>>,
+    requests: Mutex<BTreeMap<u64, ActiveRequest>>,
 }
+
+struct ActiveRequest {
+    request_id: String,
+    collector: Weak<Mutex<RequestCostCollector>>,
+}
+
+static NEXT_REGISTRATION_ID: AtomicU64 = AtomicU64::new(1);
 
 fn registry() -> &'static ActiveRequestRegistry {
     static REGISTRY: OnceLock<ActiveRequestRegistry> = OnceLock::new();
     REGISTRY.get_or_init(ActiveRequestRegistry::default)
 }
 
-fn register_request(request_id: &str, collector: &RequestCostCollectorHandle) {
-    let Ok(mut requests) = registry().requests.lock() else {
-        return;
-    };
-    requests.insert(request_id.to_string(), Arc::downgrade(collector));
+fn next_registration_id() -> u64 {
+    NEXT_REGISTRATION_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-fn unregister_request(request_id: &str) {
+fn register_request(
+    registration_id: u64,
+    request_id: &str,
+    collector: &RequestCostCollectorHandle,
+) {
     let Ok(mut requests) = registry().requests.lock() else {
         return;
     };
-    requests.remove(request_id);
+    requests.retain(|_, request| request.collector.strong_count() > 0);
+    requests.insert(
+        registration_id,
+        ActiveRequest {
+            request_id: request_id.to_string(),
+            collector: Arc::downgrade(collector),
+        },
+    );
+}
+
+fn unregister_request(registration_id: u64) {
+    let Ok(mut requests) = registry().requests.lock() else {
+        return;
+    };
+    requests.remove(&registration_id);
 }
 
 fn with_active_collector<F>(request_id: &str, f: F)
 where F: FnOnce(&mut RequestCostCollector) {
     let collector = {
-        let Ok(requests) = registry().requests.lock() else {
+        let Ok(mut requests) = registry().requests.lock() else {
             return;
         };
-        requests.get(request_id).and_then(Weak::upgrade)
+        requests.retain(|_, request| request.collector.strong_count() > 0);
+        let mut matching = requests
+            .values()
+            .filter(|request| request.request_id == request_id)
+            .filter_map(|request| request.collector.upgrade());
+        let collector = matching.next();
+        if matching.next().is_some() {
+            return;
+        }
+        collector
     };
     let Some(collector) = collector else {
         return;
@@ -339,12 +374,14 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = T>,
 {
+    let registration_id = request_id.as_ref().map(|_| next_registration_id());
     let collector = Arc::new(Mutex::new(RequestCostCollector {
+        registration_id,
         request_id: request_id.clone(),
         ..RequestCostCollector::default()
     }));
-    if let Some(request_id) = request_id.as_deref() {
-        register_request(request_id, &collector);
+    if let (Some(registration_id), Some(request_id)) = (registration_id, request_id.as_deref()) {
+        register_request(registration_id, request_id, &collector);
     }
     REQUEST_COST_COLLECTOR.scope(collector, future()).await
 }
@@ -354,46 +391,35 @@ pub async fn finish_request_cost_collection(
     wall_ms: f64,
     response_bytes: Option<u64>,
 ) -> RequestCostSnapshot {
-    let snapshot = REQUEST_COST_COLLECTOR
-        .try_with(|collector| {
-            let Ok(mut collector) = collector.lock() else {
-                return RequestCostSnapshot::default();
-            };
-            collector.wall_ms = Some(wall_ms);
-            collector.response_bytes = response_bytes;
-            collector.mark_updated();
-            collector.snapshot()
-        })
-        .unwrap_or_default();
-    if let Some(request_id) = request_id {
-        wait_for_cost_settle(request_id).await;
-        let settled = REQUEST_COST_COLLECTOR
-            .try_with(|collector| {
-                collector
-                    .lock()
-                    .map(|collector| collector.snapshot())
-                    .unwrap_or_else(|_| snapshot.clone())
-            })
-            .unwrap_or_else(|_| snapshot.clone());
-        unregister_request(request_id);
-        return settled;
+    let Ok(collector) = REQUEST_COST_COLLECTOR.try_with(Arc::clone) else {
+        return RequestCostSnapshot::default();
+    };
+    let (snapshot, registration_id) = {
+        let Ok(mut collector) = collector.lock() else {
+            return RequestCostSnapshot::default();
+        };
+        collector.wall_ms = Some(wall_ms);
+        collector.response_bytes = response_bytes;
+        collector.mark_updated();
+        (collector.snapshot(), collector.registration_id)
+    };
+    if request_id.is_some() {
+        wait_for_cost_settle(&collector).await;
     }
-    snapshot
+    let settled = collector
+        .lock()
+        .map(|collector| collector.snapshot())
+        .unwrap_or(snapshot);
+    if let Some(registration_id) = registration_id {
+        unregister_request(registration_id);
+    }
+    settled
 }
 
-async fn wait_for_cost_settle(request_id: &str) {
+async fn wait_for_cost_settle(collector: &RequestCostCollectorHandle) {
     let deadline = Instant::now() + COST_STABILIZE_TIMEOUT;
     loop {
         let settled = {
-            let collector = {
-                let Ok(requests) = registry().requests.lock() else {
-                    return;
-                };
-                requests.get(request_id).and_then(Weak::upgrade)
-            };
-            let Some(collector) = collector else {
-                return;
-            };
             let Ok(collector) = collector.lock() else {
                 return;
             };

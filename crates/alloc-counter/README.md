@@ -70,5 +70,16 @@ Each report is a single-line JSON object:
 ## Notes
 
 - Counts are process-local and include all heap allocations that occur while a guard is active.
-- The harness serializes guard windows with a mutex to avoid cross-test contamination.
-- Prefer `--test-threads=1` for stable comparisons.
+- The harness serializes guard windows with a mutex so two guards cannot reset each other's
+  counters. It cannot exclude allocations made by unrelated threads or async tasks while a guard
+  is active.
+- Async guards span every `.await`. Use them only in a dedicated test process with no background
+  work, and avoid multi-thread runtimes when a current-thread runtime is sufficient.
+- Enforced allocation budgets must run as one named test with `--test-threads=1`, for example:
+
+  ```bash
+  cargo test -p <crate> <exact_test_name> -- --exact --nocapture --test-threads=1
+  ```
+
+  Running an entire test binary with `--test-threads=1` serializes tests, but does not isolate
+  allocations from threads or tasks started by the test itself.

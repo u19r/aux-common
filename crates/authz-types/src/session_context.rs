@@ -78,21 +78,23 @@ impl SessionContext {
     }
 
     pub fn is_auth_recent(&self, max_age_seconds: u64) -> bool {
-        if let Some(auth_time) = self.auth_time {
-            let age = (Utc::now().timestamp() - auth_time).unsigned_abs();
-            age <= max_age_seconds
-        } else {
-            false
-        }
+        self.is_auth_recent_at(Utc::now().timestamp(), max_age_seconds)
+    }
+
+    pub fn is_auth_recent_at(&self, now_seconds: i64, max_age_seconds: u64) -> bool {
+        self.auth_time
+            .and_then(|auth_time| elapsed_seconds(now_seconds, auth_time))
+            .is_some_and(|age| age <= max_age_seconds)
     }
 
     pub fn is_mfa_recent(&self, max_age_seconds: u64) -> bool {
-        if let Some(mfa_time) = self.mfa_time {
-            let age = (Utc::now().timestamp() - mfa_time).unsigned_abs();
-            age <= max_age_seconds
-        } else {
-            false
-        }
+        self.is_mfa_recent_at(Utc::now().timestamp(), max_age_seconds)
+    }
+
+    pub fn is_mfa_recent_at(&self, now_seconds: i64, max_age_seconds: u64) -> bool {
+        self.mfa_time
+            .and_then(|mfa_time| elapsed_seconds(now_seconds, mfa_time))
+            .is_some_and(|age| age <= max_age_seconds)
     }
 
     pub fn has_amr(&self, method: &str) -> bool {
@@ -150,4 +152,10 @@ impl SessionContext {
             saml_expires_at: None,
         })
     }
+}
+
+fn elapsed_seconds(now_seconds: i64, event_seconds: i64) -> Option<u64> {
+    now_seconds
+        .checked_sub(event_seconds)
+        .and_then(|age| u64::try_from(age).ok())
 }

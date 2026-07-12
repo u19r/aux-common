@@ -25,6 +25,43 @@ fn allocation_guard_records_allocations_tests() {
 }
 
 #[test]
+fn allocation_guard_characterizes_process_global_background_allocations() {
+    use std::{
+        hint::black_box,
+        sync::{Arc, Barrier},
+    };
+
+    let start_allocation = Arc::new(Barrier::new(2));
+    let allocation_finished = Arc::new(Barrier::new(2));
+    let worker = std::thread::spawn({
+        let start_allocation = Arc::clone(&start_allocation);
+        let allocation_finished = Arc::clone(&allocation_finished);
+        move || {
+            start_allocation.wait();
+            let mut background = Vec::with_capacity(4096);
+            background.push(1_u8);
+            black_box(&background);
+            allocation_finished.wait();
+        }
+    });
+    let guard = alloc_counter::AllocationGuard::start(
+        module_path!(),
+        "allocation_guard_characterizes_process_global_background_allocations",
+        file!(),
+        line!(),
+        Some("global-scope-characterization"),
+    );
+
+    start_allocation.wait();
+    allocation_finished.wait();
+    let report = guard.finish();
+    worker.join().expect("background allocation worker");
+
+    assert!(report.allocation_count >= 1);
+    assert!(report.allocated_bytes >= 4096);
+}
+
+#[test]
 #[count_allocations(label = "macro_smoke")]
 fn count_allocations_macro_sync_tests() {
     let values = [String::from("a"), String::from("b"), String::from("c")];

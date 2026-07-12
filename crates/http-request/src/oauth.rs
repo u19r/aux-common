@@ -1,8 +1,10 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{HttpClient, Result};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct OAuthTokenEndpoint {
     url: String,
     headers: Vec<(String, String)>,
@@ -13,13 +15,13 @@ pub struct OAuthUserinfoEndpoint {
     url: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct OAuthRevocationEndpoint {
     url: String,
     headers: Vec<(String, String)>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct OAuthAuthorizationCodeRequest {
     grant_type: &'static str,
     client_id: String,
@@ -28,21 +30,21 @@ pub struct OAuthAuthorizationCodeRequest {
     code_verifier: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct OAuthRefreshTokenRequest {
     grant_type: &'static str,
     client_id: String,
     refresh_token: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct OAuthRevocationRequest {
     token: String,
     token_type_hint: String,
     client_id: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Deserialize)]
 pub struct OAuthTokenResponse {
     access_token: String,
     #[serde(default)]
@@ -53,6 +55,81 @@ pub struct OAuthTokenResponse {
     expires_in: Option<u64>,
     #[serde(default)]
     scope: Option<String>,
+}
+
+impl fmt::Debug for OAuthTokenEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OAuthTokenEndpoint")
+            .field("url", &self.url)
+            .field("header_names", &header_names(&self.headers))
+            .finish()
+    }
+}
+
+impl fmt::Debug for OAuthRevocationEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OAuthRevocationEndpoint")
+            .field("url", &self.url)
+            .field("header_names", &header_names(&self.headers))
+            .finish()
+    }
+}
+
+impl fmt::Debug for OAuthAuthorizationCodeRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OAuthAuthorizationCodeRequest")
+            .field("grant_type", &self.grant_type)
+            .field("client_id", &self.client_id)
+            .field("code", &"[REDACTED]")
+            .field("redirect_uri", &self.redirect_uri)
+            .field("code_verifier", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl fmt::Debug for OAuthRefreshTokenRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OAuthRefreshTokenRequest")
+            .field("grant_type", &self.grant_type)
+            .field("client_id", &self.client_id)
+            .field("refresh_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl fmt::Debug for OAuthRevocationRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OAuthRevocationRequest")
+            .field("token", &"[REDACTED]")
+            .field("token_type_hint", &self.token_type_hint)
+            .field("client_id", &self.client_id)
+            .finish()
+    }
+}
+
+impl fmt::Debug for OAuthTokenResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OAuthTokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+fn header_names(headers: &[(String, String)]) -> Vec<&str> {
+    headers.iter().map(|(name, _)| name.as_str()).collect()
 }
 
 impl OAuthTokenEndpoint {

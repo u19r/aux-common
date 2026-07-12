@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fmt};
+use std::{borrow::Cow, cell::RefCell, fmt};
 
 use serde::Serialize;
 
@@ -22,6 +22,21 @@ impl SafeTelemetryValue {
     pub fn into_string(self) -> String {
         self.0
     }
+
+    /// Records this explicitly safe string on an existing tracing span.
+    ///
+    /// `TypedOnly` policies drop ordinary string fields. This method gives
+    /// callers a typed path for low-cardinality enum/newtype values without
+    /// weakening that policy for arbitrary strings, errors, or debug output.
+    pub fn record_on(&self, span: &tracing::Span, field: &'static str) {
+        let recording = SafeRecording {
+            field,
+            value: self.0.clone(),
+        };
+        SAFE_RECORDINGS.with(|recordings| recordings.borrow_mut().push(recording));
+        let _guard = SafeRecordingGuard;
+        span.record(field, self.as_str());
+    }
 }
 
 impl fmt::Display for SafeTelemetryValue {
@@ -38,4 +53,32 @@ impl TelemetryDisplay for SafeTelemetryValue {
     fn telemetry_display(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.as_str())
     }
+}
+
+struct SafeRecording {
+    field: &'static str,
+    value: String,
+}
+
+thread_local! {
+    static SAFE_RECORDINGS: RefCell<Vec<SafeRecording>> = const { RefCell::new(Vec::new()) };
+}
+
+struct SafeRecordingGuard;
+
+impl Drop for SafeRecordingGuard {
+    fn drop(&mut self) {
+        SAFE_RECORDINGS.with(|recordings| {
+            recordings.borrow_mut().pop();
+        });
+    }
+}
+
+pub(crate) fn is_safe_recording(field: &str, value: &str) -> bool {
+    SAFE_RECORDINGS.with(|recordings| {
+        recordings
+            .borrow()
+            .last()
+            .is_some_and(|recording| recording.field == field && recording.value == value)
+    })
 }

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use authz_types::{
     AcrLevel, AuthzChallenge, ChallengeType, SessionContext, StepUpConfig, StepUpRule,
 };
+use chrono::Utc;
 
 #[derive(Debug, Clone)]
 pub enum StepUpResult {
@@ -40,11 +41,28 @@ impl<'a> StepUpEvaluator<'a> {
         session: Option<&SessionContext>,
         is_api_key: bool,
     ) -> StepUpResult {
+        self.evaluate_at(
+            resource_type,
+            action,
+            session,
+            is_api_key,
+            Utc::now().timestamp(),
+        )
+    }
+
+    pub fn evaluate_at(
+        &self,
+        resource_type: &str,
+        action: &str,
+        session: Option<&SessionContext>,
+        is_api_key: bool,
+        now_seconds: i64,
+    ) -> StepUpResult {
         let Some(rule_id) = self.find_applicable_rule(resource_type, action) else {
             return StepUpResult::Satisfied;
         };
         let Some(rule) = self.rules.get(rule_id) else {
-            return StepUpResult::Satisfied;
+            return StepUpResult::ChallengeRequired(Self::challenge_for_missing_rule(rule_id));
         };
         let rule = *rule;
 
@@ -56,7 +74,7 @@ impl<'a> StepUpEvaluator<'a> {
             return StepUpResult::ChallengeRequired(self.challenge_for_missing_session(rule));
         };
 
-        self.evaluate_rule(rule, session)
+        self.evaluate_rule(rule, session, now_seconds)
     }
 
     fn find_applicable_rule(&self, resource_type: &str, action: &str) -> Option<&str> {
@@ -71,7 +89,12 @@ impl<'a> StepUpEvaluator<'a> {
         self.default_rule
     }
 
-    fn evaluate_rule(&self, rule: &StepUpRule, session: &SessionContext) -> StepUpResult {
+    fn evaluate_rule(
+        &self,
+        rule: &StepUpRule,
+        session: &SessionContext,
+        now_seconds: i64,
+    ) -> StepUpResult {
         if !session.acr.satisfies(rule.required_acr) {
             let challenge_type = self.select_challenge_type(rule, Some(session));
             let challenge =
@@ -84,7 +107,7 @@ impl<'a> StepUpEvaluator<'a> {
         }
 
         if let Some(max_age) = rule.max_auth_age_seconds
-            && !session.is_auth_recent(max_age)
+            && !session.is_auth_recent_at(now_seconds, max_age)
         {
             let challenge =
                 AuthzChallenge::re_authenticate(&rule.rule_id, max_age).with_www_authenticate(
@@ -94,7 +117,7 @@ impl<'a> StepUpEvaluator<'a> {
         }
 
         if let Some(max_mfa_age) = rule.max_mfa_age_seconds
-            && !session.is_mfa_recent(max_mfa_age)
+            && !session.is_mfa_recent_at(now_seconds, max_mfa_age)
         {
             let challenge = AuthzChallenge::for_step_up(
                 &rule.rule_id,
@@ -169,6 +192,11 @@ impl<'a> StepUpEvaluator<'a> {
                 rule.required_acr,
                 rule.max_auth_age_seconds,
             ))
+    }
+
+    fn challenge_for_missing_rule(rule_id: &str) -> AuthzChallenge {
+        AuthzChallenge::for_step_up(rule_id, AcrLevel::RecentAuth, ChallengeType::Custom)
+            .with_www_authenticate(Self::build_www_authenticate(AcrLevel::RecentAuth, None))
     }
 
     fn build_www_authenticate(required_acr: AcrLevel, max_age: Option<u64>) -> String {

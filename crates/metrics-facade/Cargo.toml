@@ -1,5 +1,6 @@
 [package]
 publish = false
+
 name = "metrics-facade"
 version = "0.1.0"
 edition.workspace = true
@@ -11,12 +12,16 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 
+[features]
+default = ["request-cost"]
+request-cost = ["dep:tokio"]
+
 [dependencies]
 http = { workspace = true }
 metrics = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, optional = true }
 
 [lints]
 workspace = true

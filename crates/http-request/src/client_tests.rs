@@ -10,6 +10,7 @@ use serde_json::json;
 
 use crate::{
     HttpClientBuilder, HttpRequestError, HttpResponse, RetryConfig, Transport, TransportFuture,
+    client::retry_delay_for_response,
 };
 
 struct SequenceTransport {
@@ -279,6 +280,30 @@ async fn error_for_status_with_body_preserves_response_body_for_non_success_resp
 }
 
 #[tokio::test]
+async fn error_for_status_with_body_applies_default_size_limit() {
+    let body = vec![b'x'; crate::constants::DEFAULT_MAX_ERROR_BODY_LENGTH_BYTES + 1];
+    let result = HttpResponse::from_mock(
+        StatusCode::BAD_GATEWAY,
+        HeaderMap::new(),
+        body,
+        Url::parse("https://example.test/resource").expect("502 response url"),
+    )
+    .error_for_status_with_body()
+    .await;
+    let error = match result {
+        Ok(_) => panic!("oversized error body must be bounded by default"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        HttpRequestError::ResponseTooLarge { size, max }
+            if size == crate::constants::DEFAULT_MAX_ERROR_BODY_LENGTH_BYTES + 1
+                && max == crate::constants::DEFAULT_MAX_ERROR_BODY_LENGTH_BYTES
+    ));
+}
+
+#[tokio::test]
 async fn mock_response_text_respects_max_body_size_limit() {
     let error = HttpResponse::from_mock(
         StatusCode::OK,
@@ -362,7 +387,7 @@ async fn execute_uses_retry_after_header_delay_for_retryable_status() {
         .retry(RetryConfig {
             max_retries: 1,
             base_delay: Duration::from_millis(0),
-            max_delay: Duration::from_millis(0),
+            max_delay: Duration::from_secs(5),
             retry_non_idempotent: false,
         })
         .with_transport(transport)
@@ -381,6 +406,87 @@ async fn execute_uses_retry_after_header_delay_for_retryable_status() {
     assert_eq!(
         tokio::time::Instant::now() - started_at,
         Duration::from_secs(2)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn execute_clamps_retry_after_header_to_configured_max_delay() {
+    let mut headers = HeaderMap::new();
+    headers.insert(http::header::RETRY_AFTER, HeaderValue::from_static("86400"));
+    let transport = CountingTransport::from_responses(vec![
+        Ok(HttpResponse::from_mock(
+            StatusCode::TOO_MANY_REQUESTS,
+            headers,
+            Vec::new(),
+            Url::parse("https://example.test/resource").expect("429 response url"),
+        )),
+        Ok(HttpResponse::from_mock(
+            StatusCode::OK,
+            HeaderMap::new(),
+            Vec::new(),
+            Url::parse("https://example.test/resource").expect("200 response url"),
+        )),
+    ]);
+    let client = HttpClientBuilder::new()
+        .retry(RetryConfig {
+            max_retries: 1,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::from_secs(3),
+            retry_non_idempotent: false,
+        })
+        .with_transport(transport)
+        .build()
+        .expect("build http client");
+
+    let started_at = tokio::time::Instant::now();
+    client
+        .get("https://example.test/resource")
+        .send()
+        .await
+        .expect("retried response");
+
+    assert_eq!(
+        tokio::time::Instant::now() - started_at,
+        Duration::from_secs(3)
+    );
+}
+
+#[test]
+fn builder_clients_disable_redirects_but_external_clients_are_not_assumed_safe() {
+    let built = HttpClientBuilder::new().build().expect("built client");
+    assert!(built.redirects_disabled());
+
+    let external = reqwest::Client::builder().build().expect("external client");
+    let wrapped = crate::HttpClient::with_client(external, RetryConfig::default());
+    assert!(!wrapped.redirects_disabled());
+}
+
+#[test]
+fn retry_after_http_date_is_clamped_to_configured_max_delay() {
+    let retry = RetryConfig {
+        max_retries: 1,
+        base_delay: Duration::ZERO,
+        max_delay: Duration::from_secs(4),
+        retry_non_idempotent: false,
+    };
+    let mut headers = HeaderMap::new();
+    let retry_at = std::time::SystemTime::now() + Duration::from_secs(86_400);
+    headers.insert(
+        http::header::RETRY_AFTER,
+        httpdate::fmt_http_date(retry_at)
+            .parse()
+            .expect("Retry-After date"),
+    );
+    let response = HttpResponse::from_mock(
+        StatusCode::SERVICE_UNAVAILABLE,
+        headers,
+        Vec::new(),
+        Url::parse("https://example.test/resource").expect("response URL"),
+    );
+
+    assert_eq!(
+        retry_delay_for_response(&retry, &response, 0),
+        Duration::from_secs(4)
     );
 }
 

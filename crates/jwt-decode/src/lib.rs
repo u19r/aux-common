@@ -26,6 +26,8 @@ pub(crate) type Result<T> = std::result::Result<T, JwtDecodeError>;
 #[cfg(test)]
 mod claim_validation_tests;
 #[cfg(test)]
+mod json_tests;
+#[cfg(test)]
 mod lib_tests;
 #[cfg(test)]
 mod performance_tests;

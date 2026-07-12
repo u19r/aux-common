@@ -73,7 +73,8 @@ fn relationship_scope_policies_present() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        policy_text.contains("resource.org_parents") && policy_text.contains("contains(principal)"),
+        policy_text.contains("resource.org_parents")
+            && policy_text.contains("contains(principal.id)"),
         "org relationship scope condition rendered"
     );
 }

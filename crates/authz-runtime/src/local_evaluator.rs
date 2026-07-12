@@ -1,8 +1,9 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use authz_cedar::{
-    EntityParentRef as CedarEntityParentRef,
-    evaluate_owned_with_policy_sets_with_parents as cedar_evaluate_owned_with_policy_sets_with_parents,
+    CedarEvaluationErrorCategory, EntityParentRef as CedarEntityParentRef,
+    evaluate_prepared_with_policy_sets_diagnostics as cedar_evaluate_prepared_with_policy_sets_diagnostics,
+    prepare_evaluation_owned_with_parents as cedar_prepare_evaluation_owned_with_parents,
 };
 use authz_types::{
     CONTEXT_INTERNAL_KEY, DecisionContext, EvaluationRequest, EvaluationResponse,
@@ -19,11 +20,17 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct LocalAuthzEvaluator {
-    runtime: EvaluationRuntime,
+    runtime: Arc<EvaluationRuntime>,
 }
 
 impl LocalAuthzEvaluator {
     pub fn new(runtime: EvaluationRuntime) -> Self {
+        Self {
+            runtime: Arc::new(runtime),
+        }
+    }
+
+    pub fn from_arc(runtime: Arc<EvaluationRuntime>) -> Self {
         Self { runtime }
     }
 
@@ -126,7 +133,7 @@ impl LocalAuthzEvaluator {
         }
 
         if !matches!(action_policy_decision, ActionPolicyDecision::AllowMatched)
-            && !resource_is_public(&input.request)
+            && !public_read_is_declared(&self.runtime, &input.request)
         {
             let reason = if matches!(action_policy_decision, ActionPolicyDecision::DenyMatched) {
                 "deny_matched"
@@ -145,6 +152,7 @@ impl LocalAuthzEvaluator {
             &input.request.action.name,
             session_ctx,
             token_ctx.is_some(),
+            now,
         ) {
             return Ok(step_up_response);
         }
@@ -170,13 +178,27 @@ impl LocalAuthzEvaluator {
         let action_name = enriched.request.action.name.clone();
         let subject_parents = to_cedar_parent_refs(&enriched.subject_parents);
         let resource_parents = to_cedar_parent_refs(&enriched.resource_parents);
-        let mut response = cedar_evaluate_owned_with_policy_sets_with_parents(
-            &self.runtime.policy_sets,
+        let prepared = cedar_prepare_evaluation_owned_with_parents(
             enriched.request,
             &subject_parents,
             &resource_parents,
         )
         .map_err(AuthzRuntimeError::cedar)?;
+        let diagnostic_result = cedar_evaluate_prepared_with_policy_sets_diagnostics(
+            &self.runtime.policy_sets,
+            prepared,
+        )
+        .map_err(AuthzRuntimeError::cedar)?;
+        if !diagnostic_result.evaluation_errors.is_empty() {
+            record_cedar_diagnostics(
+                &resource_type,
+                &action_name,
+                self.runtime.config.version,
+                diagnostic_result.determining_policy_ids.len(),
+                &diagnostic_result.evaluation_errors,
+            );
+        }
+        let mut response = diagnostic_result.response;
 
         if response.decision {
             response.context = Some(DecisionContext {
@@ -196,6 +218,31 @@ impl LocalAuthzEvaluator {
         }
 
         Ok(response)
+    }
+}
+
+pub(crate) fn record_cedar_diagnostics(
+    resource_type: &str,
+    action: &str,
+    policy_version: u32,
+    determining_policy_count: usize,
+    errors: &[CedarEvaluationErrorCategory],
+) {
+    tracing::warn!(
+        resource_type,
+        action,
+        policy_version,
+        determining_policy_count,
+        evaluation_error_count = errors.len(),
+        evaluation_error_categories = ?errors,
+        "Cedar policy evaluation completed with skipped policy errors"
+    );
+    for category in errors {
+        metrics_facade::counter!(
+            metrics_facade::CounterMetric::AuthzCedarEvaluationErrorsTotal,
+            "category" => category.as_str(),
+        )
+        .increment(1);
     }
 }
 
@@ -252,7 +299,9 @@ pub fn permissions_for_request_bits(
         }
     }
 
-    if let Some(jwt_ctx) = request.jwt_context.as_ref() {
+    if let Some(jwt_ctx) = request.jwt_context.as_ref()
+        && jwt_ctx.is_complete()
+    {
         add_jwt_roles_bits(
             runtime,
             jwt_ctx,
@@ -514,7 +563,24 @@ fn resource_org(request: &EvaluationRequest) -> Option<&str> {
         })
 }
 
-fn resource_is_public(request: &EvaluationRequest) -> bool {
+fn public_read_is_declared(runtime: &EvaluationRuntime, request: &EvaluationRequest) -> bool {
+    if request.action.name != "read" {
+        return false;
+    }
+    let Some(resource_type) = runtime
+        .config
+        .get_resource_type(&request.resource.resource_type)
+    else {
+        return false;
+    };
+    if !resource_type
+        .actions
+        .iter()
+        .any(|action| action.name == request.action.name)
+    {
+        return false;
+    }
+
     request
         .resource
         .properties
@@ -530,13 +596,20 @@ fn step_up_response_for_allowed_request(
     action: &str,
     session_ctx: Option<&SessionContext>,
     is_api_key: bool,
+    now: DateTime<Utc>,
 ) -> Option<EvaluationResponse> {
     let step_up = StepUpEvaluator::new(
         &runtime.config.step_up_rules,
         &runtime.config.step_up_config,
         runtime.config.default_step_up_rule.as_deref(),
     );
-    match step_up.evaluate(resource_type, action, session_ctx, is_api_key) {
+    match step_up.evaluate_at(
+        resource_type,
+        action,
+        session_ctx,
+        is_api_key,
+        now.timestamp(),
+    ) {
         StepUpResult::Satisfied => None,
         StepUpResult::ChallengeRequired(challenge) => {
             let reason = format!("step_up:{}", challenge.challenge_type.as_str());
@@ -770,11 +843,15 @@ fn session_context_values(
     let now_seconds = now.timestamp();
     let (auth_age_present, auth_age_seconds) = session
         .auth_time
-        .map(|auth_time| (true, (now_seconds - auth_time).unsigned_abs() as i64))
+        .and_then(|auth_time| now_seconds.checked_sub(auth_time))
+        .filter(|age| *age >= 0)
+        .map(|age| (true, age))
         .unwrap_or((false, 0));
     let (mfa_age_present, mfa_age_seconds) = session
         .mfa_time
-        .map(|mfa_time| (true, (now_seconds - mfa_time).unsigned_abs() as i64))
+        .and_then(|mfa_time| now_seconds.checked_sub(mfa_time))
+        .filter(|age| *age >= 0)
+        .map(|age| (true, age))
         .unwrap_or((false, 0));
 
     SessionContextValues {

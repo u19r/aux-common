@@ -27,6 +27,8 @@ use crate::{
     },
 };
 
+const UNMATCHED_OPERATION: &str = "_unmatched";
+
 #[derive(Clone, Debug, Default)]
 pub struct SlowOperationLogState {
     pub thresholds: SlowOperationThresholds,
@@ -62,12 +64,7 @@ pub async fn slow_operation_log(
     let request_span = tracing::Span::current();
     let method = request.method().clone();
     let raw_path = request.uri().path().to_string();
-    let operation_path = request
-        .extensions()
-        .get::<MatchedPath>()
-        .map(MatchedPath::as_str)
-        .unwrap_or(raw_path.as_str())
-        .to_string();
+    let operation_path = bounded_operation_path(&request).to_string();
     let operation_name = format!("{method} {operation_path}");
     let request_bytes = content_length_or_body_size_hint(request.headers(), request.body());
     let request_id = request
@@ -121,7 +118,7 @@ pub async fn slow_operation_log(
             target = "http.request",
             operation_name = %operation_name,
             method = %method,
-            path = %operation_path,
+            path = %raw_path,
             status_code,
             duration_ms = duration_ms_u64,
             slow_operation_threshold_ms = threshold_ms,
@@ -130,6 +127,14 @@ pub async fn slow_operation_log(
     }
 
     response
+}
+
+pub(crate) fn bounded_operation_path(request: &http::Request<Body>) -> &str {
+    request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or(UNMATCHED_OPERATION)
 }
 
 async fn finalize_response_metrics(

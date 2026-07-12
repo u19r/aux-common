@@ -109,3 +109,60 @@ fn trace_context_when_forwarded_then_writes_w3c_and_legacy_headers() {
         Some("request-1")
     );
 }
+
+#[test]
+fn trace_context_given_zero_trace_or_parent_id_then_rejects_traceparent() {
+    for traceparent in [
+        "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_TRACEPARENT,
+            HeaderValue::from_str(traceparent).expect("header value"),
+        );
+
+        let context = TraceContext::from_headers(&headers);
+
+        assert!(context.parent_trace_id.is_none());
+        assert!(context.parent_span_id.is_none());
+    }
+}
+
+#[test]
+fn trace_context_given_future_version_then_accepts_common_fields() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HEADER_TRACEPARENT,
+        HeaderValue::from_static("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-future"),
+    );
+
+    let context = TraceContext::from_headers(&headers);
+
+    assert_eq!(
+        context.parent_trace_id.as_ref().map(TraceId::to_hex_string),
+        Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string())
+    );
+    assert_eq!(context.trace_flags.to_string(), "01");
+}
+
+#[test]
+fn trace_context_given_forbidden_or_malformed_version_then_rejects_traceparent() {
+    for traceparent in [
+        "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+        "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-",
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_TRACEPARENT,
+            HeaderValue::from_str(traceparent).expect("header value"),
+        );
+
+        assert!(
+            TraceContext::from_headers(&headers)
+                .parent_trace_id
+                .is_none()
+        );
+    }
+}

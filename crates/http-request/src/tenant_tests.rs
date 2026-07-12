@@ -1,6 +1,7 @@
 use std::{
+    collections::VecDeque,
     io::{Read, Write},
-    net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     sync::{Arc, Mutex},
     thread,
     time::Duration,
@@ -8,7 +9,10 @@ use std::{
 
 use bytes::Bytes;
 use futures_util::stream;
-use reqwest::{Client, Method, Url};
+use reqwest::{
+    Client, Method, Url,
+    dns::{Addrs, Name, Resolve, Resolving},
+};
 
 use crate::{
     HttpRequestError,
@@ -18,10 +22,58 @@ use crate::{
         SSRF_BLOCKED_PORT, SSRF_BLOCKED_SCHEME, SSRF_BLOCKED_USERINFO,
     },
     tenant::{
-        AllowedDomain, TenantHttpClient, is_blocked_ip, match_allowlisted_domain, request_body_len,
-        same_host,
+        AllowedDomain, SsrfDnsResolver, SsrfProtectionConfig, TenantHttpClient, is_blocked_ip,
+        match_allowlisted_domain, request_body_len, same_host,
     },
 };
+
+struct SequenceDnsResolver {
+    responses: Mutex<VecDeque<Vec<SocketAddr>>>,
+}
+
+impl Resolve for SequenceDnsResolver {
+    fn resolve(&self, _name: Name) -> Resolving {
+        let addrs = self
+            .responses
+            .lock()
+            .expect("DNS response lock")
+            .pop_front()
+            .expect("DNS response");
+        Box::pin(async move { Ok(Box::new(addrs.into_iter()) as Addrs) })
+    }
+}
+
+#[tokio::test]
+async fn ssrf_dns_resolver_validates_every_connector_resolution() {
+    let resolver = SsrfDnsResolver::with_resolver(
+        SsrfProtectionConfig {
+            allowed_schemes: vec!["https".to_string()],
+            allowed_ports: vec![443],
+            max_dns_addresses: 8,
+            allow_loopback_ips: false,
+        },
+        Arc::new(SequenceDnsResolver {
+            responses: Mutex::new(VecDeque::from([
+                vec!["93.184.216.34:443".parse().expect("public address")],
+                vec!["10.0.0.7:443".parse().expect("private address")],
+            ])),
+        }),
+    );
+    let name: Name = "example.com".parse().expect("DNS name");
+
+    let first = resolver
+        .resolve(name)
+        .await
+        .expect("public connector resolution");
+    assert_eq!(first.collect::<Vec<_>>().len(), 1);
+
+    let name: Name = "example.com".parse().expect("DNS name");
+    let error = match resolver.resolve(name).await {
+        Ok(_) => panic!("rebound private address must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("reserved_ip"), "{error}");
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecordedRequest {

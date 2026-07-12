@@ -1,13 +1,89 @@
 use std::collections::{HashMap, HashSet};
 
-use authz_types::{Action, Context, EvaluationRequest, Resource, Subject};
+use authz_types::{
+    Action, ConfigurationModel, Context, EvaluationRequest, FineGrainedScopes, JwtContext,
+    PermissionActionRef, PermissionId, Resource, ResourceSelection, RoleAssignment, RoleScope,
+    Scope, ScopeMappingEntry, Subject, TokenContext, TokenScopeConfig,
+};
 use chrono::{TimeZone, Utc};
 use serde_json::json;
 
 use crate::{
-    EffectiveRoleAssignment, ParentRef, ResourceAccessSnapshot, SubjectAccessSnapshot,
-    build_subject_parent_template, enrich_request_with_snapshots, inject_internal_context,
+    ActionPolicyDecision, EffectiveRoleAssignment, EvaluationRuntime, LocalAuthzEvaluator,
+    LocalEvaluationInput, ParentRef, ResourceAccessSnapshot, SubjectAccessSnapshot,
+    action_policy_decision_bits, build_subject_parent_template, enrich_request_with_snapshots,
+    inject_internal_context, permissions_for_request_bits,
 };
+
+#[test]
+fn cedar_diagnostics_log_only_allowlisted_metadata() {
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone)]
+    struct TestWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("test log lock poisoned"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let writer_buffer = Arc::clone(&buffer);
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || TestWriter(Arc::clone(&writer_buffer)))
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        crate::local_evaluator::record_cedar_diagnostics(
+            "repository",
+            "read",
+            7,
+            1,
+            &[authz_cedar::CedarEvaluationErrorCategory::AttributeMissing],
+        );
+    });
+
+    let output = String::from_utf8(buffer.lock().expect("log buffer").clone()).expect("UTF-8 log");
+    for expected in [
+        "resource_type=\"repository\"",
+        "action=\"read\"",
+        "policy_version=7",
+        "determining_policy_count=1",
+        "AttributeMissing",
+    ] {
+        assert!(
+            output.contains(expected),
+            "missing allowlisted field {expected}: {output}"
+        );
+    }
+    for forbidden in [
+        "tenant_secret_123",
+        "principal_user_123",
+        "resource_repo_123",
+        "Bearer",
+        "api_key",
+        "entity_attributes",
+    ] {
+        assert!(
+            !output.contains(forbidden),
+            "leaked forbidden field {forbidden}"
+        );
+    }
+}
 
 #[test]
 fn build_subject_parent_template_dedupes_parents_and_tracks_resource_scopes() {
@@ -161,6 +237,312 @@ fn effective_assignments_filter_expired_entries_at_supplied_clock() {
 
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].role_id, "role_active");
+}
+
+#[test]
+fn incomplete_jwt_context_cannot_grant_role_permissions() {
+    let runtime = runtime_with_read_role();
+    let subject = Subject::user("user_1");
+    let request = EvaluationRequest {
+        subject: subject.clone(),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: Some(JwtContext {
+            roles: vec![RoleAssignment {
+                role_id: "reader".to_string(),
+                scope: RoleScope::Global,
+            }],
+            roles_complete: false,
+            claims_complete: true,
+            ..JwtContext::default()
+        }),
+        session_context: None,
+        token_context: None,
+    };
+
+    let scoped = permissions_for_request_bits(&runtime, &[], &request, &subject);
+    let decision = action_policy_decision_bits(
+        &runtime,
+        "document",
+        "read",
+        &scoped.permissions,
+        &scoped.checked_roles,
+        true,
+    );
+
+    assert_eq!(decision, ActionPolicyDecision::NoPolicyAllow);
+}
+
+#[test]
+fn complete_jwt_context_can_grant_role_permissions() {
+    let runtime = runtime_with_read_role();
+    let subject = Subject::user("user_1");
+    let request = EvaluationRequest {
+        subject: subject.clone(),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: Some(JwtContext {
+            roles: vec![RoleAssignment {
+                role_id: "reader".to_string(),
+                scope: RoleScope::Global,
+            }],
+            ..JwtContext::default()
+        }),
+        session_context: None,
+        token_context: None,
+    };
+
+    let scoped = permissions_for_request_bits(&runtime, &[], &request, &subject);
+    let decision = action_policy_decision_bits(
+        &runtime,
+        "document",
+        "read",
+        &scoped.permissions,
+        &scoped.checked_roles,
+        true,
+    );
+
+    assert_eq!(decision, ActionPolicyDecision::AllowMatched);
+}
+
+#[test]
+fn public_resource_does_not_allow_undeclared_read_action() {
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "write".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![],
+        roles: vec![],
+        scope_mappings: vec![],
+        authn_providers: vec![],
+        step_up_rules: vec![],
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+        description: None,
+    };
+    let runtime = build_runtime(config);
+    let evaluator = LocalAuthzEvaluator::new(runtime);
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1").with_properties(json!({"is_public": true})),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let input = LocalEvaluationInput {
+        tenant_id: "tenant_1".to_string(),
+        subject_access: SubjectAccessSnapshot {
+            subject: request.subject.clone(),
+            assignments: vec![],
+            subject_parents: vec![],
+            resource_scopes: HashMap::new(),
+            fetched_at_ms: 1,
+        },
+        resource_access: ResourceAccessSnapshot {
+            resource_type: "document".to_string(),
+            resource_id: "doc_1".to_string(),
+            resource_parents: vec![],
+            fetched_at_ms: 1,
+        },
+        request,
+    };
+    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+
+    let response = evaluator.evaluate_at(input, now).expect("evaluation");
+
+    assert!(!response.decision);
+    assert_eq!(
+        response.context.and_then(|context| context.reason),
+        Some("no_policy_allow".to_string())
+    );
+}
+
+fn runtime_with_read_role() -> EvaluationRuntime {
+    build_runtime(ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "read".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "document:read".into(),
+            name: "Document reader".into(),
+            description: None,
+            actions: vec![PermissionActionRef {
+                resource_type: "document".into(),
+                action_name: "read".into(),
+            }],
+            not_actions: vec![],
+        }],
+        roles: vec![authz_types::Role {
+            id: "reader".into(),
+            name: "Reader".into(),
+            description: None,
+            permissions: vec![authz_types::RolePermission {
+                permission_id: PermissionId::new("document:read").expect("permission id"),
+                scopes: vec![Scope::Tenant],
+            }],
+            actions: vec![],
+            not_actions: vec![],
+        }],
+        scope_mappings: vec![ScopeMappingEntry {
+            scope: "document:read".to_string(),
+            permissions: vec!["document:read".to_string()],
+            includes: vec![],
+        }],
+        authn_providers: vec![],
+        step_up_rules: vec![],
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+        description: None,
+    })
+}
+
+#[test]
+fn token_expiry_given_reused_subject_snapshot_then_never_reuses_prior_allow_decision() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
+    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let input = |expires_at| LocalEvaluationInput {
+        tenant_id: "tenant_1".to_string(),
+        request: EvaluationRequest {
+            subject: Subject::user("user_1"),
+            resource: Resource::new("document", "doc_1"),
+            action: Action::new("read"),
+            context: None,
+            jwt_context: None,
+            session_context: None,
+            token_context: Some(TokenContext {
+                token_id: "token_variant".to_string(),
+                owner_id: "user_1".to_string(),
+                scopes: TokenScopeConfig::with_scopes(vec!["document:read".to_string()]),
+                expires_at: Some(expires_at),
+            }),
+        },
+        subject_access: SubjectAccessSnapshot {
+            subject: Subject::user("user_1"),
+            assignments: vec![assignment("reader", Some("tenant"), None)],
+            subject_parents: vec![parent("role", "reader"), parent("tenant", "tenant_1")],
+            resource_scopes: HashMap::new(),
+            fetched_at_ms: 1,
+        },
+        resource_access: ResourceAccessSnapshot {
+            resource_type: "document".to_string(),
+            resource_id: "doc_1".to_string(),
+            resource_parents: vec![parent("tenant", "tenant_1")],
+            fetched_at_ms: 1,
+        },
+    };
+
+    let allowed = evaluator
+        .evaluate_at(input(2_000), now)
+        .expect("valid token");
+    let expired = evaluator
+        .evaluate_at(input(999), now)
+        .expect("expired token");
+
+    assert!(allowed.decision);
+    assert!(!expired.decision);
+    assert_eq!(
+        expired.context.and_then(|context| context.reason),
+        Some("token_expired".to_string())
+    );
+}
+
+#[test]
+fn token_variants_given_reused_subject_snapshot_then_each_decision_uses_current_token_context() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
+    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let subject_access = SubjectAccessSnapshot {
+        subject: Subject::user("user_1"),
+        assignments: vec![assignment("reader", Some("tenant"), None)],
+        subject_parents: vec![parent("role", "reader"), parent("tenant", "tenant_1")],
+        resource_scopes: HashMap::new(),
+        fetched_at_ms: 1,
+    };
+    let evaluate = |token_context| {
+        evaluator
+            .evaluate_at(
+                LocalEvaluationInput {
+                    tenant_id: "tenant_1".to_string(),
+                    request: EvaluationRequest {
+                        subject: Subject::user("user_1"),
+                        resource: Resource::new("document", "doc_1"),
+                        action: Action::new("read"),
+                        context: None,
+                        jwt_context: None,
+                        session_context: None,
+                        token_context: Some(token_context),
+                    },
+                    subject_access: subject_access.clone(),
+                    resource_access: ResourceAccessSnapshot {
+                        resource_type: "document".to_string(),
+                        resource_id: "doc_1".to_string(),
+                        resource_parents: vec![parent("tenant", "tenant_1")],
+                        fetched_at_ms: 1,
+                    },
+                },
+                now,
+            )
+            .expect("token evaluation")
+    };
+    let token = |token_id: &str, owner_id: &str, scopes: Vec<&str>, expires_at| TokenContext {
+        token_id: token_id.to_string(),
+        owner_id: owner_id.to_string(),
+        scopes: TokenScopeConfig::with_scopes(scopes.into_iter().map(str::to_string).collect()),
+        expires_at: Some(expires_at),
+    };
+
+    assert!(evaluate(token("token_allow", "user_1", vec!["document:read"], 2_000)).decision);
+    assert!(
+        !evaluate(token(
+            "token_scope",
+            "user_1",
+            vec!["document:write"],
+            2_000
+        ))
+        .decision
+    );
+    assert!(evaluate(token("token_owner", "user_2", vec!["document:read"], 2_000)).decision);
+    assert!(!evaluate(token("token_expired", "user_1", vec!["document:read"], 999)).decision);
+    let selected_other_resource = TokenContext {
+        token_id: "token_selected_resource".to_string(),
+        owner_id: "user_1".to_string(),
+        scopes: TokenScopeConfig::fine_grained(FineGrainedScopes {
+            resource_selection: ResourceSelection::Selected,
+            selected_resources: vec!["doc_2".to_string()],
+            resource_permissions: HashMap::from([(
+                "document".to_string(),
+                vec!["document:read".to_string()],
+            )]),
+            org_permissions: HashMap::new(),
+        }),
+        expires_at: Some(2_000),
+    };
+    assert!(!evaluate(selected_other_resource).decision);
+}
+
+fn build_runtime(config: ConfigurationModel) -> EvaluationRuntime {
+    let config = config.into_validated().expect("valid config");
+    let bundle = authz_cedar::compile_policy_bundle(&config, 1).expect("compiled bundle");
+    EvaluationRuntime::build(config, &bundle).expect("runtime")
 }
 
 fn assignment(

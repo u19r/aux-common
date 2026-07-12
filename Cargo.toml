@@ -21,7 +21,7 @@ authz-types = { path = "crates/authz-types" }
 aws-credentials = { path = "crates/aws-credentials" }
 http-request = { path = "crates/http-request" }
 lru-ttl-cache = { path = "crates/lru-ttl-cache" }
-metrics-facade = { path = "crates/metrics-facade" }
+metrics-facade = { path = "crates/metrics-facade", default-features = false }
 opt-loop-probe = { path = "crates/opt-loop-probe" }
 telemetry = { path = "crates/telemetry" }
 

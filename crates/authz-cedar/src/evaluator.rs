@@ -8,8 +8,8 @@ use authz_types::{
     BatchEvaluationRequest, BatchEvaluationResponse, EvaluationRequest, EvaluationResponse,
 };
 use cedar_policy::{
-    Authorizer, Context, Decision, Entities, Entity, EntityId, EntityTypeName, EntityUid,
-    PolicySet, Request, RestrictedExpression,
+    AuthorizationError, Authorizer, Context, Decision, Entities, Entity, EntityId, EntityTypeName,
+    EntityUid, EvaluationError, PolicySet, Request, RestrictedExpression,
 };
 
 use crate::{CedarError, CompiledBundle};
@@ -27,7 +27,11 @@ impl ParsedPolicySets {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
+/// A parent relationship supplied by trusted authorization enrichment.
+///
+/// Do not construct these values directly from caller-controlled request
+/// context. The default evaluation APIs ignore reserved parent context keys.
 pub struct EntityParentRef {
     pub parent_type: String,
     pub parent_id: String,
@@ -44,6 +48,21 @@ impl CedarRequestUids {
     pub fn resource_type(&self) -> &str {
         self.resource_type.as_str()
     }
+
+    #[cfg(test)]
+    pub(crate) fn principal(&self) -> &EntityUid {
+        &self.principal
+    }
+
+    #[cfg(test)]
+    pub(crate) fn action(&self) -> &EntityUid {
+        &self.action
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resource(&self) -> &EntityUid {
+        &self.resource
+    }
 }
 
 pub struct CedarEntitiesContext {
@@ -55,6 +74,44 @@ pub struct PreparedCedarEvaluation {
     resource_type: String,
     request: Request,
     entities: Entities,
+}
+
+#[derive(Debug, Clone)]
+pub struct InternalEvaluationResult {
+    pub response: EvaluationResponse,
+    pub determining_policy_ids: Vec<String>,
+    pub evaluation_errors: Vec<CedarEvaluationErrorCategory>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CedarEvaluationErrorCategory {
+    EntityMissing,
+    AttributeMissing,
+    ExtensionLookup,
+    Type,
+    ExtensionArgumentCount,
+    IntegerOverflow,
+    UnlinkedSlot,
+    ExtensionExecution,
+    NonValue,
+    RecursionLimit,
+}
+
+impl CedarEvaluationErrorCategory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EntityMissing => "entity_missing",
+            Self::AttributeMissing => "attribute_missing",
+            Self::ExtensionLookup => "extension_lookup",
+            Self::Type => "type",
+            Self::ExtensionArgumentCount => "extension_argument_count",
+            Self::IntegerOverflow => "integer_overflow",
+            Self::UnlinkedSlot => "unlinked_slot",
+            Self::ExtensionExecution => "extension_execution",
+            Self::NonValue => "non_value",
+            Self::RecursionLimit => "recursion_limit",
+        }
+    }
 }
 
 impl PreparedCedarEvaluation {
@@ -77,10 +134,8 @@ pub fn evaluate_with_policy_sets(
     request: &EvaluationRequest,
 ) -> Result<EvaluationResponse, CedarError> {
     let uids = prepare_request_uids(request)?;
-    let (subject_parents, resource_parents) = parent_refs_from_request_context(request);
-    let (entities, context) =
-        build_entities_and_context_ref_with_parents(request, &subject_parents, &resource_parents)
-            .map_err(CedarError::evaluation)?;
+    let (entities, context) = build_entities_and_context_ref_with_parents(request, &[], &[])
+        .map_err(CedarError::evaluation)?;
     let prepared = prepare_request_from_parts(uids, CedarEntitiesContext { entities, context })?;
     evaluate_prepared_with_policy_sets(policy_sets, prepared)
 }
@@ -93,6 +148,7 @@ pub fn evaluate_owned_with_policy_sets(
     evaluate_prepared_with_policy_sets(policy_sets, prepared)
 }
 
+/// Evaluate with parent relationships supplied through the trusted boundary.
 pub fn evaluate_owned_with_policy_sets_with_parents(
     policy_sets: &ParsedPolicySets,
     request: EvaluationRequest,
@@ -165,11 +221,8 @@ pub fn prepare_request_uids(request: &EvaluationRequest) -> Result<CedarRequestU
     let subject_id = request.subject.id.clone();
     let resource_id = request.resource.id.clone();
 
-    let action = EntityUid::from_str(&format!(
-        "Authz::Action::\"{}:{}\"",
-        resource_type, action_name
-    ))
-    .map_err(|e| CedarError::evaluation(e.to_string()))?;
+    let action = entity_uid("Authz::Action", &format!("{resource_type}:{action_name}"))
+        .map_err(CedarError::evaluation)?;
     let principal = principal_uid(&subject_type, &subject_id).map_err(CedarError::evaluation)?;
     let resource = resource_uid(&resource_type, &resource_id).map_err(CedarError::evaluation)?;
 
@@ -184,9 +237,7 @@ pub fn prepare_request_uids(request: &EvaluationRequest) -> Result<CedarRequestU
 pub fn prepare_entities_and_context_owned(
     request: EvaluationRequest,
 ) -> Result<CedarEntitiesContext, CedarError> {
-    let mut request = request;
-    let (subject_parents, resource_parents) = take_parent_refs_from_request_context(&mut request);
-    prepare_entities_and_context_owned_with_parents(request, &subject_parents, &resource_parents)
+    prepare_entities_and_context_owned_with_parents(request, &[], &[])
 }
 
 pub fn prepare_entities_and_context_owned_with_parents(
@@ -225,17 +276,13 @@ pub fn prepare_request_from_parts(
 pub fn prepare_evaluation_owned(
     request: EvaluationRequest,
 ) -> Result<PreparedCedarEvaluation, CedarError> {
-    let mut request = request;
-    let (subject_parents, resource_parents) = take_parent_refs_from_request_context(&mut request);
     let uids = prepare_request_uids(&request)?;
-    let entities_context = prepare_entities_and_context_owned_with_parents(
-        request,
-        &subject_parents,
-        &resource_parents,
-    )?;
+    let entities_context = prepare_entities_and_context_owned_with_parents(request, &[], &[])?;
     prepare_request_from_parts(uids, entities_context)
 }
 
+/// Prepare an evaluation with parent relationships supplied by trusted
+/// authorization enrichment.
 pub fn prepare_evaluation_owned_with_parents(
     request: EvaluationRequest,
     subject_parents: &[EntityParentRef],
@@ -254,20 +301,88 @@ pub fn evaluate_prepared_with_policy_sets(
     policy_sets: &ParsedPolicySets,
     prepared: PreparedCedarEvaluation,
 ) -> Result<EvaluationResponse, CedarError> {
+    Ok(evaluate_prepared_with_policy_sets_diagnostics(policy_sets, prepared)?.response)
+}
+
+pub fn evaluate_prepared_with_policy_sets_diagnostics(
+    policy_sets: &ParsedPolicySets,
+    prepared: PreparedCedarEvaluation,
+) -> Result<InternalEvaluationResult, CedarError> {
     let PreparedCedarEvaluation {
         resource_type,
         request,
         entities,
     } = prepared;
     let Some(policy_set) = policy_sets.get(resource_type.as_str()) else {
-        return Ok(EvaluationResponse::deny_with_reason(format!(
-            "policy slice not found for {}",
-            resource_type
-        )));
+        return Ok(InternalEvaluationResult {
+            response: EvaluationResponse::deny_with_reason(format!(
+                "policy slice not found for {}",
+                resource_type
+            )),
+            determining_policy_ids: Vec::new(),
+            evaluation_errors: Vec::new(),
+        });
     };
 
-    let response = Authorizer::new().is_authorized(&request, policy_set, &entities);
-    Ok(response_from_decision(response.decision()))
+    Ok(evaluate_authorizer_with_diagnostics(
+        &request, policy_set, &entities,
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn evaluate_prepared_with_policy_set_diagnostics(
+    policy_set: &PolicySet,
+    prepared: PreparedCedarEvaluation,
+) -> InternalEvaluationResult {
+    evaluate_authorizer_with_diagnostics(&prepared.request, policy_set, &prepared.entities)
+}
+
+pub(crate) fn evaluate_authorizer_with_diagnostics(
+    request: &Request,
+    policy_set: &PolicySet,
+    entities: &Entities,
+) -> InternalEvaluationResult {
+    let response = Authorizer::new().is_authorized(request, policy_set, entities);
+    let mut determining_policy_ids = response
+        .diagnostics()
+        .reason()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    determining_policy_ids.sort();
+    let evaluation_errors = response
+        .diagnostics()
+        .errors()
+        .map(error_category)
+        .collect();
+    InternalEvaluationResult {
+        response: response_from_decision(response.decision()),
+        determining_policy_ids,
+        evaluation_errors,
+    }
+}
+
+fn error_category(error: &AuthorizationError) -> CedarEvaluationErrorCategory {
+    let AuthorizationError::PolicyEvaluationError(error) = error;
+    match error.inner() {
+        EvaluationError::EntityDoesNotExist(_) => CedarEvaluationErrorCategory::EntityMissing,
+        EvaluationError::EntityAttrDoesNotExist(_) | EvaluationError::RecordAttrDoesNotExist(_) => {
+            CedarEvaluationErrorCategory::AttributeMissing
+        }
+        EvaluationError::FailedExtensionFunctionLookup(_) => {
+            CedarEvaluationErrorCategory::ExtensionLookup
+        }
+        EvaluationError::TypeError(_) => CedarEvaluationErrorCategory::Type,
+        EvaluationError::WrongNumArguments(_) => {
+            CedarEvaluationErrorCategory::ExtensionArgumentCount
+        }
+        EvaluationError::IntegerOverflow(_) => CedarEvaluationErrorCategory::IntegerOverflow,
+        EvaluationError::UnlinkedSlot(_) => CedarEvaluationErrorCategory::UnlinkedSlot,
+        EvaluationError::FailedExtensionFunctionExecution(_) => {
+            CedarEvaluationErrorCategory::ExtensionExecution
+        }
+        EvaluationError::NonValue(_) => CedarEvaluationErrorCategory::NonValue,
+        EvaluationError::RecursionLimit(_) => CedarEvaluationErrorCategory::RecursionLimit,
+    }
 }
 
 fn response_from_decision(decision: Decision) -> EvaluationResponse {
@@ -580,7 +695,7 @@ fn entity_uid_from_escape_ref(value: &serde_json::Value) -> Result<EntityUid, St
 
 fn entity_uid(entity_type: &str, entity_id: &str) -> Result<EntityUid, String> {
     let type_name = EntityTypeName::from_str(entity_type).map_err(|e| e.to_string())?;
-    let entity_id = EntityId::from_str(entity_id).map_err(|e| e.to_string())?;
+    let entity_id = EntityId::new(entity_id);
     Ok(EntityUid::from_type_name_and_id(type_name, entity_id))
 }
 
@@ -607,80 +722,14 @@ fn remove_parent_keys_from_context(context: &mut serde_json::Value) {
     }
 }
 
-fn take_parent_refs_from_request_context(
-    request: &mut EvaluationRequest,
-) -> (Vec<EntityParentRef>, Vec<EntityParentRef>) {
-    let Some(context) = request.context.as_mut() else {
-        return (Vec::new(), Vec::new());
-    };
-    let Some(map) = context.attributes.as_object_mut() else {
-        return (Vec::new(), Vec::new());
-    };
-
-    let subject_parents = map
-        .remove("subject_parents")
-        .map(|value| parent_refs_from_value_ref(&value))
-        .unwrap_or_default();
-    let resource_parents = map
-        .remove("resource_parents")
-        .map(|value| parent_refs_from_value_ref(&value))
-        .unwrap_or_default();
-    (subject_parents, resource_parents)
-}
-
-fn parent_refs_from_request_context(
-    request: &EvaluationRequest,
-) -> (Vec<EntityParentRef>, Vec<EntityParentRef>) {
-    let Some(context) = request.context.as_ref() else {
-        return (Vec::new(), Vec::new());
-    };
-    let Some(map) = context.attributes.as_object() else {
-        return (Vec::new(), Vec::new());
-    };
-
-    let subject_parents = map
-        .get("subject_parents")
-        .map(parent_refs_from_value_ref)
-        .unwrap_or_default();
-    let resource_parents = map
-        .get("resource_parents")
-        .map(parent_refs_from_value_ref)
-        .unwrap_or_default();
-    (subject_parents, resource_parents)
-}
-
-fn parent_refs_from_value_ref(value: &serde_json::Value) -> Vec<EntityParentRef> {
-    let serde_json::Value::Array(parents) = value else {
-        return Vec::new();
-    };
-
-    let mut parsed = Vec::with_capacity(parents.len());
-    for parent in parents {
-        let Some(parent_obj) = parent.as_object() else {
-            continue;
-        };
-        let Some(parent_type) = parent_obj.get("type").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let Some(parent_id) = parent_obj.get("id").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        parsed.push(EntityParentRef {
-            parent_type: parent_type.to_string(),
-            parent_id: parent_id.to_string(),
-        });
-    }
-    parsed
-}
-
 fn principal_uid(subject_type: &str, id: &str) -> Result<EntityUid, String> {
     let entity_type = subject_entity_type(subject_type);
-    EntityUid::from_str(&format!("Authz::{entity_type}::\"{id}\"")).map_err(|e| e.to_string())
+    entity_uid(&format!("Authz::{entity_type}"), id)
 }
 
 fn resource_uid(resource_type: &str, id: &str) -> Result<EntityUid, String> {
     let entity_type = super::schema_generator::to_pascal_case(resource_type);
-    EntityUid::from_str(&format!("Authz::{entity_type}::\"{id}\"")).map_err(|e| e.to_string())
+    entity_uid(&format!("Authz::{entity_type}"), id)
 }
 
 fn subject_entity_type(subject_type: &str) -> String {

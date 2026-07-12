@@ -7,7 +7,7 @@ use serde::{
 use serde_json::Value;
 use tracing::field::{Field, Visit};
 
-use crate::config::FieldEmissionMode;
+use crate::{config::FieldEmissionMode, safe_value::is_safe_recording};
 
 const DEFAULT_FIELD_CAPACITY: usize = 12;
 
@@ -72,6 +72,19 @@ impl SpanFields {
             &key,
             Value::String(value.into()),
             FieldValueSafety::FreeText,
+        ) else {
+            return;
+        };
+
+        self.insert_normalized_value(key, new_value);
+    }
+
+    fn insert_safe_str(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        let key = key.into();
+        let Some(new_value) = self.normalize_value_for_key(
+            &key,
+            Value::String(value.into()),
+            FieldValueSafety::Structured,
         ) else {
             return;
         };
@@ -278,6 +291,10 @@ impl Visit for SpanFields {
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
+        if is_safe_recording(field.name(), value) {
+            self.insert_safe_str(field.name(), value);
+            return;
+        }
         self.insert_str(field.name(), value);
     }
 

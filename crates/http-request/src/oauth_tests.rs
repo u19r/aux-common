@@ -9,9 +9,70 @@ use reqwest::{Request, StatusCode, Url, header};
 
 use crate::{
     HttpClientBuilder, HttpResponse, OAuthAuthorizationCodeRequest, OAuthRefreshTokenRequest,
-    OAuthRevocationEndpoint, OAuthRevocationRequest, OAuthTokenEndpoint, OAuthUserinfoEndpoint,
-    Transport, TransportFuture,
+    OAuthRevocationEndpoint, OAuthRevocationRequest, OAuthTokenEndpoint, OAuthTokenResponse,
+    OAuthUserinfoEndpoint, Transport, TransportFuture,
 };
+
+#[test]
+fn oauth_debug_output_redacts_all_credential_material() {
+    let values = [
+        format!(
+            "{:?}",
+            OAuthTokenEndpoint::new("https://auth.example.test/token")
+                .with_header("authorization", "sentinel-endpoint-secret")
+        ),
+        format!(
+            "{:?}",
+            OAuthRevocationEndpoint::new("https://auth.example.test/revoke")
+                .with_header("authorization", "sentinel-endpoint-secret")
+        ),
+        format!(
+            "{:?}",
+            OAuthAuthorizationCodeRequest::public_client(
+                "client-id",
+                "sentinel-authorization-code",
+                "https://client.example.test/callback",
+                "sentinel-code-verifier"
+            )
+        ),
+        format!(
+            "{:?}",
+            OAuthRefreshTokenRequest::public_client("client-id", "sentinel-refresh-token")
+        ),
+        format!(
+            "{:?}",
+            OAuthRevocationRequest::public_client(
+                "client-id",
+                "sentinel-revocation-token",
+                "refresh_token"
+            )
+        ),
+        format!(
+            "{:?}",
+            serde_json::from_str::<OAuthTokenResponse>(
+                r#"{"access_token":"sentinel-access-token","refresh_token":"sentinel-response-refresh-token"}"#
+            )
+            .expect("token response")
+        ),
+    ];
+
+    for debug in values {
+        for secret in [
+            "sentinel-endpoint-secret",
+            "sentinel-authorization-code",
+            "sentinel-code-verifier",
+            "sentinel-refresh-token",
+            "sentinel-revocation-token",
+            "sentinel-access-token",
+            "sentinel-response-refresh-token",
+        ] {
+            assert!(
+                !debug.contains(secret),
+                "debug output leaked {secret}: {debug}"
+            );
+        }
+    }
+}
 
 #[derive(Clone)]
 struct RecordingTransport {

@@ -9,10 +9,9 @@ use std::{
 
 use metrics::{Key, Label, Level, Metadata, with_recorder};
 
-use crate::{
-    metrics::{CounterMetric, GaugeMetric, HistogramMetric},
-    request_cost,
-};
+use crate::metrics::{CounterMetric, GaugeMetric, HistogramMetric};
+#[cfg(feature = "request-cost")]
+use crate::request_cost;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MetricLabel {
@@ -190,6 +189,7 @@ fn register_histogram_handle(
 impl MetricsFacade for MetricsCrateFacade {
     fn increment_counter(&self, metric: CounterMetric, labels: &[MetricLabel], value: u64) {
         Self::counter_handle(metric, labels).increment(value);
+        #[cfg(feature = "request-cost")]
         request_cost::record_counter(metric, labels, value);
     }
 
@@ -207,11 +207,13 @@ impl MetricsFacade for MetricsCrateFacade {
 
     fn set_gauge(&self, metric: GaugeMetric, labels: &[MetricLabel], value: f64) {
         Self::gauge_handle(metric, labels).set(value);
+        #[cfg(feature = "request-cost")]
         request_cost::record_gauge(metric, labels, request_cost::GaugeUpdate::Set);
     }
 
     fn record_histogram(&self, metric: HistogramMetric, labels: &[MetricLabel], value: f64) {
         Self::histogram_handle(metric, labels).record(value);
+        #[cfg(feature = "request-cost")]
         request_cost::record_histogram(metric, labels, value);
     }
 }

@@ -8,8 +8,8 @@ use http_request::HttpRequestError;
 use jsonwebtoken::{Algorithm, Header};
 
 use crate::{
-    AllowedAlgorithms, JwksCachePolicy, JwksSource, JwksUrl, JwtDecodeErrorKind, JwtVerifier,
-    SignatureAlgorithm, TokenKind, VerificationPolicy,
+    AllowedAlgorithms, JwksCachePolicy, JwksDocument, JwksSource, JwksUrl, JwtDecodeErrorKind,
+    JwtVerifier, SignatureAlgorithm, TokenKind, VerificationPolicy,
     test_support::{
         Claims, CountingTransport, FixedClock, build_remote_verifier,
         build_remote_verifier_with_policy, build_verifier, id_header, jwk, jwks,
@@ -78,6 +78,50 @@ async fn given_claims_only_verification_when_payload_has_duplicate_member_then_r
         error.kind(),
         JwtDecodeErrorKind::ClaimsInvalid(crate::ClaimErrorKind::DuplicateJsonMember)
     ));
+}
+
+#[tokio::test]
+async fn given_trailing_json_in_header_when_verifying_then_rejects_token() {
+    let token = signed_raw_token(
+        br#"{"alg":"RS256","kid":"test-key","typ":"at+jwt"} {}"#,
+        serde_json::to_string(&valid_claims()).unwrap().as_bytes(),
+    );
+
+    let error = build_verifier()
+        .verify_json_claims_only(&token, &policy())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error.kind(),
+        JwtDecodeErrorKind::ClaimsInvalid(crate::ClaimErrorKind::DuplicateJsonMember)
+    ));
+}
+
+#[tokio::test]
+async fn given_trailing_json_in_payload_when_verifying_then_rejects_token() {
+    let payload = format!("{} {{}}", serde_json::to_string(&valid_claims()).unwrap());
+    let token = signed_raw_token(
+        br#"{"alg":"RS256","kid":"test-key","typ":"at+jwt"}"#,
+        payload.as_bytes(),
+    );
+
+    let error = build_verifier()
+        .verify_json_claims_only(&token, &policy())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error.kind(),
+        JwtDecodeErrorKind::ClaimsInvalid(crate::ClaimErrorKind::DuplicateJsonMember)
+    ));
+}
+
+#[test]
+fn given_trailing_json_in_jwks_when_parsing_then_rejects_document() {
+    let error = JwksDocument::from_json_str(&format!("{} {{}}", jwks())).unwrap_err();
+
+    assert_eq!(error.kind(), &JwtDecodeErrorKind::JwksParse);
 }
 
 #[tokio::test]

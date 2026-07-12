@@ -32,6 +32,8 @@ pub use scope::{ScopeKind, classify_scope, role_assignment_covers_resource};
 pub use step_up_evaluator::{StepUpEvaluator, StepUpResult};
 
 #[cfg(test)]
+mod evaluation_runtime_tests;
+#[cfg(test)]
 mod local_evaluator_tests;
 #[cfg(test)]
 mod step_up_evaluator_tests;

@@ -73,6 +73,34 @@ where
             .map(|entry| entry.value().clone())
     }
 
+    pub(super) fn apply_refresh_if_current(
+        &self,
+        key: &K,
+        expected: &CacheEntry<V>,
+        value: Option<V>,
+    ) -> bool {
+        let mut inner = self.lock_inner();
+        let Some(current) = inner.entries.get(key) else {
+            return false;
+        };
+        if !current.is_same_entry(expected) {
+            return false;
+        }
+
+        match value {
+            Some(value) => {
+                let access_order = self.next_access_order();
+                inner
+                    .entries
+                    .insert(key.clone(), CacheEntry::new(value, self.ttl, access_order));
+            }
+            None => {
+                inner.entries.remove(key);
+            }
+        }
+        true
+    }
+
     pub(super) fn inspect_entry(&self, key: &K) -> EntryState<V> {
         if self.disabled {
             self.record_miss();
@@ -260,6 +288,10 @@ impl<V> CacheEntry<V> {
 
     pub(super) fn finish_refresh(&self) {
         self.inner.refreshing.store(false, Ordering::Release);
+    }
+
+    fn is_same_entry(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     pub(super) fn value(&self) -> &V {

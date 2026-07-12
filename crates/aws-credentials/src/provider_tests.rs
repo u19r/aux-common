@@ -8,10 +8,34 @@ use std::{
 use url::Url;
 
 use crate::{
-    half_life_refresh_after, resolve_default_chain_credentials,
-    resolve_default_chain_credentials_with_expiry, resolve_ecs_authorization_token,
-    resolve_ecs_task_credentials_uri, validate_ecs_full_uri,
+    AwsResolvedCredentials, AwsStaticCredentials, CredentialSource, half_life_refresh_after,
+    resolve_default_chain_credentials, resolve_default_chain_credentials_with_expiry,
+    resolve_ecs_authorization_token, resolve_ecs_task_credentials_uri, validate_ecs_full_uri,
 };
+
+#[test]
+fn credential_debug_output_redacts_secret_material() {
+    let credentials = AwsStaticCredentials {
+        access_key_id: "AKIDEXAMPLE".to_string(),
+        secret_access_key: "sentinel-secret-access-key".to_string(),
+        session_token: Some("sentinel-session-token".to_string()),
+    };
+    let resolved = AwsResolvedCredentials {
+        credentials: credentials.clone(),
+        expires_after: None,
+        refresh_after: None,
+    };
+
+    for debug in [
+        format!("{credentials:?}"),
+        format!("{resolved:?}"),
+        format!("{:?}", CredentialSource::Static(credentials)),
+    ] {
+        assert!(!debug.contains("sentinel-secret-access-key"), "{debug}");
+        assert!(!debug.contains("sentinel-session-token"), "{debug}");
+        assert!(debug.contains("[REDACTED]"), "{debug}");
+    }
+}
 
 static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 

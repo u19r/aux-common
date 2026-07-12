@@ -98,6 +98,55 @@ async fn triggers_background_refresh() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_refresh_does_not_overwrite_newer_insert() {
+    use tokio::sync::Notify;
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let refresh_started = Arc::new(Notify::new());
+    let release_refresh = Arc::new(Notify::new());
+    let fetch: FetchFn<String, usize, ()> = {
+        let call_count = Arc::clone(&call_count);
+        let refresh_started = Arc::clone(&refresh_started);
+        let release_refresh = Arc::clone(&release_refresh);
+        arc_fetch_fn(move |_key: String| {
+            let call_count = Arc::clone(&call_count);
+            let refresh_started = Arc::clone(&refresh_started);
+            let release_refresh = Arc::clone(&release_refresh);
+            async move {
+                let call = call_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if call == 1 {
+                    return Ok(Some(1));
+                }
+                refresh_started.notify_one();
+                release_refresh.notified().await;
+                Ok(Some(2))
+            }
+        })
+    };
+    let cache = FetchingLruTtlCache::new(
+        CacheConfig::<String, usize>::new()
+            .with_ttl(Duration::from_secs(1))
+            .with_fetch(fetch)
+            .with_refresh_ttl(Duration::from_millis(1)),
+    );
+    let key = "refresh-race".to_string();
+
+    assert_eq!(
+        Some(1),
+        cache.get_or_fetch(&key).await.expect("initial fetch")
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert_eq!(Some(1), cache.get_or_fetch(&key).await.expect("cache hit"));
+    refresh_started.notified().await;
+
+    cache.insert(key.clone(), 99);
+    release_refresh.notify_one();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    assert_eq!(Some(99), cache.cached(&key));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expires_entries() {
     let fetch: FetchFn<String, i32, ()> =
         arc_fetch_fn(move |_key: String| async move { Ok::<_, ()>(Some(99)) });

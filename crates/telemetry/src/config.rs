@@ -163,7 +163,7 @@ impl FieldSecurityPolicy {
 
     #[must_use]
     pub fn default_allowlist_and_blocklist() -> Self {
-        Self::new(
+        Self::strict_allowlist(
             DEFAULT_TOP_LEVEL_FIELD_ALLOWLIST
                 .iter()
                 .map(|field| (*field).to_string())

@@ -222,9 +222,11 @@ where
         tokio::spawn(async move {
             let result = fetcher(refresh_key.clone()).await;
             match result {
-                Ok(Some(value)) => cache_core.insert(refresh_key.clone(), value),
+                Ok(Some(value)) => {
+                    cache_core.apply_refresh_if_current(&refresh_key, &entry, Some(value));
+                }
                 Ok(None) => {
-                    cache_core.remove(&refresh_key);
+                    cache_core.apply_refresh_if_current(&refresh_key, &entry, None);
                 }
                 Err(err) => {
                     refresh_errors.fetch_add(1, Ordering::Relaxed);
