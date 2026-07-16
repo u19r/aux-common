@@ -124,6 +124,21 @@ where
         EntryState::Fresh(entry)
     }
 
+    pub(super) fn fresh_entry_untracked(&self, key: &K) -> Option<CacheEntry<V>> {
+        if self.disabled {
+            return None;
+        }
+
+        let mut inner = self.lock_inner();
+        let entry = inner.entries.get(key)?.clone();
+        if entry.is_expired_at(Instant::now()) {
+            inner.entries.remove(key);
+            return None;
+        }
+        entry.touch(self.next_access_order());
+        Some(entry)
+    }
+
     pub(super) fn inspect_entry_with_stale(&self, key: &K, stale_ttl: Duration) -> EntryState<V> {
         if self.disabled {
             self.record_miss();

@@ -5,7 +5,8 @@ use std::{
 };
 
 use authz_types::{
-    BatchEvaluationRequest, BatchEvaluationResponse, EvaluationRequest, EvaluationResponse,
+    BatchEvaluationRequest, BatchEvaluationResponse, CONTEXT_INTERNAL_KEY, EvaluationRequest,
+    EvaluationResponse, ValidatedConfigurationModel,
 };
 use cedar_policy::{
     AuthorizationError, Authorizer, Context, Decision, Entities, Entity, EntityId, EntityTypeName,
@@ -44,6 +45,100 @@ pub struct CedarRequestUids {
     resource: EntityUid,
 }
 
+#[derive(Debug, Clone)]
+pub struct CedarUidRegistry {
+    subject_types: HashMap<&'static str, EntityTypeName>,
+    resources: HashMap<String, CedarResourceUids>,
+}
+
+#[derive(Debug, Clone)]
+struct CedarResourceUids {
+    entity_type: EntityTypeName,
+    actions: HashMap<String, EntityUid>,
+}
+
+impl CedarUidRegistry {
+    pub fn new(config: &ValidatedConfigurationModel) -> Result<Self, CedarError> {
+        let subject_types = ["user", "group", "role", "api_key", "machine", "protocol"]
+            .into_iter()
+            .map(|subject_type| {
+                let cedar_type = format!("Authz::{}", subject_entity_type(subject_type));
+                let entity_type = EntityTypeName::from_str(&cedar_type)
+                    .map_err(|error| CedarError::evaluation(error.to_string()))?;
+                Ok((subject_type, entity_type))
+            })
+            .collect::<Result<HashMap<_, _>, CedarError>>()?;
+        let action_type = EntityTypeName::from_str("Authz::Action")
+            .map_err(|error| CedarError::evaluation(error.to_string()))?;
+        let resources = config
+            .resource_types
+            .iter()
+            .map(|resource| {
+                let cedar_type = format!(
+                    "Authz::{}",
+                    super::schema_generator::to_pascal_case(&resource.id)
+                );
+                let entity_type = EntityTypeName::from_str(&cedar_type)
+                    .map_err(|error| CedarError::evaluation(error.to_string()))?;
+                let actions = resource
+                    .actions
+                    .iter()
+                    .map(|action| {
+                        let action_id = format!("{}:{}", resource.id, action.name);
+                        let uid = EntityUid::from_type_name_and_id(
+                            action_type.clone(),
+                            EntityId::new(action_id),
+                        );
+                        (action.name.clone(), uid)
+                    })
+                    .collect();
+                Ok((
+                    resource.id.clone(),
+                    CedarResourceUids {
+                        entity_type,
+                        actions,
+                    },
+                ))
+            })
+            .collect::<Result<HashMap<_, _>, CedarError>>()?;
+        Ok(Self {
+            subject_types,
+            resources,
+        })
+    }
+
+    pub(crate) fn request_uids(
+        &self,
+        request: &EvaluationRequest,
+    ) -> Result<CedarRequestUids, CedarError> {
+        let subject_type = self
+            .subject_types
+            .get(request.subject.subject_type.as_str())
+            .ok_or_else(|| CedarError::evaluation("subject type is not prepared"))?;
+        let resource = self
+            .resources
+            .get(&request.resource.resource_type)
+            .ok_or_else(|| CedarError::evaluation("resource type is not prepared"))?;
+        let action = resource
+            .actions
+            .get(&request.action.name)
+            .ok_or_else(|| CedarError::evaluation("resource action is not prepared"))?;
+
+        Ok(CedarRequestUids {
+            resource_type: request.resource.resource_type.clone(),
+            principal: EntityUid::from_type_name_and_id(
+                subject_type.clone(),
+                EntityId::new(request.subject.id.clone()),
+            ),
+            action: action.clone(),
+            resource: EntityUid::from_type_name_and_id(
+                resource.entity_type.clone(),
+                EntityId::new(request.resource.id.clone()),
+            ),
+        })
+    }
+}
+
 impl CedarRequestUids {
     pub fn resource_type(&self) -> &str {
         self.resource_type.as_str()
@@ -68,6 +163,45 @@ impl CedarRequestUids {
 pub struct CedarEntitiesContext {
     entities: Entities,
     context: Context,
+}
+
+#[derive(Debug, Clone)]
+pub struct CedarEntityRef {
+    uid: EntityUid,
+}
+
+impl CedarEntityRef {
+    pub fn new(entity_type: &str, entity_id: &str) -> Result<Self, CedarError> {
+        Ok(Self {
+            uid: entity_uid(entity_type, entity_id).map_err(CedarError::evaluation)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CedarResourceScope {
+    pub role: CedarEntityRef,
+    pub resource: CedarEntityRef,
+}
+
+#[derive(Debug, Clone)]
+pub struct CedarInternalContext {
+    pub token_present: bool,
+    pub token_valid: bool,
+    pub token_resource_filter_enabled: bool,
+    pub token_resource_filter: Vec<CedarEntityRef>,
+    pub resource_scopes: Vec<CedarResourceScope>,
+    pub token_org_id_present: bool,
+    pub token_org_id: String,
+    pub token_owner_org_ids: Vec<String>,
+    pub allowed_actions: Vec<String>,
+    pub session_present: bool,
+    pub session_acr: i64,
+    pub session_amr: Vec<String>,
+    pub session_auth_age_present: bool,
+    pub session_auth_age_seconds: i64,
+    pub session_mfa_age_present: bool,
+    pub session_mfa_age_seconds: i64,
 }
 
 pub struct PreparedCedarEvaluation {
@@ -216,15 +350,18 @@ pub fn parse_policy_sets(bundle: &CompiledBundle) -> Result<ParsedPolicySets, Ce
 
 pub fn prepare_request_uids(request: &EvaluationRequest) -> Result<CedarRequestUids, CedarError> {
     let resource_type = request.resource.resource_type.clone();
-    let action_name = request.action.name.clone();
-    let subject_type = request.subject.subject_type.as_str().to_string();
     let subject_id = request.subject.id.clone();
     let resource_id = request.resource.id.clone();
 
-    let action = entity_uid("Authz::Action", &format!("{resource_type}:{action_name}"))
+    let action = entity_uid_owned(
+        "Authz::Action",
+        format!("{}:{}", resource_type, request.action.name),
+    )
+    .map_err(CedarError::evaluation)?;
+    let principal = principal_uid_owned(request.subject.subject_type.as_str(), subject_id)
         .map_err(CedarError::evaluation)?;
-    let principal = principal_uid(&subject_type, &subject_id).map_err(CedarError::evaluation)?;
-    let resource = resource_uid(&resource_type, &resource_id).map_err(CedarError::evaluation)?;
+    let resource = resource_uid_owned(&resource_type, resource_id)
+        .map_err(CedarError::evaluation)?;
 
     Ok(CedarRequestUids {
         resource_type,
@@ -245,9 +382,14 @@ pub fn prepare_entities_and_context_owned_with_parents(
     subject_parents: &[EntityParentRef],
     resource_parents: &[EntityParentRef],
 ) -> Result<CedarEntitiesContext, CedarError> {
-    let (entities, context) =
-        build_entities_and_context_owned_with_parents(request, subject_parents, resource_parents)
-            .map_err(CedarError::evaluation)?;
+    let (entities, context) = build_entities_and_context_owned_with_parents(
+        request,
+        subject_parents,
+        resource_parents,
+        None,
+        None,
+    )
+    .map_err(CedarError::evaluation)?;
     Ok(CedarEntitiesContext { entities, context })
 }
 
@@ -277,8 +419,10 @@ pub fn prepare_evaluation_owned(
     request: EvaluationRequest,
 ) -> Result<PreparedCedarEvaluation, CedarError> {
     let uids = prepare_request_uids(&request)?;
-    let entities_context = prepare_entities_and_context_owned_with_parents(request, &[], &[])?;
-    prepare_request_from_parts(uids, entities_context)
+    let (entities, context) =
+        build_entities_and_context_owned_with_parents(request, &[], &[], None, Some(&uids))
+            .map_err(CedarError::evaluation)?;
+    prepare_request_from_parts(uids, CedarEntitiesContext { entities, context })
 }
 
 /// Prepare an evaluation with parent relationships supplied by trusted
@@ -289,12 +433,52 @@ pub fn prepare_evaluation_owned_with_parents(
     resource_parents: &[EntityParentRef],
 ) -> Result<PreparedCedarEvaluation, CedarError> {
     let uids = prepare_request_uids(&request)?;
-    let entities_context = prepare_entities_and_context_owned_with_parents(
+    let (entities, context) = build_entities_and_context_owned_with_parents(
         request,
         subject_parents,
         resource_parents,
-    )?;
-    prepare_request_from_parts(uids, entities_context)
+        None,
+        Some(&uids),
+    )
+    .map_err(CedarError::evaluation)?;
+    prepare_request_from_parts(uids, CedarEntitiesContext { entities, context })
+}
+
+pub fn prepare_evaluation_owned_with_parents_and_internal_context(
+    request: EvaluationRequest,
+    subject_parents: &[EntityParentRef],
+    resource_parents: &[EntityParentRef],
+    internal_context: CedarInternalContext,
+) -> Result<PreparedCedarEvaluation, CedarError> {
+    let uids = prepare_request_uids(&request)?;
+    let (entities, context) = build_entities_and_context_owned_with_parents(
+        request,
+        subject_parents,
+        resource_parents,
+        Some(internal_context),
+        Some(&uids),
+    )
+    .map_err(CedarError::evaluation)?;
+    prepare_request_from_parts(uids, CedarEntitiesContext { entities, context })
+}
+
+pub fn prepare_evaluation_owned_with_registry_and_internal_context(
+    uid_registry: &CedarUidRegistry,
+    request: EvaluationRequest,
+    subject_parents: &[EntityParentRef],
+    resource_parents: &[EntityParentRef],
+    internal_context: CedarInternalContext,
+) -> Result<PreparedCedarEvaluation, CedarError> {
+    let uids = uid_registry.request_uids(&request)?;
+    let (entities, context) = build_entities_and_context_owned_with_parents(
+        request,
+        subject_parents,
+        resource_parents,
+        Some(internal_context),
+        Some(&uids),
+    )
+    .map_err(CedarError::evaluation)?;
+    prepare_request_from_parts(uids, CedarEntitiesContext { entities, context })
 }
 
 pub fn evaluate_prepared_with_policy_sets(
@@ -415,11 +599,9 @@ fn build_entities_and_context_ref_with_parents(
     let context = context_from_attrs_ref(request.context.as_ref().map(|ctx| &ctx.attributes))?;
 
     let entities = build_entities_from_converted_inputs(EntityConvertedBuildInputs {
-        principal_type,
-        principal_id: request.subject.id.clone(),
+        principal_uid: principal_uid(&principal_type, &request.subject.id)?,
         principal_attrs,
-        resource_type,
-        resource_id: request.resource.id.clone(),
+        resource_uid: resource_uid(&resource_type, &request.resource.id)?,
         resource_attrs,
         subject_parents: subject_parents.to_vec(),
         resource_parents: resource_parents.to_vec(),
@@ -432,6 +614,8 @@ fn build_entities_and_context_owned_with_parents(
     request: EvaluationRequest,
     subject_parents: &[EntityParentRef],
     resource_parents: &[EntityParentRef],
+    internal_context: Option<CedarInternalContext>,
+    request_uids: Option<&CedarRequestUids>,
 ) -> Result<(Entities, Context), String> {
     let principal_type = subject_entity_type(request.subject.subject_type.as_str());
     let resource_type = super::schema_generator::to_pascal_case(&request.resource.resource_type);
@@ -444,27 +628,31 @@ fn build_entities_and_context_owned_with_parents(
         "id".to_string(),
         serde_json::Value::String(request.subject.id.clone()),
     );
-    let resource_props = request
-        .resource
-        .properties
-        .unwrap_or_else(|| serde_json::Value::Object(Default::default()))
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
+    let resource_props = match request.resource.properties {
+        Some(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
 
     let mut context_attrs = request
         .context
         .map(|ctx| ctx.attributes)
         .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
     remove_parent_keys_from_context(&mut context_attrs);
-    let context = context_from_value(context_attrs)?;
+    let context = context_from_value(context_attrs, internal_context)?;
+
+    let principal_uid = match request_uids {
+        Some(uids) => uids.principal.clone(),
+        None => principal_uid(&principal_type, &request.subject.id)?,
+    };
+    let resource_uid = match request_uids {
+        Some(uids) => uids.resource.clone(),
+        None => resource_uid(&resource_type, &request.resource.id)?,
+    };
 
     let entities = build_entities_from_converted_inputs(EntityConvertedBuildInputs {
-        principal_type,
-        principal_id: request.subject.id,
+        principal_uid,
         principal_attrs: restricted_attrs_from_map(principal_props)?,
-        resource_type,
-        resource_id: request.resource.id,
+        resource_uid,
         resource_attrs: restricted_attrs_from_map(resource_props)?,
         subject_parents: subject_parents.to_vec(),
         resource_parents: resource_parents.to_vec(),
@@ -474,11 +662,9 @@ fn build_entities_and_context_owned_with_parents(
 }
 
 struct EntityConvertedBuildInputs {
-    principal_type: String,
-    principal_id: String,
+    principal_uid: EntityUid,
     principal_attrs: Vec<(String, RestrictedExpression)>,
-    resource_type: String,
-    resource_id: String,
+    resource_uid: EntityUid,
     resource_attrs: Vec<(String, RestrictedExpression)>,
     subject_parents: Vec<EntityParentRef>,
     resource_parents: Vec<EntityParentRef>,
@@ -488,18 +674,14 @@ fn build_entities_from_converted_inputs(
     inputs: EntityConvertedBuildInputs,
 ) -> Result<Entities, String> {
     let EntityConvertedBuildInputs {
-        principal_type,
-        principal_id,
+        principal_uid,
         principal_attrs,
-        resource_type,
-        resource_id,
+        resource_uid,
         resource_attrs,
         subject_parents,
         resource_parents,
     } = inputs;
 
-    let principal_uid = principal_uid(principal_type.as_str(), principal_id.as_str())?;
-    let resource_uid = resource_uid(resource_type.as_str(), resource_id.as_str())?;
     let principal_parent_uids = parent_uids(&subject_parents)?;
     let resource_parent_uids = parent_uids(&resource_parents)?;
 
@@ -537,18 +719,136 @@ fn build_entities_from_converted_inputs(
     Entities::from_entities(entities, None).map_err(|e| e.to_string())
 }
 
-fn context_from_value(context: serde_json::Value) -> Result<Context, String> {
-    let serde_json::Value::Object(map) = context else {
-        return Err("context must be an object".to_string());
+fn context_from_value(
+    context: serde_json::Value,
+    internal_context: Option<CedarInternalContext>,
+) -> Result<Context, String> {
+    let mut map = match context {
+        serde_json::Value::Object(map) => map,
+        _ if internal_context.is_some() => serde_json::Map::new(),
+        _ => return Err("context must be an object".to_string()),
     };
-    if map.is_empty() {
+    if internal_context.is_some() {
+        map.remove(CONTEXT_INTERNAL_KEY);
+    }
+    if map.is_empty() && internal_context.is_none() {
         return Ok(Context::empty());
     }
-    let mut pairs = Vec::with_capacity(map.len());
+    let mut pairs = Vec::with_capacity(map.len() + usize::from(internal_context.is_some()));
     for (key, value) in map {
         pairs.push((key, restricted_expr_from_value(value)?));
     }
+    if let Some(internal_context) = internal_context {
+        pairs.push((
+            CONTEXT_INTERNAL_KEY.to_string(),
+            restricted_expr_from_internal_context(internal_context)?,
+        ));
+    }
     Context::from_pairs(pairs).map_err(|e| e.to_string())
+}
+
+fn restricted_expr_from_internal_context(
+    context: CedarInternalContext,
+) -> Result<RestrictedExpression, String> {
+    let entity_set = |entities: Vec<CedarEntityRef>| {
+        RestrictedExpression::new_set(
+            entities
+                .into_iter()
+                .map(|entity| RestrictedExpression::new_entity_uid(entity.uid)),
+        )
+    };
+    let string_set = |values: Vec<String>| {
+        RestrictedExpression::new_set(
+            values
+                .into_iter()
+                .map(RestrictedExpression::new_string),
+        )
+    };
+    let resource_scopes = context
+        .resource_scopes
+        .into_iter()
+        .map(|scope| {
+            RestrictedExpression::new_record([
+                (
+                    "role".to_string(),
+                    RestrictedExpression::new_entity_uid(scope.role.uid),
+                ),
+                (
+                    "resource".to_string(),
+                    RestrictedExpression::new_entity_uid(scope.resource.uid),
+                ),
+            ])
+            .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    RestrictedExpression::new_record([
+        (
+            "token_present".to_string(),
+            RestrictedExpression::new_bool(context.token_present),
+        ),
+        (
+            "token_valid".to_string(),
+            RestrictedExpression::new_bool(context.token_valid),
+        ),
+        (
+            "token_resource_filter_enabled".to_string(),
+            RestrictedExpression::new_bool(context.token_resource_filter_enabled),
+        ),
+        (
+            "token_resource_filter".to_string(),
+            entity_set(context.token_resource_filter),
+        ),
+        (
+            "resource_scopes".to_string(),
+            RestrictedExpression::new_set(resource_scopes),
+        ),
+        (
+            "token_org_id_present".to_string(),
+            RestrictedExpression::new_bool(context.token_org_id_present),
+        ),
+        (
+            "token_org_id".to_string(),
+            RestrictedExpression::new_string(context.token_org_id),
+        ),
+        (
+            "token_owner_org_ids".to_string(),
+            string_set(context.token_owner_org_ids),
+        ),
+        (
+            "allowed_actions".to_string(),
+            string_set(context.allowed_actions),
+        ),
+        (
+            "session_present".to_string(),
+            RestrictedExpression::new_bool(context.session_present),
+        ),
+        (
+            "session_acr".to_string(),
+            RestrictedExpression::new_long(context.session_acr),
+        ),
+        (
+            "session_amr".to_string(),
+            string_set(context.session_amr),
+        ),
+        (
+            "session_auth_age_present".to_string(),
+            RestrictedExpression::new_bool(context.session_auth_age_present),
+        ),
+        (
+            "session_auth_age_seconds".to_string(),
+            RestrictedExpression::new_long(context.session_auth_age_seconds),
+        ),
+        (
+            "session_mfa_age_present".to_string(),
+            RestrictedExpression::new_bool(context.session_mfa_age_present),
+        ),
+        (
+            "session_mfa_age_seconds".to_string(),
+            RestrictedExpression::new_long(context.session_mfa_age_seconds),
+        ),
+    ])
+    .map_err(|error| error.to_string())
 }
 
 fn context_from_attrs_ref(context_attrs: Option<&serde_json::Value>) -> Result<Context, String> {
@@ -699,6 +999,14 @@ fn entity_uid(entity_type: &str, entity_id: &str) -> Result<EntityUid, String> {
     Ok(EntityUid::from_type_name_and_id(type_name, entity_id))
 }
 
+fn entity_uid_owned(entity_type: &str, entity_id: String) -> Result<EntityUid, String> {
+    let type_name = EntityTypeName::from_str(entity_type).map_err(|e| e.to_string())?;
+    Ok(EntityUid::from_type_name_and_id(
+        type_name,
+        EntityId::new(entity_id),
+    ))
+}
+
 fn parent_uids(parents: &[EntityParentRef]) -> Result<HashSet<EntityUid>, String> {
     let mut parent_uids = HashSet::with_capacity(parents.len());
     for parent in parents {
@@ -727,9 +1035,19 @@ fn principal_uid(subject_type: &str, id: &str) -> Result<EntityUid, String> {
     entity_uid(&format!("Authz::{entity_type}"), id)
 }
 
+fn principal_uid_owned(subject_type: &str, id: String) -> Result<EntityUid, String> {
+    let entity_type = subject_entity_type(subject_type);
+    entity_uid_owned(&format!("Authz::{entity_type}"), id)
+}
+
 fn resource_uid(resource_type: &str, id: &str) -> Result<EntityUid, String> {
     let entity_type = super::schema_generator::to_pascal_case(resource_type);
     entity_uid(&format!("Authz::{entity_type}"), id)
+}
+
+fn resource_uid_owned(resource_type: &str, id: String) -> Result<EntityUid, String> {
+    let entity_type = super::schema_generator::to_pascal_case(resource_type);
+    entity_uid_owned(&format!("Authz::{entity_type}"), id)
 }
 
 fn subject_entity_type(subject_type: &str) -> String {

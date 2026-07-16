@@ -17,6 +17,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+alloc-counter = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [lints]

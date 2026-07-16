@@ -84,6 +84,7 @@ dependencies = [
 name = "authz-runtime"
 version = "0.1.0"
 dependencies = [
+ "alloc-counter",
  "authz-cedar",
  "authz-types",
  "chrono",

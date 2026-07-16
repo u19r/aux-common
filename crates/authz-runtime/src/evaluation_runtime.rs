@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use authz_cedar::{CompiledBundle, ParsedPolicySets, parse_policy_sets};
+use authz_cedar::{CedarUidRegistry, CompiledBundle, ParsedPolicySets, parse_policy_sets};
 use authz_types::{
     MAX_PERMISSIONS, MAX_ROLES, TokenContext, TokenScopeType, ValidatedConfigurationModel,
 };
@@ -151,6 +151,7 @@ struct RoleRuntime {
 pub struct EvaluationRuntime {
     pub(crate) config: ValidatedConfigurationModel,
     pub(crate) policy_sets: ParsedPolicySets,
+    cedar_uids: CedarUidRegistry,
     roles: Vec<RoleRuntime>,
     permissions: Vec<PermissionRuntime>,
     role_index: HashMap<String, usize>,
@@ -204,6 +205,7 @@ impl EvaluationRuntime {
         }
 
         let policy_sets = parse_policy_sets(bundle).map_err(AuthzRuntimeError::build)?;
+        let cedar_uids = CedarUidRegistry::new(&config).map_err(AuthzRuntimeError::build)?;
         let mut permission_index = HashMap::with_capacity(config.permissions.len());
         let mut permissions = Vec::with_capacity(config.permissions.len());
         for (idx, permission) in config.permissions.iter().enumerate() {
@@ -281,6 +283,7 @@ impl EvaluationRuntime {
         Ok(Self {
             config,
             policy_sets,
+            cedar_uids,
             roles,
             permissions,
             role_index,
@@ -305,6 +308,10 @@ impl EvaluationRuntime {
         self.action_masks
             .get(resource_type)
             .and_then(|actions| actions.get(action))
+    }
+
+    pub(crate) fn cedar_uids(&self) -> &CedarUidRegistry {
+        &self.cedar_uids
     }
 
     pub(crate) fn actions_for_resource(

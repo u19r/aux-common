@@ -7,7 +7,7 @@ use authz_types::{
 use serde_json::{Map, Value};
 
 use crate::{
-    EntityParentRef, compile_policy_bundle, evaluate as evaluate_untrusted, evaluate_batch,
+    CedarUidRegistry, EntityParentRef, compile_policy_bundle, evaluate as evaluate_untrusted, evaluate_batch,
     evaluate_batch_with_policy_sets, evaluate_owned_with_policy_sets,
     evaluate_owned_with_policy_sets_with_parents, evaluate_with_policy_sets, parse_policy_sets,
     prepare_request_uids,
@@ -39,6 +39,39 @@ fn typed_uid_construction_round_trips_all_validated_identifier_shapes() {
                 .expect("rendered UID remains valid Cedar syntax");
             assert_eq!(&reparsed, uid);
         }
+    }
+}
+
+#[test]
+fn prepared_uid_registry_matches_dynamic_uid_construction_for_every_subject_type() {
+    let config = config_with_scope(Scope::Tenant);
+    let registry = CedarUidRegistry::new(&config).expect("prepared uid registry");
+    let subjects = [
+        Subject::user("subject"),
+        Subject::group("subject"),
+        Subject::role("subject"),
+        Subject::api_key("subject"),
+        Subject::machine("subject"),
+        Subject::protocol("subject"),
+    ];
+
+    for subject in subjects {
+        let request = authz_types::EvaluationRequest {
+            subject,
+            resource: Resource::new("document", "doc1"),
+            action: Action::new("read"),
+            context: None,
+            jwt_context: None,
+            session_context: None,
+            token_context: None,
+        };
+        let dynamic = prepare_request_uids(&request).expect("dynamic uids");
+        let prepared = registry.request_uids(&request).expect("prepared uids");
+
+        assert_eq!(prepared.resource_type(), dynamic.resource_type());
+        assert_eq!(prepared.principal(), dynamic.principal());
+        assert_eq!(prepared.action(), dynamic.action());
+        assert_eq!(prepared.resource(), dynamic.resource());
     }
 }
 

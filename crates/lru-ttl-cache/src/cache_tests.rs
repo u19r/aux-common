@@ -1,13 +1,15 @@
 use std::{
     hash::{Hash, Hasher},
+    hint::black_box,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex, RwLock,
         atomic::{AtomicUsize, Ordering},
     },
+    thread,
     time::Duration,
 };
 
-use tokio::sync::Mutex;
+use tokio::sync::{Barrier, Mutex, Notify};
 
 use crate::{
     cache::{FetchingLruTtlCache, LruTtlCache},
@@ -364,6 +366,388 @@ async fn evicts_least_recently_accessed_entry_when_capacity_is_full() {
     assert_eq!(Some(1), cache.get(&first));
     assert_eq!(None, cache.get(&second));
     assert_eq!(Some(3), cache.get(&third));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_misses_for_one_key_share_one_fetch() {
+    const CALLERS: usize = 32;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fetch: FetchFn<String, usize, ()> = {
+        let calls = Arc::clone(&calls);
+        arc_fetch_fn(move |_key: String| {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(Some(7))
+            }
+        })
+    };
+    let cache = FetchingLruTtlCache::new(
+        CacheConfig::<String, usize>::new()
+            .with_ttl(Duration::from_secs(1))
+            .with_fetch(fetch),
+    );
+    let start = Arc::new(Barrier::new(CALLERS + 1));
+    let key = "shared".to_string();
+    let mut tasks = Vec::with_capacity(CALLERS);
+    for _ in 0..CALLERS {
+        let cache = cache.clone();
+        let start = Arc::clone(&start);
+        let key = key.clone();
+        tasks.push(tokio::spawn(async move {
+            start.wait().await;
+            cache.get_or_fetch(&key).await
+        }));
+    }
+
+    start.wait().await;
+    for task in tasks {
+        assert_eq!(Some(7), task.await.expect("task").expect("fetch"));
+    }
+    assert_eq!(1, calls.load(Ordering::SeqCst));
+    assert_eq!(0, cache.in_flight_count());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_negative_misses_share_one_fetch_without_negative_caching() {
+    const CALLERS: usize = 16;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fetch: FetchFn<String, usize, ()> = {
+        let calls = Arc::clone(&calls);
+        arc_fetch_fn(move |_key: String| {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(None)
+            }
+        })
+    };
+    let cache = FetchingLruTtlCache::new(
+        CacheConfig::<String, usize>::new()
+            .with_ttl(Duration::from_secs(1))
+            .with_fetch(fetch),
+    );
+    let start = Arc::new(Barrier::new(CALLERS + 1));
+    let key = "absent".to_string();
+    let mut tasks = Vec::with_capacity(CALLERS);
+    for _ in 0..CALLERS {
+        let cache = cache.clone();
+        let start = Arc::clone(&start);
+        let key = key.clone();
+        tasks.push(tokio::spawn(async move {
+            start.wait().await;
+            cache.get_or_fetch(&key).await
+        }));
+    }
+
+    start.wait().await;
+    for task in tasks {
+        assert_eq!(None, task.await.expect("task").expect("fetch"));
+    }
+    assert_eq!(1, calls.load(Ordering::SeqCst));
+    assert_eq!(None, cache.get_or_fetch(&key).await.expect("next fetch"));
+    assert_eq!(2, calls.load(Ordering::SeqCst));
+    assert_eq!(0, cache.in_flight_count());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancellation_releases_same_key_followers() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let first_started = Arc::new(Notify::new());
+    let fetch: FetchFn<String, usize, ()> = {
+        let calls = Arc::clone(&calls);
+        let first_started = Arc::clone(&first_started);
+        arc_fetch_fn(move |_key: String| {
+            let calls = Arc::clone(&calls);
+            let first_started = Arc::clone(&first_started);
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    first_started.notify_one();
+                    std::future::pending().await
+                } else {
+                    Ok(Some(9))
+                }
+            }
+        })
+    };
+    let cache = FetchingLruTtlCache::new(
+        CacheConfig::<String, usize>::new()
+            .with_ttl(Duration::from_secs(1))
+            .with_fetch(fetch),
+    );
+    let key = "cancelled".to_string();
+    let leader = {
+        let cache = cache.clone();
+        let key = key.clone();
+        tokio::spawn(async move { cache.get_or_fetch(&key).await })
+    };
+    first_started.notified().await;
+    let follower = {
+        let cache = cache.clone();
+        let key = key.clone();
+        tokio::spawn(async move { cache.get_or_fetch(&key).await })
+    };
+    tokio::task::yield_now().await;
+    leader.abort();
+
+    assert_eq!(
+        Some(9),
+        tokio::time::timeout(Duration::from_secs(1), follower)
+            .await
+            .expect("follower unblocked")
+            .expect("follower task")
+            .expect("retry fetch")
+    );
+    assert_eq!(2, calls.load(Ordering::SeqCst));
+    assert_eq!(0, cache.in_flight_count());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fetch_error_releases_same_key_followers_for_retry() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let first_started = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+    let fetch: FetchFn<String, usize, &'static str> = {
+        let calls = Arc::clone(&calls);
+        let first_started = Arc::clone(&first_started);
+        let release_first = Arc::clone(&release_first);
+        arc_fetch_fn(move |_key: String| {
+            let calls = Arc::clone(&calls);
+            let first_started = Arc::clone(&first_started);
+            let release_first = Arc::clone(&release_first);
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    first_started.notify_one();
+                    release_first.notified().await;
+                    Err("first fetch failed")
+                } else {
+                    Ok(Some(11))
+                }
+            }
+        })
+    };
+    let cache = FetchingLruTtlCache::new(
+        CacheConfig::<String, usize>::new()
+            .with_ttl(Duration::from_secs(1))
+            .with_fetch(fetch),
+    );
+    let key = "failed".to_string();
+    let leader = {
+        let cache = cache.clone();
+        let key = key.clone();
+        tokio::spawn(async move { cache.get_or_fetch(&key).await })
+    };
+    first_started.notified().await;
+    let follower = {
+        let cache = cache.clone();
+        let key = key.clone();
+        tokio::spawn(async move { cache.get_or_fetch(&key).await })
+    };
+    tokio::task::yield_now().await;
+    release_first.notify_one();
+
+    assert_eq!(Err("first fetch failed"), leader.await.expect("leader task"));
+    assert_eq!(
+        Some(11),
+        follower.await.expect("follower task").expect("retry fetch")
+    );
+    assert_eq!(2, calls.load(Ordering::SeqCst));
+    assert_eq!(0, cache.in_flight_count());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fetch_panic_releases_same_key_followers_for_retry() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let first_started = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+    let fetch: FetchFn<String, usize, ()> = {
+        let calls = Arc::clone(&calls);
+        let first_started = Arc::clone(&first_started);
+        let release_first = Arc::clone(&release_first);
+        arc_fetch_fn(move |_key: String| {
+            let calls = Arc::clone(&calls);
+            let first_started = Arc::clone(&first_started);
+            let release_first = Arc::clone(&release_first);
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    first_started.notify_one();
+                    release_first.notified().await;
+                    panic!("simulated fetch panic");
+                }
+                Ok(Some(13))
+            }
+        })
+    };
+    let cache = FetchingLruTtlCache::new(
+        CacheConfig::<String, usize>::new()
+            .with_ttl(Duration::from_secs(1))
+            .with_fetch(fetch),
+    );
+    let key = "panicked".to_string();
+    let leader = {
+        let cache = cache.clone();
+        let key = key.clone();
+        tokio::spawn(async move { cache.get_or_fetch(&key).await })
+    };
+    first_started.notified().await;
+    let follower = {
+        let cache = cache.clone();
+        let key = key.clone();
+        tokio::spawn(async move { cache.get_or_fetch(&key).await })
+    };
+    tokio::task::yield_now().await;
+    release_first.notify_one();
+
+    assert!(leader.await.expect_err("leader must panic").is_panic());
+    assert_eq!(
+        Some(13),
+        follower.await.expect("follower task").expect("retry fetch")
+    );
+    assert_eq!(2, calls.load(Ordering::SeqCst));
+    assert_eq!(0, cache.in_flight_count());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn different_keys_fetch_concurrently() {
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum_active = Arc::new(AtomicUsize::new(0));
+    let both_started = Arc::new(Barrier::new(2));
+    let fetch: FetchFn<String, usize, ()> = {
+        let active = Arc::clone(&active);
+        let maximum_active = Arc::clone(&maximum_active);
+        let both_started = Arc::clone(&both_started);
+        arc_fetch_fn(move |_key: String| {
+            let active = Arc::clone(&active);
+            let maximum_active = Arc::clone(&maximum_active);
+            let both_started = Arc::clone(&both_started);
+            async move {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum_active.fetch_max(current, Ordering::SeqCst);
+                both_started.wait().await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(Some(1))
+            }
+        })
+    };
+    let cache = FetchingLruTtlCache::new(
+        CacheConfig::<String, usize>::new()
+            .with_ttl(Duration::from_secs(1))
+            .with_fetch(fetch),
+    );
+    let first = {
+        let cache = cache.clone();
+        tokio::spawn(async move { cache.get_or_fetch(&"first".to_string()).await })
+    };
+    let second = {
+        let cache = cache.clone();
+        tokio::spawn(async move { cache.get_or_fetch(&"second".to_string()).await })
+    };
+
+    let (first, second) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("different keys must not share one fetch lock");
+    assert_eq!(Some(1), first.expect("first task").expect("first fetch"));
+    assert_eq!(Some(1), second.expect("second task").expect("second fetch"));
+    assert_eq!(2, maximum_active.load(Ordering::SeqCst));
+    assert_eq!(0, cache.in_flight_count());
+}
+
+fn profile_hit_lock(thread_count: usize, reads_per_thread: usize, read_concurrent: bool) -> u128 {
+    let values = (0..64).map(|key| (key, key)).collect::<std::collections::HashMap<_, _>>();
+    let start = Arc::new(std::sync::Barrier::new(thread_count + 1));
+    let started = std::time::Instant::now();
+
+    if read_concurrent {
+        let values = Arc::new(RwLock::new(values));
+        let handles = (0..thread_count)
+            .map(|thread_index| {
+                let values = Arc::clone(&values);
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    for read_index in 0..reads_per_thread {
+                        let key = (thread_index + read_index) % 64;
+                        let values = values.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        black_box(values.get(&key).copied());
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        for handle in handles {
+            handle.join().expect("reader");
+        }
+    } else {
+        let values = Arc::new(StdMutex::new(values));
+        let handles = (0..thread_count)
+            .map(|thread_index| {
+                let values = Arc::clone(&values);
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    for read_index in 0..reads_per_thread {
+                        let key = (thread_index + read_index) % 64;
+                        let values = values.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        black_box(values.get(&key).copied());
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        for handle in handles {
+            handle.join().expect("reader");
+        }
+    }
+
+    started.elapsed().as_nanos()
+}
+
+#[test]
+#[ignore = "P2-030a single-core and available-parallelism lock profile"]
+fn cache_hit_read_lock_profile() {
+    const READS_PER_THREAD: usize = 100_000;
+
+    let parallelism = thread::available_parallelism()
+        .map_or(1, usize::from)
+        .clamp(1, 96);
+    for thread_count in [1, parallelism] {
+        let mut mutex_best_ns = u128::MAX;
+        let mut rwlock_best_ns = u128::MAX;
+        for iteration in 0..6 {
+            if iteration % 2 == 0 {
+                rwlock_best_ns = rwlock_best_ns.min(profile_hit_lock(
+                    thread_count,
+                    READS_PER_THREAD,
+                    true,
+                ));
+                mutex_best_ns = mutex_best_ns.min(profile_hit_lock(
+                    thread_count,
+                    READS_PER_THREAD,
+                    false,
+                ));
+            } else {
+                mutex_best_ns = mutex_best_ns.min(profile_hit_lock(
+                    thread_count,
+                    READS_PER_THREAD,
+                    false,
+                ));
+                rwlock_best_ns = rwlock_best_ns.min(profile_hit_lock(
+                    thread_count,
+                    READS_PER_THREAD,
+                    true,
+                ));
+            }
+        }
+        eprintln!(
+            "p2_030a_cache_hit_lock_profile|threads={thread_count}|reads_per_thread={READS_PER_THREAD}|mutex_best_ns={mutex_best_ns}|rwlock_best_ns={rwlock_best_ns}"
+        );
+    }
 }
 
 #[derive(Debug)]

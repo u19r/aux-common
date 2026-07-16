@@ -1,10 +1,15 @@
 use std::{
+    collections::HashMap,
     fmt::Debug,
     hash::Hash,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
 use crate::{
@@ -21,6 +26,37 @@ pub struct FetchingLruTtlCache<K, V, E> {
     core: CacheCore<K, V>,
     refresh_ttl: Option<Duration>,
     fetch: FetchFn<K, V, E>,
+    in_flight: Arc<Mutex<HashMap<K, Arc<FetchFlight>>>>,
+}
+
+struct FetchFlight {
+    gate: AsyncMutex<()>,
+    missing: AtomicBool,
+}
+
+struct FetchLeader<K: Eq + Hash> {
+    key: K,
+    flight: Arc<FetchFlight>,
+    in_flight: Arc<Mutex<HashMap<K, Arc<FetchFlight>>>>,
+}
+
+impl<K> Drop for FetchLeader<K>
+where K: Eq + Hash
+{
+    fn drop(&mut self) {
+        let mut in_flight = lock_unpoisoned(&self.in_flight);
+        if in_flight
+            .get(&self.key)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
+        {
+            in_flight.remove(&self.key);
+        }
+    }
+}
+
+enum FetchRole<K: Eq + Hash> {
+    Leader(FetchLeader<K>),
+    Follower(Arc<FetchFlight>),
 }
 
 impl<K, V> Clone for LruTtlCache<K, V>
@@ -46,6 +82,7 @@ where
             core: self.core.clone(),
             refresh_ttl: self.refresh_ttl,
             fetch: Arc::clone(&self.fetch),
+            in_flight: Arc::clone(&self.in_flight),
         }
     }
 }
@@ -95,6 +132,7 @@ where
     pub fn stats(&self) -> CacheStats {
         self.core.stats()
     }
+
 }
 
 impl<K, V, E> FetchingLruTtlCache<K, V, E>
@@ -109,6 +147,7 @@ where
             core: CacheCore::new(config.base.capacity, config.base.ttl),
             refresh_ttl: config.refresh_ttl,
             fetch: config.fetch,
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -177,11 +216,54 @@ where
         self.core.stats()
     }
 
+    #[cfg(test)]
+    pub(crate) fn in_flight_count(&self) -> usize {
+        lock_unpoisoned(&self.in_flight).len()
+    }
+
     fn fetch_clone(&self) -> FetchFn<K, V, E> {
         Arc::clone(&self.fetch)
     }
 
     async fn fetch_and_store(&self, key: &K) -> Result<Option<V>, E> {
+        if self.core.is_disabled() {
+            return self.fetch_and_store_uncoordinated(key).await;
+        }
+
+        loop {
+            match self.fetch_role(key) {
+                FetchRole::Leader(leader) => {
+                    let flight = Arc::clone(&leader.flight);
+                    let gate = flight.gate.lock().await;
+                    if let Some(entry) = self.core.fresh_entry_untracked(key) {
+                        drop(leader);
+                        drop(gate);
+                        return Ok(Some(entry.value().clone()));
+                    }
+
+                    let result = self.fetch_and_store_uncoordinated(key).await;
+                    if matches!(result, Ok(None)) {
+                        flight.missing.store(true, Ordering::Release);
+                    }
+                    drop(leader);
+                    drop(gate);
+                    return result;
+                }
+                FetchRole::Follower(flight) => {
+                    let gate = flight.gate.lock().await;
+                    if flight.missing.load(Ordering::Acquire) {
+                        return Ok(None);
+                    }
+                    if let Some(entry) = self.core.fresh_entry_untracked(key) {
+                        return Ok(Some(entry.value().clone()));
+                    }
+                    drop(gate);
+                }
+            }
+        }
+    }
+
+    async fn fetch_and_store_uncoordinated(&self, key: &K) -> Result<Option<V>, E> {
         let fetcher = self.fetch_clone();
         let key_clone = key.clone();
         let result = fetcher(key_clone.clone()).await?;
@@ -195,6 +277,24 @@ where
             self.core.remove(&key_clone);
             Ok(None)
         }
+    }
+
+    fn fetch_role(&self, key: &K) -> FetchRole<K> {
+        let mut in_flight = lock_unpoisoned(&self.in_flight);
+        if let Some(flight) = in_flight.get(key) {
+            return FetchRole::Follower(Arc::clone(flight));
+        }
+
+        let flight = Arc::new(FetchFlight {
+            gate: AsyncMutex::new(()),
+            missing: AtomicBool::new(false),
+        });
+        in_flight.insert(key.clone(), Arc::clone(&flight));
+        FetchRole::Leader(FetchLeader {
+            key: key.clone(),
+            flight,
+            in_flight: Arc::clone(&self.in_flight),
+        })
     }
 
     fn maybe_spawn_refresh(&self, key: &K, entry: CacheEntry<V>) {
@@ -235,5 +335,12 @@ where
             }
             entry.finish_refresh();
         });
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }

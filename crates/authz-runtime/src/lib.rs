@@ -24,8 +24,7 @@ pub use evaluation_runtime::{
 };
 pub use local_evaluator::{
     ActionPolicyDecision, LocalAuthzEvaluator, LocalEvaluationInput, action_policy_decision_bits,
-    best_permission_for_action_with_bits, build_internal_context_at, inject_internal_context,
-    permissions_for_request_bits,
+    best_permission_for_action_with_bits, permissions_for_request_bits,
 };
 pub use role_assignment::EffectiveRoleAssignment;
 pub use scope::{ScopeKind, classify_scope, role_assignment_covers_resource};

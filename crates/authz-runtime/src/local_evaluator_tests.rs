@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::{collections::{HashMap, HashSet}, hint::black_box, time::Instant};
 
+use alloc_counter::AllocationGuard;
 use authz_types::{
     Action, ConfigurationModel, Context, EvaluationRequest, FineGrainedScopes, JwtContext,
     PermissionActionRef, PermissionId, Resource, ResourceSelection, RoleAssignment, RoleScope,
@@ -12,8 +13,117 @@ use crate::{
     ActionPolicyDecision, EffectiveRoleAssignment, EvaluationRuntime, LocalAuthzEvaluator,
     LocalEvaluationInput, ParentRef, ResourceAccessSnapshot, SubjectAccessSnapshot,
     action_policy_decision_bits, build_subject_parent_template, enrich_request_with_snapshots,
-    inject_internal_context, permissions_for_request_bits,
+    permissions_for_request_bits,
 };
+use crate::local_evaluator::inject_internal_context;
+
+fn prepare_legacy_internal_context(
+    runtime: &EvaluationRuntime,
+    input: &LocalEvaluationInput,
+    now: chrono::DateTime<Utc>,
+) -> authz_cedar::PreparedCedarEvaluation {
+    let assignments = input.subject_access.active_assignments_at(now);
+    let scoped = permissions_for_request_bits(
+        runtime,
+        &assignments,
+        &input.request,
+        &input.request.subject,
+    );
+    let internal = crate::local_evaluator::build_internal_context_at(
+        runtime,
+        &input.request,
+        &scoped.permissions,
+        input.request.token_context.as_ref(),
+        &assignments,
+        input.request.session_context.as_ref(),
+        now,
+    );
+    let mut enriched = enrich_request_with_snapshots(
+        &input.tenant_id,
+        input.request.clone(),
+        &input.subject_access,
+        &input.resource_access,
+    )
+    .expect("legacy enrichment");
+    inject_internal_context(&mut enriched.request, internal);
+    let subject_parents = enriched
+        .subject_parents
+        .iter()
+        .map(|parent| authz_cedar::EntityParentRef {
+            parent_type: parent.ref_type.clone(),
+            parent_id: parent.id.clone(),
+        })
+        .collect::<Vec<_>>();
+    let resource_parents = enriched
+        .resource_parents
+        .iter()
+        .map(|parent| authz_cedar::EntityParentRef {
+            parent_type: parent.ref_type.clone(),
+            parent_id: parent.id.clone(),
+        })
+        .collect::<Vec<_>>();
+    authz_cedar::prepare_evaluation_owned_with_parents(
+        enriched.request,
+        &subject_parents,
+        &resource_parents,
+    )
+    .expect("legacy preparation")
+}
+
+fn prepare_typed_internal_context(
+    runtime: &EvaluationRuntime,
+    input: &LocalEvaluationInput,
+    now: chrono::DateTime<Utc>,
+) -> authz_cedar::PreparedCedarEvaluation {
+    let assignments = input.subject_access.active_assignments_at(now);
+    let scoped = permissions_for_request_bits(
+        runtime,
+        &assignments,
+        &input.request,
+        &input.request.subject,
+    );
+    let internal = crate::local_evaluator::build_cedar_internal_context_at(
+        runtime,
+        &input.request,
+        &scoped.permissions,
+        input.request.token_context.as_ref(),
+        &assignments,
+        input.request.session_context.as_ref(),
+        now,
+    )
+    .expect("typed internal context");
+    let enriched = enrich_request_with_snapshots(
+        &input.tenant_id,
+        input.request.clone(),
+        &input.subject_access,
+        &input.resource_access,
+    )
+    .expect("typed enrichment");
+    let subject_parents = enriched
+        .subject_parents
+        .iter()
+        .map(|parent| authz_cedar::EntityParentRef {
+            parent_type: parent.ref_type.clone(),
+            parent_id: parent.id.clone(),
+        })
+        .collect::<Vec<_>>();
+    let resource_parents = enriched
+        .resource_parents
+        .iter()
+        .map(|parent| authz_cedar::EntityParentRef {
+            parent_type: parent.ref_type.clone(),
+            parent_id: parent.id.clone(),
+        })
+        .collect::<Vec<_>>();
+    authz_cedar::prepare_evaluation_owned_with_registry_and_internal_context(
+        runtime.cedar_uids(),
+        enriched.request,
+        &subject_parents,
+        &resource_parents,
+        internal,
+    )
+    .expect("typed preparation")
+}
 
 #[test]
 fn cedar_diagnostics_log_only_allowlisted_metadata() {
@@ -211,6 +321,48 @@ fn inject_internal_context_replaces_non_object_context_with_reserved_object() {
         request.context.map(|context| context.attributes),
         Some(json!({ "_authz": { "token_present": false } }))
     );
+}
+
+#[test]
+fn typed_internal_context_preserves_non_object_context_normalization() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
+    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("read"),
+        context: Some(Context::new(json!("not-an-object"))),
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let response = evaluator
+        .evaluate_at(
+            LocalEvaluationInput {
+                tenant_id: "tenant_1".to_string(),
+                subject_access: SubjectAccessSnapshot {
+                    subject: request.subject.clone(),
+                    assignments: vec![assignment("reader", Some("tenant"), None)],
+                    subject_parents: vec![
+                        parent("role", "reader"),
+                        parent("tenant", "tenant_1"),
+                    ],
+                    resource_scopes: HashMap::new(),
+                    fetched_at_ms: 1,
+                },
+                resource_access: ResourceAccessSnapshot {
+                    resource_type: "document".to_string(),
+                    resource_id: "doc_1".to_string(),
+                    resource_parents: vec![parent("tenant", "tenant_1")],
+                    fetched_at_ms: 1,
+                },
+                request,
+            },
+            now,
+        )
+        .expect("non-object context is normalized");
+
+    assert!(response.decision);
 }
 
 #[test]
@@ -537,6 +689,284 @@ fn token_variants_given_reused_subject_snapshot_then_each_decision_uses_current_
         expires_at: Some(2_000),
     };
     assert!(!evaluate(selected_other_resource).decision);
+}
+
+#[test]
+fn borrowed_and_owned_local_inputs_have_identical_decisions() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
+    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let subject_access = SubjectAccessSnapshot {
+        subject: request.subject.clone(),
+        assignments: vec![assignment("reader", Some("tenant"), None)],
+        subject_parents: vec![parent("role", "reader"), parent("tenant", "tenant_1")],
+        resource_scopes: HashMap::new(),
+        fetched_at_ms: 1,
+    };
+    let resource_access = ResourceAccessSnapshot {
+        resource_type: "document".to_string(),
+        resource_id: "doc_1".to_string(),
+        resource_parents: vec![parent("tenant", "tenant_1")],
+        fetched_at_ms: 1,
+    };
+
+    let owned = evaluator
+        .evaluate_at(
+            LocalEvaluationInput {
+                tenant_id: "tenant_1".to_string(),
+                request: request.clone(),
+                subject_access: subject_access.clone(),
+                resource_access: resource_access.clone(),
+            },
+            now,
+        )
+        .expect("owned evaluation");
+    let borrowed = evaluator
+        .evaluate_at(
+            LocalEvaluationInput {
+                tenant_id: "tenant_1",
+                request,
+                subject_access: &subject_access,
+                resource_access: &resource_access,
+            },
+            now,
+        )
+        .expect("borrowed evaluation");
+
+    assert_eq!(
+        serde_json::to_value(borrowed).expect("borrowed response JSON"),
+        serde_json::to_value(owned).expect("owned response JSON"),
+    );
+}
+
+#[test]
+#[ignore = "P2-036 borrowed batch-input allocation and CPU receipt"]
+fn borrowed_local_input_avoids_snapshot_clones_profile() {
+    const ITERATIONS: usize = 10_000;
+
+    let tenant_id = "tenant_1";
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let subject_access = SubjectAccessSnapshot {
+        subject: request.subject.clone(),
+        assignments: (0..64)
+            .map(|index| assignment(&format!("reader_{index}"), Some("tenant"), None))
+            .collect(),
+        subject_parents: (0..64)
+            .map(|index| parent("role", &format!("reader_{index}")))
+            .collect(),
+        resource_scopes: HashMap::from([(
+            "document".to_string(),
+            (0..64).map(|index| format!("doc_{index}")).collect(),
+        )]),
+        fetched_at_ms: 1,
+    };
+    let resource_access = ResourceAccessSnapshot {
+        resource_type: "document".to_string(),
+        resource_id: "doc_1".to_string(),
+        resource_parents: (0..16)
+            .map(|index| parent("group", &format!("group_{index}")))
+            .collect(),
+        fetched_at_ms: 1,
+    };
+
+    let owned_guard = AllocationGuard::start(
+        module_path!(),
+        "borrowed_local_input_avoids_snapshot_clones_profile",
+        file!(),
+        line!(),
+        Some("owned_local_input"),
+    );
+    for _ in 0..ITERATIONS {
+        black_box(LocalEvaluationInput {
+            tenant_id: tenant_id.to_string(),
+            request: request.clone(),
+            subject_access: subject_access.clone(),
+            resource_access: resource_access.clone(),
+        });
+    }
+    let owned_allocations = owned_guard.finish();
+
+    let borrowed_guard = AllocationGuard::start(
+        module_path!(),
+        "borrowed_local_input_avoids_snapshot_clones_profile",
+        file!(),
+        line!(),
+        Some("borrowed_local_input"),
+    );
+    for _ in 0..ITERATIONS {
+        black_box(LocalEvaluationInput {
+            tenant_id,
+            request: request.clone(),
+            subject_access: &subject_access,
+            resource_access: &resource_access,
+        });
+    }
+    let borrowed_allocations = borrowed_guard.finish();
+
+    let mut owned_ns = 0_u128;
+    let mut borrowed_ns = 0_u128;
+    for iteration in 0..ITERATIONS {
+        if iteration % 2 == 0 {
+            let started = Instant::now();
+            black_box(LocalEvaluationInput {
+                tenant_id,
+                request: request.clone(),
+                subject_access: &subject_access,
+                resource_access: &resource_access,
+            });
+            borrowed_ns += started.elapsed().as_nanos();
+            let started = Instant::now();
+            black_box(LocalEvaluationInput {
+                tenant_id: tenant_id.to_string(),
+                request: request.clone(),
+                subject_access: subject_access.clone(),
+                resource_access: resource_access.clone(),
+            });
+            owned_ns += started.elapsed().as_nanos();
+        } else {
+            let started = Instant::now();
+            black_box(LocalEvaluationInput {
+                tenant_id: tenant_id.to_string(),
+                request: request.clone(),
+                subject_access: subject_access.clone(),
+                resource_access: resource_access.clone(),
+            });
+            owned_ns += started.elapsed().as_nanos();
+            let started = Instant::now();
+            black_box(LocalEvaluationInput {
+                tenant_id,
+                request: request.clone(),
+                subject_access: &subject_access,
+                resource_access: &resource_access,
+            });
+            borrowed_ns += started.elapsed().as_nanos();
+        }
+    }
+
+    assert!(
+        borrowed_allocations.allocation_count < owned_allocations.allocation_count,
+        "borrowed allocations={} owned allocations={}",
+        borrowed_allocations.allocation_count,
+        owned_allocations.allocation_count,
+    );
+    eprintln!(
+        "p2_036_borrowed_input_profile|iterations={ITERATIONS}|owned_allocations={}|borrowed_allocations={}|owned_bytes={}|borrowed_bytes={}|owned_ns={owned_ns}|borrowed_ns={borrowed_ns}",
+        owned_allocations.allocation_count,
+        borrowed_allocations.allocation_count,
+        owned_allocations.allocated_bytes,
+        borrowed_allocations.allocated_bytes,
+    );
+}
+
+#[test]
+#[ignore = "P2-017 typed internal-context allocation and CPU receipt"]
+fn typed_internal_context_avoids_json_round_trip_profile() {
+    const ITERATIONS: usize = 2_000;
+
+    let runtime = runtime_with_read_role();
+    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1").with_properties(json!({
+            "department": "engineering"
+        })),
+        resource: Resource::new("document", "doc_1").with_properties(json!({
+            "org_id": "org_1",
+            "classification": "internal"
+        })),
+        action: Action::new("read"),
+        context: Some(Context::new(json!({
+            "request_region": "eu-west-1",
+            "risk_score": 3
+        }))),
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let input = LocalEvaluationInput {
+        tenant_id: "tenant_1".to_string(),
+        subject_access: SubjectAccessSnapshot {
+            subject: request.subject.clone(),
+            assignments: vec![assignment(
+                "reader",
+                Some("resource:document"),
+                Some("doc_1"),
+            )],
+            subject_parents: vec![parent("role", "reader"), parent("tenant", "tenant_1")],
+            resource_scopes: HashMap::new(),
+            fetched_at_ms: 1,
+        },
+        resource_access: ResourceAccessSnapshot {
+            resource_type: "document".to_string(),
+            resource_id: "doc_1".to_string(),
+            resource_parents: vec![parent("tenant", "tenant_1")],
+            fetched_at_ms: 1,
+        },
+        request,
+    };
+
+    let legacy_guard = AllocationGuard::start(
+        module_path!(),
+        "typed_internal_context_avoids_json_round_trip_profile",
+        file!(),
+        line!(),
+        Some("legacy_json_internal_context"),
+    );
+    black_box(prepare_legacy_internal_context(&runtime, &input, now));
+    let legacy_allocations = legacy_guard.finish();
+
+    let typed_guard = AllocationGuard::start(
+        module_path!(),
+        "typed_internal_context_avoids_json_round_trip_profile",
+        file!(),
+        line!(),
+        Some("typed_cedar_internal_context"),
+    );
+    black_box(prepare_typed_internal_context(&runtime, &input, now));
+    let typed_allocations = typed_guard.finish();
+
+    let mut legacy_ns = 0_u128;
+    let mut typed_ns = 0_u128;
+    for iteration in 0..ITERATIONS {
+        if iteration % 2 == 0 {
+            let started = Instant::now();
+            black_box(prepare_typed_internal_context(&runtime, &input, now));
+            typed_ns += started.elapsed().as_nanos();
+            let started = Instant::now();
+            black_box(prepare_legacy_internal_context(&runtime, &input, now));
+            legacy_ns += started.elapsed().as_nanos();
+        } else {
+            let started = Instant::now();
+            black_box(prepare_legacy_internal_context(&runtime, &input, now));
+            legacy_ns += started.elapsed().as_nanos();
+            let started = Instant::now();
+            black_box(prepare_typed_internal_context(&runtime, &input, now));
+            typed_ns += started.elapsed().as_nanos();
+        }
+    }
+
+    eprintln!(
+        "p2_017_internal_context_profile|iterations={ITERATIONS}|legacy_allocations={}|typed_allocations={}|legacy_bytes={}|typed_bytes={}|legacy_ns={legacy_ns}|typed_ns={typed_ns}",
+        legacy_allocations.allocation_count,
+        typed_allocations.allocation_count,
+        legacy_allocations.allocated_bytes,
+        typed_allocations.allocated_bytes,
+    );
 }
 
 fn build_runtime(config: ConfigurationModel) -> EvaluationRuntime {

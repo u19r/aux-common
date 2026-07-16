@@ -7,7 +7,11 @@ use authz_types::{
 };
 use serde_json::Value;
 
-use crate::{compile_policy_bundle, evaluate_with_policy_sets, parse_policy_sets};
+use crate::{
+    CedarInternalContext, compile_policy_bundle, evaluate_prepared_with_policy_sets,
+    evaluate_owned_with_policy_sets, evaluate_with_policy_sets, parse_policy_sets,
+    prepare_evaluation_owned_with_parents_and_internal_context,
+};
 
 const ITERATIONS: usize = 512;
 const MAX_ALLOCATIONS_PER_RUN: u64 = 1_050_000;
@@ -33,6 +37,27 @@ fn default_internal_context() -> Value {
         "session_mfa_age_present": false,
         "session_mfa_age_seconds": 0
     })
+}
+
+fn default_typed_internal_context() -> CedarInternalContext {
+    CedarInternalContext {
+        token_present: false,
+        token_valid: true,
+        token_resource_filter_enabled: false,
+        token_resource_filter: Vec::new(),
+        resource_scopes: Vec::new(),
+        token_org_id_present: false,
+        token_org_id: String::new(),
+        token_owner_org_ids: Vec::new(),
+        allowed_actions: Vec::new(),
+        session_present: false,
+        session_acr: 0,
+        session_amr: Vec::new(),
+        session_auth_age_present: false,
+        session_auth_age_seconds: 0,
+        session_mfa_age_present: false,
+        session_mfa_age_seconds: 0,
+    }
 }
 
 fn allocation_fixture() -> (crate::ParsedPolicySets, EvaluationRequest) {
@@ -123,6 +148,55 @@ fn measure_direct_path(
     guard.finish()
 }
 
+fn measure_typed_internal_path(
+    policy_sets: &crate::ParsedPolicySets,
+    request: &EvaluationRequest,
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "authz_cedar_evaluate_with_policy_sets_direct_path",
+        file!(),
+        line!(),
+        Some("typed_internal"),
+    );
+
+    for _ in 0..ITERATIONS {
+        let prepared = prepare_evaluation_owned_with_parents_and_internal_context(
+            request.clone(),
+            &[],
+            &[],
+            default_typed_internal_context(),
+        )
+        .expect("typed preparation should succeed");
+        let response = evaluate_prepared_with_policy_sets(policy_sets, prepared)
+            .expect("typed evaluation should succeed");
+        black_box(response.decision);
+    }
+
+    guard.finish()
+}
+
+fn measure_owned_json_internal_path(
+    policy_sets: &crate::ParsedPolicySets,
+    request: &EvaluationRequest,
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "authz_cedar_evaluate_with_policy_sets_direct_path",
+        file!(),
+        line!(),
+        Some("owned_json_internal"),
+    );
+
+    for _ in 0..ITERATIONS {
+        let response = evaluate_owned_with_policy_sets(policy_sets, request.clone())
+            .expect("owned JSON evaluation should succeed");
+        black_box(response.decision);
+    }
+
+    guard.finish()
+}
+
 #[test]
 fn evaluate_with_policy_sets_direct_path_budget_tests() {
     if std::env::var_os(ISOLATED_ALLOC_GUARD_ENV).is_none() {
@@ -147,8 +221,12 @@ fn evaluate_with_policy_sets_direct_path_budget_tests() {
     // ITERATIONS=512): direct_path: 965,457 allocs, 297,774,768 bytes
     let (policy_sets, request) = allocation_fixture();
     let report = measure_direct_path(&policy_sets, &request);
+    let owned_json_report = measure_owned_json_internal_path(&policy_sets, &request);
+    let typed_report = measure_typed_internal_path(&policy_sets, &request);
 
     alloc_counter::emit_report(&report);
+    alloc_counter::emit_report(&owned_json_report);
+    alloc_counter::emit_report(&typed_report);
 
     assert!(
         report.allocation_count <= MAX_ALLOCATIONS_PER_RUN,
@@ -161,5 +239,11 @@ fn evaluate_with_policy_sets_direct_path_budget_tests() {
         "byte budget exceeded: actual={} budget={}",
         report.allocated_bytes,
         MAX_ALLOCATED_BYTES_PER_RUN
+    );
+    assert!(
+        typed_report.allocated_bytes < owned_json_report.allocated_bytes,
+        "typed internal context must allocate fewer bytes: typed={} json={}",
+        typed_report.allocated_bytes,
+        owned_json_report.allocated_bytes
     );
 }

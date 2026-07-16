@@ -1,16 +1,22 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{borrow::Borrow, collections::BTreeSet, sync::Arc};
 
 use authz_cedar::{
-    CedarEvaluationErrorCategory, EntityParentRef as CedarEntityParentRef,
+    CedarEntityRef, CedarEvaluationErrorCategory, CedarInternalContext,
+    CedarResourceScope, EntityParentRef as CedarEntityParentRef,
     evaluate_prepared_with_policy_sets_diagnostics as cedar_evaluate_prepared_with_policy_sets_diagnostics,
-    prepare_evaluation_owned_with_parents as cedar_prepare_evaluation_owned_with_parents,
+    prepare_evaluation_owned_with_registry_and_internal_context as cedar_prepare_evaluation_owned_with_registry_and_internal_context,
 };
 use authz_types::{
-    CONTEXT_INTERNAL_KEY, DecisionContext, EvaluationRequest, EvaluationResponse,
-    ResourceSelection, RoleScope, SessionContext, TokenContext, TokenScopeType,
+    DecisionContext, EvaluationRequest, EvaluationResponse, ResourceSelection, RoleScope,
+    SessionContext, TokenContext, TokenScopeType,
 };
 use chrono::{DateTime, Utc};
-use serde_json::{Map, Value};
+
+#[cfg(test)]
+use authz_types::CONTEXT_INTERNAL_KEY;
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::Map;
 
 use crate::{
     AuthzRuntimeError, AuthzRuntimeResult, EffectiveRoleAssignment, EvaluationRuntime, ParentRef,
@@ -24,7 +30,8 @@ pub struct LocalAuthzEvaluator {
 }
 
 impl LocalAuthzEvaluator {
-    pub fn new(runtime: EvaluationRuntime) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(runtime: EvaluationRuntime) -> Self {
         Self {
             runtime: Arc::new(runtime),
         }
@@ -38,18 +45,34 @@ impl LocalAuthzEvaluator {
         &self.runtime
     }
 
-    pub fn evaluate(&self, input: LocalEvaluationInput) -> AuthzRuntimeResult<EvaluationResponse> {
+    pub fn evaluate<Tenant, SubjectAccess, ResourceAccess>(
+        &self,
+        input: LocalEvaluationInput<Tenant, SubjectAccess, ResourceAccess>,
+    ) -> AuthzRuntimeResult<EvaluationResponse>
+    where
+        Tenant: Borrow<str>,
+        SubjectAccess: Borrow<SubjectAccessSnapshot>,
+        ResourceAccess: Borrow<crate::ResourceAccessSnapshot>,
+    {
         self.evaluate_at(input, Utc::now())
     }
 
-    pub fn evaluate_at(
+    pub fn evaluate_at<Tenant, SubjectAccess, ResourceAccess>(
         &self,
-        input: LocalEvaluationInput,
+        input: LocalEvaluationInput<Tenant, SubjectAccess, ResourceAccess>,
         now: DateTime<Utc>,
-    ) -> AuthzRuntimeResult<EvaluationResponse> {
+    ) -> AuthzRuntimeResult<EvaluationResponse>
+    where
+        Tenant: Borrow<str>,
+        SubjectAccess: Borrow<SubjectAccessSnapshot>,
+        ResourceAccess: Borrow<crate::ResourceAccessSnapshot>,
+    {
+        let tenant_id = input.tenant_id.borrow();
+        let subject_access = input.subject_access.borrow();
+        let resource_access = input.resource_access.borrow();
         let token_ctx = input.request.token_context.as_ref();
         let session_ctx = input.request.session_context.as_ref();
-        let assignments = input.subject_access.active_assignments_at(now);
+        let assignments = subject_access.active_assignments_at(now);
         let scoped = permissions_for_request_bits(
             &self.runtime,
             &assignments,
@@ -157,7 +180,7 @@ impl LocalAuthzEvaluator {
             return Ok(step_up_response);
         }
 
-        let internal_ctx = build_internal_context_at(
+        let internal_ctx = build_cedar_internal_context_at(
             &self.runtime,
             &input.request,
             &effective_permissions,
@@ -165,23 +188,23 @@ impl LocalAuthzEvaluator {
             &assignments,
             session_ctx,
             now,
-        );
-        let mut enriched = enrich_request_with_snapshots(
-            &input.tenant_id,
-            input.request,
-            &input.subject_access,
-            &input.resource_access,
         )?;
-        inject_internal_context(&mut enriched.request, internal_ctx);
-
+        let enriched = enrich_request_with_snapshots(
+            tenant_id,
+            input.request,
+            subject_access,
+            resource_access,
+        )?;
         let resource_type = enriched.request.resource.resource_type.clone();
         let action_name = enriched.request.action.name.clone();
         let subject_parents = to_cedar_parent_refs(&enriched.subject_parents);
         let resource_parents = to_cedar_parent_refs(&enriched.resource_parents);
-        let prepared = cedar_prepare_evaluation_owned_with_parents(
+        let prepared = cedar_prepare_evaluation_owned_with_registry_and_internal_context(
+            self.runtime.cedar_uids(),
             enriched.request,
             &subject_parents,
             &resource_parents,
+            internal_ctx,
         )
         .map_err(AuthzRuntimeError::cedar)?;
         let diagnostic_result = cedar_evaluate_prepared_with_policy_sets_diagnostics(
@@ -247,11 +270,15 @@ pub(crate) fn record_cedar_diagnostics(
 }
 
 #[derive(Debug, Clone)]
-pub struct LocalEvaluationInput {
-    pub tenant_id: String,
+pub struct LocalEvaluationInput<
+    Tenant = String,
+    SubjectAccess = SubjectAccessSnapshot,
+    ResourceAccess = crate::ResourceAccessSnapshot,
+> {
+    pub tenant_id: Tenant,
     pub request: EvaluationRequest,
-    pub subject_access: SubjectAccessSnapshot,
-    pub resource_access: crate::ResourceAccessSnapshot,
+    pub subject_access: SubjectAccess,
+    pub resource_access: ResourceAccess,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,7 +415,8 @@ pub fn best_permission_for_action_with_bits(
     best_idx.and_then(|idx| runtime.permission_id(idx).map(ToString::to_string))
 }
 
-pub fn build_internal_context_at(
+#[cfg(test)]
+pub(crate) fn build_internal_context_at(
     runtime: &EvaluationRuntime,
     request: &EvaluationRequest,
     effective_permissions: &PermissionBits,
@@ -397,12 +425,211 @@ pub fn build_internal_context_at(
     session_ctx: Option<&SessionContext>,
     now: DateTime<Utc>,
 ) -> Value {
+    let values = internal_context_values_at(
+        runtime,
+        request,
+        effective_permissions,
+        token_ctx,
+        assignments,
+        session_ctx,
+        now,
+    );
+    let mut authz_map = Map::new();
+    authz_map.insert("token_present".into(), Value::Bool(values.token_present));
+    authz_map.insert("token_valid".into(), Value::Bool(values.token_valid));
+    authz_map.insert(
+        "token_resource_filter_enabled".into(),
+        Value::Bool(values.token_resource_filter_enabled),
+    );
+    authz_map.insert(
+        "token_resource_filter".into(),
+        Value::Array(
+            values
+                .token_resource_filter
+                .into_iter()
+                .map(internal_entity_ref_json)
+                .collect(),
+        ),
+    );
+    authz_map.insert(
+        "resource_scopes".into(),
+        Value::Array(
+            values
+                .resource_scopes
+                .into_iter()
+                .map(|scope| {
+                    serde_json::json!({
+                        "role": internal_entity_ref_json(scope.role),
+                        "resource": internal_entity_ref_json(scope.resource),
+                    })
+                })
+                .collect(),
+        ),
+    );
+    authz_map.insert(
+        "token_org_id_present".into(),
+        Value::Bool(values.token_org_id.is_some()),
+    );
+    authz_map.insert(
+        "token_org_id".into(),
+        Value::String(values.token_org_id.unwrap_or_default()),
+    );
+    authz_map.insert(
+        "token_owner_org_ids".into(),
+        Value::Array(
+            values
+                .token_owner_org_ids
+                .into_iter()
+                .map(Value::String)
+                .collect(),
+        ),
+    );
+    authz_map.insert(
+        "allowed_actions".into(),
+        Value::Array(
+            values
+                .allowed_actions
+                .into_iter()
+                .map(Value::String)
+                .collect(),
+        ),
+    );
+    authz_map.insert(
+        "session_present".into(),
+        Value::Bool(values.session.present),
+    );
+    authz_map.insert(
+        "session_acr".into(),
+        Value::Number(serde_json::Number::from(values.session.acr)),
+    );
+    authz_map.insert(
+        "session_amr".into(),
+        Value::Array(
+            values
+                .session
+                .amr
+                .into_iter()
+                .map(Value::String)
+                .collect(),
+        ),
+    );
+    authz_map.insert(
+        "session_auth_age_present".into(),
+        Value::Bool(values.session.auth_age_present),
+    );
+    authz_map.insert(
+        "session_auth_age_seconds".into(),
+        Value::Number(serde_json::Number::from(
+            values.session.auth_age_seconds,
+        )),
+    );
+    authz_map.insert(
+        "session_mfa_age_present".into(),
+        Value::Bool(values.session.mfa_age_present),
+    );
+    authz_map.insert(
+        "session_mfa_age_seconds".into(),
+        Value::Number(serde_json::Number::from(values.session.mfa_age_seconds)),
+    );
+
+    Value::Object(authz_map)
+}
+
+pub(crate) fn build_cedar_internal_context_at(
+    runtime: &EvaluationRuntime,
+    request: &EvaluationRequest,
+    effective_permissions: &PermissionBits,
+    token_ctx: Option<&TokenContext>,
+    assignments: &[EffectiveRoleAssignment],
+    session_ctx: Option<&SessionContext>,
+    now: DateTime<Utc>,
+) -> AuthzRuntimeResult<CedarInternalContext> {
+    let values = internal_context_values_at(
+        runtime,
+        request,
+        effective_permissions,
+        token_ctx,
+        assignments,
+        session_ctx,
+        now,
+    );
+    let token_resource_filter = values
+        .token_resource_filter
+        .into_iter()
+        .map(|entity| {
+            CedarEntityRef::new(&entity.entity_type, &entity.id)
+                .map_err(AuthzRuntimeError::cedar)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let resource_scopes = values
+        .resource_scopes
+        .into_iter()
+        .map(|scope| {
+            Ok(CedarResourceScope {
+                role: CedarEntityRef::new(&scope.role.entity_type, &scope.role.id)
+                    .map_err(AuthzRuntimeError::cedar)?,
+                resource: CedarEntityRef::new(&scope.resource.entity_type, &scope.resource.id)
+                    .map_err(AuthzRuntimeError::cedar)?,
+            })
+        })
+        .collect::<Result<Vec<_>, AuthzRuntimeError>>()?;
+
+    Ok(CedarInternalContext {
+        token_present: values.token_present,
+        token_valid: values.token_valid,
+        token_resource_filter_enabled: values.token_resource_filter_enabled,
+        token_resource_filter,
+        resource_scopes,
+        token_org_id_present: values.token_org_id.is_some(),
+        token_org_id: values.token_org_id.unwrap_or_default(),
+        token_owner_org_ids: values.token_owner_org_ids,
+        allowed_actions: values.allowed_actions,
+        session_present: values.session.present,
+        session_acr: values.session.acr,
+        session_amr: values.session.amr,
+        session_auth_age_present: values.session.auth_age_present,
+        session_auth_age_seconds: values.session.auth_age_seconds,
+        session_mfa_age_present: values.session.mfa_age_present,
+        session_mfa_age_seconds: values.session.mfa_age_seconds,
+    })
+}
+
+struct InternalContextValues {
+    token_present: bool,
+    token_valid: bool,
+    token_resource_filter_enabled: bool,
+    token_resource_filter: Vec<InternalEntityRef>,
+    resource_scopes: Vec<InternalResourceScope>,
+    token_org_id: Option<String>,
+    token_owner_org_ids: Vec<String>,
+    allowed_actions: Vec<String>,
+    session: SessionContextValues,
+}
+
+struct InternalEntityRef {
+    entity_type: String,
+    id: String,
+}
+
+struct InternalResourceScope {
+    role: InternalEntityRef,
+    resource: InternalEntityRef,
+}
+
+fn internal_context_values_at(
+    runtime: &EvaluationRuntime,
+    request: &EvaluationRequest,
+    effective_permissions: &PermissionBits,
+    token_ctx: Option<&TokenContext>,
+    assignments: &[EffectiveRoleAssignment],
+    session_ctx: Option<&SessionContext>,
+    now: DateTime<Utc>,
+) -> InternalContextValues {
     let token_present = token_ctx.is_some();
     let token_valid = token_ctx
         .map(|token| token_is_valid_at(token, now))
         .unwrap_or(true);
     let token_org_id = token_ctx.and_then(|ctx| ctx.scopes.org_id.clone());
-    let token_org_id_present = token_org_id.is_some();
     let token_owner_org_ids = token_ctx
         .map(|ctx| token_owner_org_ids_sorted(assignments, &ctx.owner_id))
         .unwrap_or_default();
@@ -415,70 +642,34 @@ pub fn build_internal_context_at(
     } else {
         Vec::new()
     };
-
     let (token_resource_filter_enabled, token_resource_filter) =
-        token_resource_filter(request, token_ctx);
-    let resource_scopes = resource_scopes(assignments, request);
-    let session = session_context_values(session_ctx, now);
+        internal_token_resource_filter(request, token_ctx);
 
-    let mut authz_map = Map::new();
-    authz_map.insert("token_present".into(), Value::Bool(token_present));
-    authz_map.insert("token_valid".into(), Value::Bool(token_valid));
-    authz_map.insert(
-        "token_resource_filter_enabled".into(),
-        Value::Bool(token_resource_filter_enabled),
-    );
-    authz_map.insert(
-        "token_resource_filter".into(),
-        Value::Array(token_resource_filter),
-    );
-    authz_map.insert("resource_scopes".into(), Value::Array(resource_scopes));
-    authz_map.insert(
-        "token_org_id_present".into(),
-        Value::Bool(token_org_id_present),
-    );
-    authz_map.insert(
-        "token_org_id".into(),
-        Value::String(token_org_id.unwrap_or_default()),
-    );
-    authz_map.insert(
-        "token_owner_org_ids".into(),
-        Value::Array(token_owner_org_ids.into_iter().map(Value::String).collect()),
-    );
-    authz_map.insert(
-        "allowed_actions".into(),
-        Value::Array(allowed_actions.into_iter().map(Value::String).collect()),
-    );
-    authz_map.insert("session_present".into(), Value::Bool(session.present));
-    authz_map.insert(
-        "session_acr".into(),
-        Value::Number(serde_json::Number::from(session.acr)),
-    );
-    authz_map.insert(
-        "session_amr".into(),
-        Value::Array(session.amr.into_iter().map(Value::String).collect()),
-    );
-    authz_map.insert(
-        "session_auth_age_present".into(),
-        Value::Bool(session.auth_age_present),
-    );
-    authz_map.insert(
-        "session_auth_age_seconds".into(),
-        Value::Number(serde_json::Number::from(session.auth_age_seconds)),
-    );
-    authz_map.insert(
-        "session_mfa_age_present".into(),
-        Value::Bool(session.mfa_age_present),
-    );
-    authz_map.insert(
-        "session_mfa_age_seconds".into(),
-        Value::Number(serde_json::Number::from(session.mfa_age_seconds)),
-    );
-
-    Value::Object(authz_map)
+    InternalContextValues {
+        token_present,
+        token_valid,
+        token_resource_filter_enabled,
+        token_resource_filter,
+        resource_scopes: internal_resource_scopes(assignments, request),
+        token_org_id,
+        token_owner_org_ids,
+        allowed_actions,
+        session: session_context_values(session_ctx, now),
+    }
 }
 
-pub fn inject_internal_context(request: &mut EvaluationRequest, internal: Value) {
+#[cfg(test)]
+fn internal_entity_ref_json(entity: InternalEntityRef) -> Value {
+    serde_json::json!({
+        "__entity": {
+            "type": entity.entity_type,
+            "id": entity.id,
+        }
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn inject_internal_context(request: &mut EvaluationRequest, internal: Value) {
     let mut attributes = request
         .context
         .take()
@@ -715,10 +906,10 @@ fn allowed_actions_for_resource_bits(
     allowed
 }
 
-fn token_resource_filter(
+fn internal_token_resource_filter(
     request: &EvaluationRequest,
     token_ctx: Option<&TokenContext>,
-) -> (bool, Vec<Value>) {
+) -> (bool, Vec<InternalEntityRef>) {
     let Some(token_ctx) = token_ctx else {
         return (false, Vec::new());
     };
@@ -736,15 +927,18 @@ fn token_resource_filter(
     let filter = fine_grained
         .selected_resources
         .iter()
-        .map(|id| serde_json::json!({ "__entity": { "type": entity_type, "id": id } }))
+        .map(|id| InternalEntityRef {
+            entity_type: entity_type.clone(),
+            id: id.clone(),
+        })
         .collect();
     (true, filter)
 }
 
-fn resource_scopes(
+fn internal_resource_scopes(
     assignments: &[EffectiveRoleAssignment],
     request: &EvaluationRequest,
-) -> Vec<Value> {
+) -> Vec<InternalResourceScope> {
     let mut resource_scopes_set: BTreeSet<(String, String, String)> = BTreeSet::new();
     for assignment in assignments {
         let Some(scope_type) = &assignment.scope_type else {
@@ -789,11 +983,18 @@ fn resource_scopes(
     resource_scopes_set
         .into_iter()
         .map(|(role_id, resource_type, resource_id)| {
-            let entity_type = format!("Authz::{}", cedar_resource_entity_type(&resource_type));
-            serde_json::json!({
-                "role": { "__entity": { "type": "Authz::Role", "id": role_id } },
-                "resource": { "__entity": { "type": entity_type, "id": resource_id } }
-            })
+            let resource_entity_type =
+                format!("Authz::{}", cedar_resource_entity_type(&resource_type));
+            InternalResourceScope {
+                role: InternalEntityRef {
+                    entity_type: "Authz::Role".to_string(),
+                    id: role_id,
+                },
+                resource: InternalEntityRef {
+                    entity_type: resource_entity_type,
+                    id: resource_id,
+                },
+            }
         })
         .collect()
 }
