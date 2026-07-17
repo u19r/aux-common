@@ -9,6 +9,7 @@ pub mod config;
 pub mod constants;
 mod core;
 pub mod fetch;
+mod singleflight;
 mod template;
 
 pub use core::CacheStats;
@@ -17,6 +18,7 @@ pub use cache::{FetchingLruTtlCache, LruTtlCache};
 pub use common_ttls::{CommonCacheTtl, CommonCacheTtlOverrides};
 pub use config::{CacheConfig, FetchingCacheConfig};
 pub use fetch::{FetchFn, FetchFuture, arc_fetch_fn};
+pub use singleflight::{KeyedSingleflight, KeyedSingleflightGuard};
 pub use template::CacheTemplate;
 
 #[cfg(test)]
