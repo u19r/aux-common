@@ -7,8 +7,8 @@ use authz_types::{
 use serde_json::{Map, Value};
 
 use crate::{
-    CedarUidRegistry, EntityParentRef, compile_policy_bundle, evaluate as evaluate_untrusted, evaluate_batch,
-    evaluate_batch_with_policy_sets, evaluate_owned_with_policy_sets,
+    CedarUidRegistry, EntityParentRef, compile_policy_bundle, evaluate as evaluate_untrusted,
+    evaluate_batch, evaluate_batch_with_policy_sets, evaluate_owned_with_policy_sets,
     evaluate_owned_with_policy_sets_with_parents, evaluate_with_policy_sets, parse_policy_sets,
     prepare_request_uids,
 };
@@ -2100,7 +2100,7 @@ fn diagnostics_retain_determining_policy_and_evaluation_error_categories() {
     };
     let prepared = crate::prepare_evaluation_owned(request).expect("prepared request");
     let result =
-        crate::evaluator::evaluate_prepared_with_policy_set_diagnostics(&policies, prepared);
+        crate::evaluator::evaluate_prepared_with_policy_set_diagnostics(&policies, &prepared);
 
     assert!(result.response.decision);
     assert_eq!(result.determining_policy_ids.len(), 1);
@@ -2109,4 +2109,70 @@ fn diagnostics_retain_determining_policy_and_evaluation_error_categories() {
         result.evaluation_errors,
         [crate::CedarEvaluationErrorCategory::AttributeMissing]
     );
+}
+
+#[test]
+fn error_diagnostics_skip_policy_ids_on_healthy_allow_and_deny() {
+    use std::str::FromStr;
+
+    use cedar_policy::PolicySet;
+
+    let request = authz_types::EvaluationRequest {
+        subject: Subject::user("u1"),
+        resource: Resource::new("document", "doc1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    for (policy, expected_decision) in [
+        (r#"@id("allow") permit(principal, action, resource);"#, true),
+        (r#"@id("deny") forbid(principal, action, resource);"#, false),
+    ] {
+        let policies = PolicySet::from_str(policy).expect("healthy policy");
+        let prepared = crate::prepare_evaluation_owned(request.clone()).expect("prepared request");
+        let result = crate::evaluator::evaluate_prepared_with_policy_set_error_diagnostics(
+            &policies, &prepared,
+        );
+        assert_eq!(result.response.decision, expected_decision);
+        assert_eq!(result.determining_policy_count, 0);
+        assert!(result.evaluation_errors.is_empty());
+    }
+}
+
+#[test]
+fn error_diagnostics_preserve_missing_entity_and_attribute_categories() {
+    use std::str::FromStr;
+
+    use cedar_policy::PolicySet;
+
+    let request = authz_types::EvaluationRequest {
+        subject: Subject::user("u1"),
+        resource: Resource::new("document", "doc1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    for (policy, expected_error) in [
+        (
+            r#"permit(principal, action, resource) when { Team::"missing".active };"#,
+            crate::CedarEvaluationErrorCategory::EntityMissing,
+        ),
+        (
+            r#"permit(principal, action, resource) when { resource.missing_attribute == "value" };"#,
+            crate::CedarEvaluationErrorCategory::AttributeMissing,
+        ),
+    ] {
+        let policies = PolicySet::from_str(policy).expect("error policy");
+        let prepared = crate::prepare_evaluation_owned(request.clone()).expect("prepared request");
+        let result = crate::evaluator::evaluate_prepared_with_policy_set_error_diagnostics(
+            &policies, &prepared,
+        );
+        assert!(!result.response.decision);
+        assert_eq!(result.determining_policy_count, 0);
+        assert_eq!(result.evaluation_errors, [expected_error]);
+    }
 }

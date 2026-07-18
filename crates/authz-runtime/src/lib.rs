@@ -23,8 +23,9 @@ pub use evaluation_runtime::{
     ScopedPermissionBits,
 };
 pub use local_evaluator::{
-    ActionPolicyDecision, LocalAuthzEvaluator, LocalEvaluationInput, action_policy_decision_bits,
-    best_permission_for_action_with_bits, permissions_for_request_bits,
+    ActionPolicyDecision, LocalAuthzEvaluator, LocalBatchEvaluationInput, LocalEvaluationInput,
+    action_policy_decision_bits, best_permission_for_action_with_bits,
+    permissions_for_request_bits,
 };
 pub use role_assignment::EffectiveRoleAssignment;
 pub use scope::{ScopeKind, classify_scope, role_assignment_covers_resource};

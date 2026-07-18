@@ -1,15 +1,16 @@
-use std::{collections::HashMap, hint::black_box};
+use std::{collections::HashMap, hint::black_box, str::FromStr, time::Instant};
 
 use alloc_counter::AllocationGuard;
 use authz_types::{
     Action, ConfigurationModel, EvaluationRequest, PermissionActionRef, PermissionId, Resource,
     Scope, Subject,
 };
+use cedar_policy::PolicySet;
 use serde_json::Value;
 
 use crate::{
-    CedarInternalContext, compile_policy_bundle, evaluate_prepared_with_policy_sets,
-    evaluate_owned_with_policy_sets, evaluate_with_policy_sets, parse_policy_sets,
+    CedarInternalContext, compile_policy_bundle, evaluate_owned_with_policy_sets,
+    evaluate_prepared_with_policy_sets, evaluate_with_policy_sets, parse_policy_sets,
     prepare_evaluation_owned_with_parents_and_internal_context,
 };
 
@@ -17,6 +18,7 @@ const ITERATIONS: usize = 512;
 const MAX_ALLOCATIONS_PER_RUN: u64 = 1_050_000;
 const MAX_ALLOCATED_BYTES_PER_RUN: u64 = 320_000_000;
 const ISOLATED_ALLOC_GUARD_ENV: &str = "AUTHZ_CEDAR_ISOLATED_ALLOC_GUARD";
+const DIAGNOSTIC_ITERATIONS: usize = 10_000;
 
 fn default_internal_context() -> Value {
     serde_json::json!({
@@ -245,5 +247,100 @@ fn evaluate_with_policy_sets_direct_path_budget_tests() {
         "typed internal context must allocate fewer bytes: typed={} json={}",
         typed_report.allocated_bytes,
         owned_json_report.allocated_bytes
+    );
+}
+
+fn diagnostic_fixture(policy: &str) -> (PolicySet, crate::PreparedCedarEvaluation) {
+    let policies = PolicySet::from_str(policy).expect("diagnostic policies");
+    let request = EvaluationRequest {
+        subject: Subject::user("u1"),
+        resource: Resource::new("document", "doc1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let prepared = crate::prepare_evaluation_owned(request).expect("prepared diagnostic request");
+    (policies, prepared)
+}
+
+fn measure_diagnostics(
+    label: &'static str,
+    policies: &PolicySet,
+    prepared: &crate::PreparedCedarEvaluation,
+) -> (
+    alloc_counter::AllocationReport<'static>,
+    std::time::Duration,
+) {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "healthy_cedar_diagnostics_profile",
+        file!(),
+        line!(),
+        Some(label),
+    );
+    let started_at = Instant::now();
+    for _ in 0..DIAGNOSTIC_ITERATIONS {
+        let result = crate::evaluator::evaluate_prepared_with_policy_set_error_diagnostics(
+            policies, prepared,
+        );
+        black_box(result);
+    }
+    let elapsed = started_at.elapsed();
+    (guard.finish(), elapsed)
+}
+
+fn measure_explicit_diagnostics(
+    policies: &PolicySet,
+    prepared: &crate::PreparedCedarEvaluation,
+) -> (
+    alloc_counter::AllocationReport<'static>,
+    std::time::Duration,
+) {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "healthy_cedar_diagnostics_profile",
+        file!(),
+        line!(),
+        Some("explicit_allow"),
+    );
+    let started_at = Instant::now();
+    for _ in 0..DIAGNOSTIC_ITERATIONS {
+        let result =
+            crate::evaluator::evaluate_prepared_with_policy_set_diagnostics(policies, prepared);
+        black_box(result);
+    }
+    let elapsed = started_at.elapsed();
+    (guard.finish(), elapsed)
+}
+
+#[test]
+#[ignore = "optimization profile"]
+fn healthy_cedar_diagnostics_profile() {
+    let (allow_policies, allow_prepared) =
+        diagnostic_fixture(r#"@id("allow") permit(principal, action, resource);"#);
+    let (deny_policies, deny_prepared) =
+        diagnostic_fixture(r#"@id("deny") forbid(principal, action, resource);"#);
+    let (allow_report, allow_elapsed) =
+        measure_diagnostics("allow", &allow_policies, &allow_prepared);
+    let (deny_report, deny_elapsed) = measure_diagnostics("deny", &deny_policies, &deny_prepared);
+    let (explicit_report, explicit_elapsed) =
+        measure_explicit_diagnostics(&allow_policies, &allow_prepared);
+
+    alloc_counter::emit_report(&allow_report);
+    alloc_counter::emit_report(&deny_report);
+    alloc_counter::emit_report(&explicit_report);
+    eprintln!(
+        "ac3_001|mode=allow|iterations={DIAGNOSTIC_ITERATIONS}|elapsed_ns={}",
+        allow_elapsed.as_nanos(),
+    );
+    eprintln!(
+        "ac3_001|mode=deny|iterations={DIAGNOSTIC_ITERATIONS}|elapsed_ns={}",
+        deny_elapsed.as_nanos(),
+    );
+    eprintln!(
+        "ac3_001|mode=explicit_allow|iterations={DIAGNOSTIC_ITERATIONS}|elapsed_ns={}",
+        explicit_elapsed.as_nanos(),
     );
 }

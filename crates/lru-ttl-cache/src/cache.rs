@@ -132,7 +132,6 @@ where
     pub fn stats(&self) -> CacheStats {
         self.core.stats()
     }
-
 }
 
 impl<K, V, E> FetchingLruTtlCache<K, V, E>

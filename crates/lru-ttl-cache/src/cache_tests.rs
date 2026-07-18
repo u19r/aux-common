@@ -550,7 +550,10 @@ async fn fetch_error_releases_same_key_followers_for_retry() {
     tokio::task::yield_now().await;
     release_first.notify_one();
 
-    assert_eq!(Err("first fetch failed"), leader.await.expect("leader task"));
+    assert_eq!(
+        Err("first fetch failed"),
+        leader.await.expect("leader task")
+    );
     assert_eq!(
         Some(11),
         follower.await.expect("follower task").expect("retry fetch")
@@ -659,7 +662,9 @@ async fn different_keys_fetch_concurrently() {
 }
 
 fn profile_hit_lock(thread_count: usize, reads_per_thread: usize, read_concurrent: bool) -> u128 {
-    let values = (0..64).map(|key| (key, key)).collect::<std::collections::HashMap<_, _>>();
+    let values = (0..64)
+        .map(|key| (key, key))
+        .collect::<std::collections::HashMap<_, _>>();
     let start = Arc::new(std::sync::Barrier::new(thread_count + 1));
     let started = std::time::Instant::now();
 
@@ -673,7 +678,9 @@ fn profile_hit_lock(thread_count: usize, reads_per_thread: usize, read_concurren
                     start.wait();
                     for read_index in 0..reads_per_thread {
                         let key = (thread_index + read_index) % 64;
-                        let values = values.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let values = values
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
                         black_box(values.get(&key).copied());
                     }
                 })
@@ -693,7 +700,9 @@ fn profile_hit_lock(thread_count: usize, reads_per_thread: usize, read_concurren
                     start.wait();
                     for read_index in 0..reads_per_thread {
                         let key = (thread_index + read_index) % 64;
-                        let values = values.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let values = values
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
                         black_box(values.get(&key).copied());
                     }
                 })
@@ -721,27 +730,15 @@ fn cache_hit_read_lock_profile() {
         let mut rwlock_best_ns = u128::MAX;
         for iteration in 0..6 {
             if iteration % 2 == 0 {
-                rwlock_best_ns = rwlock_best_ns.min(profile_hit_lock(
-                    thread_count,
-                    READS_PER_THREAD,
-                    true,
-                ));
-                mutex_best_ns = mutex_best_ns.min(profile_hit_lock(
-                    thread_count,
-                    READS_PER_THREAD,
-                    false,
-                ));
+                rwlock_best_ns =
+                    rwlock_best_ns.min(profile_hit_lock(thread_count, READS_PER_THREAD, true));
+                mutex_best_ns =
+                    mutex_best_ns.min(profile_hit_lock(thread_count, READS_PER_THREAD, false));
             } else {
-                mutex_best_ns = mutex_best_ns.min(profile_hit_lock(
-                    thread_count,
-                    READS_PER_THREAD,
-                    false,
-                ));
-                rwlock_best_ns = rwlock_best_ns.min(profile_hit_lock(
-                    thread_count,
-                    READS_PER_THREAD,
-                    true,
-                ));
+                mutex_best_ns =
+                    mutex_best_ns.min(profile_hit_lock(thread_count, READS_PER_THREAD, false));
+                rwlock_best_ns =
+                    rwlock_best_ns.min(profile_hit_lock(thread_count, READS_PER_THREAD, true));
             }
         }
         eprintln!(

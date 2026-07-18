@@ -1,4 +1,8 @@
-use std::{collections::{HashMap, HashSet}, hint::black_box, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    hint::black_box,
+    time::Instant,
+};
 
 use alloc_counter::AllocationGuard;
 use authz_types::{
@@ -11,11 +15,11 @@ use serde_json::json;
 
 use crate::{
     ActionPolicyDecision, EffectiveRoleAssignment, EvaluationRuntime, LocalAuthzEvaluator,
-    LocalEvaluationInput, ParentRef, ResourceAccessSnapshot, SubjectAccessSnapshot,
-    action_policy_decision_bits, build_subject_parent_template, enrich_request_with_snapshots,
+    LocalBatchEvaluationInput, LocalEvaluationInput, ParentRef, ResourceAccessSnapshot,
+    SubjectAccessSnapshot, action_policy_decision_bits, build_subject_parent_template,
+    enrich_request_with_snapshots, local_evaluator::inject_internal_context,
     permissions_for_request_bits,
 };
-use crate::local_evaluator::inject_internal_context;
 
 fn prepare_legacy_internal_context(
     runtime: &EvaluationRuntime,
@@ -343,10 +347,7 @@ fn typed_internal_context_preserves_non_object_context_normalization() {
                 subject_access: SubjectAccessSnapshot {
                     subject: request.subject.clone(),
                     assignments: vec![assignment("reader", Some("tenant"), None)],
-                    subject_parents: vec![
-                        parent("role", "reader"),
-                        parent("tenant", "tenant_1"),
-                    ],
+                    subject_parents: vec![parent("role", "reader"), parent("tenant", "tenant_1")],
                     resource_scopes: HashMap::new(),
                     fetched_at_ms: 1,
                 },
@@ -566,6 +567,361 @@ fn runtime_with_read_role() -> EvaluationRuntime {
         default_step_up_rule: None,
         description: None,
     })
+}
+
+fn runtime_with_batch_actions(count: usize) -> EvaluationRuntime {
+    let actions = (0..count)
+        .map(|index| authz_types::ActionDefinition {
+            name: format!("action_{index}"),
+            description: None,
+        })
+        .collect::<Vec<_>>();
+    let permission_actions = actions
+        .iter()
+        .map(|action| PermissionActionRef {
+            resource_type: "document".into(),
+            action_name: action.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    build_runtime(ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions,
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "document:batch".into(),
+            name: "Document batch".into(),
+            description: None,
+            actions: permission_actions,
+            not_actions: vec![],
+        }],
+        roles: vec![authz_types::Role {
+            id: "batch_reader".into(),
+            name: "Batch reader".into(),
+            description: None,
+            permissions: vec![authz_types::RolePermission {
+                permission_id: PermissionId::new("document:batch").expect("permission id"),
+                scopes: vec![Scope::Tenant],
+            }],
+            actions: vec![],
+            not_actions: vec![],
+        }],
+        scope_mappings: vec![],
+        authn_providers: vec![],
+        step_up_rules: vec![],
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+        description: None,
+    })
+}
+
+fn runtime_with_action_permission_catalog(permission_count: usize) -> EvaluationRuntime {
+    let permissions = (0..permission_count)
+        .map(|index| authz_types::Permission {
+            id: format!("document:permission_{index:03}"),
+            name: format!("Permission {index}"),
+            description: None,
+            actions: vec![PermissionActionRef {
+                resource_type: "document".into(),
+                action_name: "read".into(),
+            }],
+            not_actions: vec![],
+        })
+        .collect::<Vec<_>>();
+    let role_permissions = permissions
+        .iter()
+        .map(|permission| authz_types::RolePermission {
+            permission_id: PermissionId::new(&permission.id).expect("permission id"),
+            scopes: vec![Scope::Tenant],
+        })
+        .collect();
+    build_runtime(ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "read".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions,
+        roles: vec![authz_types::Role {
+            id: "catalog_reader".into(),
+            name: "Catalog reader".into(),
+            description: None,
+            permissions: role_permissions,
+            actions: vec![],
+            not_actions: vec![],
+        }],
+        scope_mappings: vec![],
+        authn_providers: vec![],
+        step_up_rules: vec![],
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+        description: None,
+    })
+}
+
+#[test]
+#[ignore = "AC3-003 compiled action descriptor allocation and CPU receipt"]
+fn compiled_action_descriptor_profile() {
+    const PROFILE_ITERATIONS: usize = 10_000;
+
+    for permission_count in [1, 64] {
+        let runtime = runtime_with_action_permission_catalog(permission_count);
+        let request = EvaluationRequest {
+            subject: Subject::user("user_1"),
+            resource: Resource::new("document", "doc_1"),
+            action: Action::new("read"),
+            context: None,
+            jwt_context: None,
+            session_context: None,
+            token_context: None,
+        };
+        let assignments = vec![assignment("catalog_reader", Some("tenant"), None)];
+        let scoped =
+            permissions_for_request_bits(&runtime, &assignments, &request, &request.subject);
+
+        let legacy_guard = AllocationGuard::start(
+            module_path!(),
+            "compiled_action_descriptor_profile",
+            file!(),
+            line!(),
+            Some("legacy"),
+        );
+        let legacy_started = Instant::now();
+        for _ in 0..PROFILE_ITERATIONS {
+            black_box(
+                crate::local_evaluator::legacy_action_resolution_for_profile(
+                    &runtime,
+                    "document",
+                    "read",
+                    &scoped.permissions,
+                    &scoped.checked_roles,
+                ),
+            );
+        }
+        let legacy_elapsed = legacy_started.elapsed();
+        let legacy_report = legacy_guard.finish();
+
+        let compiled_guard = AllocationGuard::start(
+            module_path!(),
+            "compiled_action_descriptor_profile",
+            file!(),
+            line!(),
+            Some("compiled"),
+        );
+        let compiled_started = Instant::now();
+        for _ in 0..PROFILE_ITERATIONS {
+            black_box(
+                crate::local_evaluator::compiled_action_resolution_for_profile(
+                    &runtime,
+                    "document",
+                    "read",
+                    &scoped.permissions,
+                    &scoped.checked_roles,
+                ),
+            );
+        }
+        let compiled_elapsed = compiled_started.elapsed();
+        let compiled_report = compiled_guard.finish();
+
+        alloc_counter::emit_report(&legacy_report);
+        alloc_counter::emit_report(&compiled_report);
+        eprintln!(
+            "ac3_003|permissions={permission_count}|iterations={PROFILE_ITERATIONS}|legacy_ns={}|compiled_ns={}",
+            legacy_elapsed.as_nanos(),
+            compiled_elapsed.as_nanos(),
+        );
+    }
+}
+
+#[test]
+#[ignore = "AC3-002 prepared local batch frame allocation and CPU receipt"]
+fn prepared_local_batch_frame_profile() {
+    const BATCH_ITERATIONS: usize = 100;
+
+    for cardinality in [1, 4, 16] {
+        let evaluator = LocalAuthzEvaluator::new(runtime_with_batch_actions(cardinality));
+        let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+        let subject_access = SubjectAccessSnapshot {
+            subject: Subject::user("user_1"),
+            assignments: vec![assignment("batch_reader", Some("tenant"), None)],
+            subject_parents: vec![parent("role", "batch_reader")],
+            resource_scopes: HashMap::new(),
+            fetched_at_ms: 1,
+        };
+        let resource_access = ResourceAccessSnapshot {
+            resource_type: "document".to_string(),
+            resource_id: "doc_1".to_string(),
+            resource_parents: vec![parent("tenant", "tenant_1")],
+            fetched_at_ms: 1,
+        };
+        let actions = (0..cardinality)
+            .map(|index| Action::new(format!("action_{index}")))
+            .collect::<Vec<_>>();
+        let request = EvaluationRequest {
+            subject: Subject::user("user_1"),
+            resource: Resource::new("document", "doc_1"),
+            action: actions[0].clone(),
+            context: None,
+            jwt_context: None,
+            session_context: None,
+            token_context: None,
+        };
+        let label = match cardinality {
+            1 => "one_action",
+            4 => "four_actions",
+            _ => "sixteen_actions",
+        };
+        let guard = AllocationGuard::start(
+            module_path!(),
+            "prepared_local_batch_frame_profile",
+            file!(),
+            line!(),
+            Some(label),
+        );
+        let started_at = Instant::now();
+        for _ in 0..BATCH_ITERATIONS {
+            let responses = evaluator
+                .evaluate_batch_at(
+                    LocalBatchEvaluationInput {
+                        tenant_id: "tenant_1",
+                        request: request.clone(),
+                        actions: &actions,
+                        subject_access: &subject_access,
+                        resource_access: &resource_access,
+                    },
+                    now,
+                )
+                .expect("batch evaluation");
+            black_box(responses);
+        }
+        let elapsed = started_at.elapsed();
+        let report = guard.finish();
+        alloc_counter::emit_report(&report);
+        eprintln!(
+            "ac3_002|mode=prepared|cardinality={cardinality}|iterations={BATCH_ITERATIONS}|elapsed_ns={}",
+            elapsed.as_nanos(),
+        );
+    }
+}
+
+#[test]
+fn prepared_local_batch_matches_individual_action_evaluations() {
+    let cardinality = 4;
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_batch_actions(cardinality));
+    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let subject_access = SubjectAccessSnapshot {
+        subject: Subject::user("user_1"),
+        assignments: vec![assignment("batch_reader", Some("tenant"), None)],
+        subject_parents: vec![parent("role", "batch_reader")],
+        resource_scopes: HashMap::new(),
+        fetched_at_ms: 1,
+    };
+    let resource_access = ResourceAccessSnapshot {
+        resource_type: "document".to_string(),
+        resource_id: "doc_1".to_string(),
+        resource_parents: vec![parent("tenant", "tenant_1")],
+        fetched_at_ms: 1,
+    };
+    let actions = (0..cardinality)
+        .map(|index| Action::new(format!("action_{index}")))
+        .collect::<Vec<_>>();
+    let base_request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1"),
+        action: actions[0].clone(),
+        context: Some(Context::new(json!({"request_region": "eu-west-1"}))),
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let expected = actions
+        .iter()
+        .map(|action| {
+            let mut request = base_request.clone();
+            request.action = action.clone();
+            evaluator
+                .evaluate_at(
+                    LocalEvaluationInput {
+                        tenant_id: "tenant_1",
+                        request,
+                        subject_access: &subject_access,
+                        resource_access: &resource_access,
+                    },
+                    now,
+                )
+                .expect("individual evaluation")
+        })
+        .collect::<Vec<_>>();
+    let actual = evaluator
+        .evaluate_batch_at(
+            LocalBatchEvaluationInput {
+                tenant_id: "tenant_1",
+                request: base_request,
+                actions: &actions,
+                subject_access: &subject_access,
+                resource_access: &resource_access,
+            },
+            now,
+        )
+        .expect("prepared batch evaluation");
+
+    assert_eq!(
+        serde_json::to_value(actual).expect("actual JSON"),
+        serde_json::to_value(expected).expect("expected JSON"),
+    );
+}
+
+#[test]
+fn prepared_local_batch_uses_the_explicit_action_sequence() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_batch_actions(2));
+    let actions = vec![Action::new("action_0"), Action::new("action_1")];
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("action_1"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let subject_access = SubjectAccessSnapshot {
+        subject: request.subject.clone(),
+        assignments: vec![assignment("batch_reader", Some("tenant"), None)],
+        subject_parents: vec![parent("role", "batch_reader")],
+        resource_scopes: HashMap::new(),
+        fetched_at_ms: 1,
+    };
+    let resource_access = ResourceAccessSnapshot {
+        resource_type: "document".to_string(),
+        resource_id: "doc_1".to_string(),
+        resource_parents: vec![],
+        fetched_at_ms: 1,
+    };
+
+    let result = evaluator
+        .evaluate_batch_at(
+            LocalBatchEvaluationInput {
+                tenant_id: "tenant_1",
+                request,
+                actions: &actions,
+                subject_access,
+                resource_access,
+            },
+            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        )
+        .expect("batch evaluation");
+    assert_eq!(result.len(), 2);
+    assert!(result.iter().all(|response| response.decision));
 }
 
 #[test]

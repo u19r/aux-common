@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use authz_cedar::{CedarUidRegistry, CompiledBundle, ParsedPolicySets, parse_policy_sets};
+use authz_cedar::{
+    CedarUidRegistry, CompiledBundle, ParsedPolicySets, PreparedCedarAction, parse_policy_sets,
+};
 use authz_types::{
     MAX_PERMISSIONS, MAX_ROLES, TokenContext, TokenScopeType, ValidatedConfigurationModel,
 };
@@ -148,6 +150,13 @@ struct RoleRuntime {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct CompiledActionDescriptor {
+    pub(crate) masks: ActionMasks,
+    pub(crate) best_permission_candidates: Vec<usize>,
+    pub(crate) cedar_action: PreparedCedarAction,
+}
+
+#[derive(Debug, Clone)]
 pub struct EvaluationRuntime {
     pub(crate) config: ValidatedConfigurationModel,
     pub(crate) policy_sets: ParsedPolicySets,
@@ -155,7 +164,7 @@ pub struct EvaluationRuntime {
     roles: Vec<RoleRuntime>,
     permissions: Vec<PermissionRuntime>,
     role_index: HashMap<String, usize>,
-    action_masks: HashMap<String, HashMap<String, ActionMasks>>,
+    action_descriptors: HashMap<String, HashMap<String, CompiledActionDescriptor>>,
     scope_permission_masks: HashMap<String, PermissionBits>,
 }
 
@@ -278,7 +287,43 @@ impl EvaluationRuntime {
             }
         }
 
+        for resource in &config.resource_types {
+            for action in &resource.actions {
+                action_masks_for_mut(&mut action_masks, &resource.id, &action.name);
+            }
+        }
+
         let scope_permission_masks = build_scope_permission_masks(&config, &permission_index);
+        let mut action_descriptors = HashMap::with_capacity(action_masks.len());
+        for (resource_type, actions) in action_masks {
+            let mut descriptors = HashMap::with_capacity(actions.len());
+            for (action, masks) in actions {
+                let mut best_permission_candidates = (0..permissions.len())
+                    .filter(|index| {
+                        masks.permission_allow.contains(*index)
+                            && !masks.permission_deny.contains(*index)
+                    })
+                    .collect::<Vec<_>>();
+                best_permission_candidates.sort_by(|left, right| {
+                    permissions[*right]
+                        .action_score
+                        .cmp(&permissions[*left].action_score)
+                        .then_with(|| permissions[*left].id.cmp(&permissions[*right].id))
+                });
+                let cedar_action = cedar_uids
+                    .prepare_action(&resource_type, &action)
+                    .map_err(AuthzRuntimeError::build)?;
+                descriptors.insert(
+                    action,
+                    CompiledActionDescriptor {
+                        masks,
+                        best_permission_candidates,
+                        cedar_action,
+                    },
+                );
+            }
+            action_descriptors.insert(resource_type, descriptors);
+        }
 
         Ok(Self {
             config,
@@ -287,7 +332,7 @@ impl EvaluationRuntime {
             roles,
             permissions,
             role_index,
-            action_masks,
+            action_descriptors,
             scope_permission_masks,
         })
     }
@@ -304,8 +349,12 @@ impl EvaluationRuntime {
         self.roles.get(role_idx).map(|role| &role.permission_bits)
     }
 
-    pub(crate) fn action_masks(&self, resource_type: &str, action: &str) -> Option<&ActionMasks> {
-        self.action_masks
+    pub(crate) fn action_descriptor(
+        &self,
+        resource_type: &str,
+        action: &str,
+    ) -> Option<&CompiledActionDescriptor> {
+        self.action_descriptors
             .get(resource_type)
             .and_then(|actions| actions.get(action))
     }
@@ -317,8 +366,8 @@ impl EvaluationRuntime {
     pub(crate) fn actions_for_resource(
         &self,
         resource_type: &str,
-    ) -> Option<&HashMap<String, ActionMasks>> {
-        self.action_masks.get(resource_type)
+    ) -> Option<&HashMap<String, CompiledActionDescriptor>> {
+        self.action_descriptors.get(resource_type)
     }
 
     pub fn role_ids_sorted(&self, bits: &RoleBits) -> Vec<String> {
@@ -338,6 +387,7 @@ impl EvaluationRuntime {
             .map(|permission| permission.id.as_str())
     }
 
+    #[cfg(test)]
     pub(crate) fn permission_action_score(&self, index: usize) -> Option<usize> {
         self.permissions
             .get(index)

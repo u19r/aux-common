@@ -52,6 +52,9 @@ pub struct CedarUidRegistry {
 }
 
 #[derive(Debug, Clone)]
+pub struct PreparedCedarAction(EntityUid);
+
+#[derive(Debug, Clone)]
 struct CedarResourceUids {
     entity_type: EntityTypeName,
     actions: HashMap<String, EntityUid>,
@@ -137,6 +140,19 @@ impl CedarUidRegistry {
             ),
         })
     }
+
+    pub fn prepare_action(
+        &self,
+        resource_type: &str,
+        action: &str,
+    ) -> Result<PreparedCedarAction, CedarError> {
+        self.resources
+            .get(resource_type)
+            .and_then(|resource| resource.actions.get(action))
+            .cloned()
+            .map(PreparedCedarAction)
+            .ok_or_else(|| CedarError::evaluation("resource action is not prepared"))
+    }
 }
 
 impl CedarRequestUids {
@@ -210,10 +226,25 @@ pub struct PreparedCedarEvaluation {
     entities: Entities,
 }
 
+pub struct PreparedCedarBatchFrame {
+    resource_type: String,
+    principal: EntityUid,
+    resource: EntityUid,
+    context: Context,
+    entities: Entities,
+}
+
 #[derive(Debug, Clone)]
 pub struct InternalEvaluationResult {
     pub response: EvaluationResponse,
     pub determining_policy_ids: Vec<String>,
+    pub evaluation_errors: Vec<CedarEvaluationErrorCategory>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CedarErrorDiagnostics {
+    pub response: EvaluationResponse,
+    pub determining_policy_count: usize,
     pub evaluation_errors: Vec<CedarEvaluationErrorCategory>,
 }
 
@@ -360,8 +391,8 @@ pub fn prepare_request_uids(request: &EvaluationRequest) -> Result<CedarRequestU
     .map_err(CedarError::evaluation)?;
     let principal = principal_uid_owned(request.subject.subject_type.as_str(), subject_id)
         .map_err(CedarError::evaluation)?;
-    let resource = resource_uid_owned(&resource_type, resource_id)
-        .map_err(CedarError::evaluation)?;
+    let resource =
+        resource_uid_owned(&resource_type, resource_id).map_err(CedarError::evaluation)?;
 
     Ok(CedarRequestUids {
         resource_type,
@@ -481,11 +512,101 @@ pub fn prepare_evaluation_owned_with_registry_and_internal_context(
     prepare_request_from_parts(uids, CedarEntitiesContext { entities, context })
 }
 
+pub fn prepare_batch_frame_owned_with_registry_and_internal_context(
+    uid_registry: &CedarUidRegistry,
+    request: EvaluationRequest,
+    subject_parents: &[EntityParentRef],
+    resource_parents: &[EntityParentRef],
+    internal_context: CedarInternalContext,
+) -> Result<PreparedCedarBatchFrame, CedarError> {
+    let uids = uid_registry.request_uids(&request)?;
+    let (entities, context) = build_entities_and_context_owned_with_parents(
+        request,
+        subject_parents,
+        resource_parents,
+        Some(internal_context),
+        Some(&uids),
+    )
+    .map_err(CedarError::evaluation)?;
+    Ok(PreparedCedarBatchFrame {
+        resource_type: uids.resource_type,
+        principal: uids.principal,
+        resource: uids.resource,
+        context,
+        entities,
+    })
+}
+
+pub fn evaluate_batch_frame_action_with_policy_sets_error_diagnostics(
+    policy_sets: &ParsedPolicySets,
+    prepared: &PreparedCedarBatchFrame,
+    action: &PreparedCedarAction,
+) -> Result<CedarErrorDiagnostics, CedarError> {
+    let Some(policy_set) = policy_sets.get(prepared.resource_type.as_str()) else {
+        return Ok(CedarErrorDiagnostics {
+            response: EvaluationResponse::deny_with_reason(format!(
+                "policy slice not found for {}",
+                prepared.resource_type
+            )),
+            determining_policy_count: 0,
+            evaluation_errors: Vec::new(),
+        });
+    };
+    let request = Request::new(
+        prepared.principal.clone(),
+        action.0.clone(),
+        prepared.resource.clone(),
+        prepared.context.clone(),
+        None,
+    )
+    .map_err(|error| CedarError::evaluation(error.to_string()))?;
+    Ok(evaluate_authorizer_with_error_diagnostics(
+        &request,
+        policy_set,
+        &prepared.entities,
+    ))
+}
+
 pub fn evaluate_prepared_with_policy_sets(
     policy_sets: &ParsedPolicySets,
     prepared: PreparedCedarEvaluation,
 ) -> Result<EvaluationResponse, CedarError> {
-    Ok(evaluate_prepared_with_policy_sets_diagnostics(policy_sets, prepared)?.response)
+    let PreparedCedarEvaluation {
+        resource_type,
+        request,
+        entities,
+    } = prepared;
+    let Some(policy_set) = policy_sets.get(resource_type.as_str()) else {
+        return Ok(EvaluationResponse::deny_with_reason(format!(
+            "policy slice not found for {}",
+            resource_type
+        )));
+    };
+    Ok(evaluate_authorizer(&request, policy_set, &entities))
+}
+
+pub fn evaluate_prepared_with_policy_sets_error_diagnostics(
+    policy_sets: &ParsedPolicySets,
+    prepared: PreparedCedarEvaluation,
+) -> Result<CedarErrorDiagnostics, CedarError> {
+    let PreparedCedarEvaluation {
+        resource_type,
+        request,
+        entities,
+    } = prepared;
+    let Some(policy_set) = policy_sets.get(resource_type.as_str()) else {
+        return Ok(CedarErrorDiagnostics {
+            response: EvaluationResponse::deny_with_reason(format!(
+                "policy slice not found for {}",
+                resource_type
+            )),
+            determining_policy_count: 0,
+            evaluation_errors: Vec::new(),
+        });
+    };
+    Ok(evaluate_authorizer_with_error_diagnostics(
+        &request, policy_set, &entities,
+    ))
 }
 
 pub fn evaluate_prepared_with_policy_sets_diagnostics(
@@ -516,9 +637,49 @@ pub fn evaluate_prepared_with_policy_sets_diagnostics(
 #[cfg(test)]
 pub(crate) fn evaluate_prepared_with_policy_set_diagnostics(
     policy_set: &PolicySet,
-    prepared: PreparedCedarEvaluation,
+    prepared: &PreparedCedarEvaluation,
 ) -> InternalEvaluationResult {
     evaluate_authorizer_with_diagnostics(&prepared.request, policy_set, &prepared.entities)
+}
+
+#[cfg(test)]
+pub(crate) fn evaluate_prepared_with_policy_set_error_diagnostics(
+    policy_set: &PolicySet,
+    prepared: &PreparedCedarEvaluation,
+) -> CedarErrorDiagnostics {
+    evaluate_authorizer_with_error_diagnostics(&prepared.request, policy_set, &prepared.entities)
+}
+
+fn evaluate_authorizer(
+    request: &Request,
+    policy_set: &PolicySet,
+    entities: &Entities,
+) -> EvaluationResponse {
+    let response = Authorizer::new().is_authorized(request, policy_set, entities);
+    response_from_decision(response.decision())
+}
+
+fn evaluate_authorizer_with_error_diagnostics(
+    request: &Request,
+    policy_set: &PolicySet,
+    entities: &Entities,
+) -> CedarErrorDiagnostics {
+    let response = Authorizer::new().is_authorized(request, policy_set, entities);
+    let evaluation_errors = response
+        .diagnostics()
+        .errors()
+        .map(error_category)
+        .collect::<Vec<_>>();
+    let determining_policy_count = if evaluation_errors.is_empty() {
+        0
+    } else {
+        response.diagnostics().reason().count()
+    };
+    CedarErrorDiagnostics {
+        response: response_from_decision(response.decision()),
+        determining_policy_count,
+        evaluation_errors,
+    }
 }
 
 pub(crate) fn evaluate_authorizer_with_diagnostics(
@@ -758,11 +919,7 @@ fn restricted_expr_from_internal_context(
         )
     };
     let string_set = |values: Vec<String>| {
-        RestrictedExpression::new_set(
-            values
-                .into_iter()
-                .map(RestrictedExpression::new_string),
-        )
+        RestrictedExpression::new_set(values.into_iter().map(RestrictedExpression::new_string))
     };
     let resource_scopes = context
         .resource_scopes
@@ -827,10 +984,7 @@ fn restricted_expr_from_internal_context(
             "session_acr".to_string(),
             RestrictedExpression::new_long(context.session_acr),
         ),
-        (
-            "session_amr".to_string(),
-            string_set(context.session_amr),
-        ),
+        ("session_amr".to_string(), string_set(context.session_amr)),
         (
             "session_auth_age_present".to_string(),
             RestrictedExpression::new_bool(context.session_auth_age_present),

@@ -1,27 +1,27 @@
 use std::{borrow::Borrow, collections::BTreeSet, sync::Arc};
 
 use authz_cedar::{
-    CedarEntityRef, CedarEvaluationErrorCategory, CedarInternalContext,
-    CedarResourceScope, EntityParentRef as CedarEntityParentRef,
-    evaluate_prepared_with_policy_sets_diagnostics as cedar_evaluate_prepared_with_policy_sets_diagnostics,
-    prepare_evaluation_owned_with_registry_and_internal_context as cedar_prepare_evaluation_owned_with_registry_and_internal_context,
+    CedarEntityRef, CedarEvaluationErrorCategory, CedarInternalContext, CedarResourceScope,
+    EntityParentRef as CedarEntityParentRef,
+    evaluate_batch_frame_action_with_policy_sets_error_diagnostics as cedar_evaluate_batch_frame_action_with_policy_sets_error_diagnostics,
+    prepare_batch_frame_owned_with_registry_and_internal_context as cedar_prepare_batch_frame_owned_with_registry_and_internal_context,
 };
+#[cfg(test)]
+use authz_types::CONTEXT_INTERNAL_KEY;
 use authz_types::{
-    DecisionContext, EvaluationRequest, EvaluationResponse, ResourceSelection, RoleScope,
+    Action, DecisionContext, EvaluationRequest, EvaluationResponse, ResourceSelection, RoleScope,
     SessionContext, TokenContext, TokenScopeType,
 };
 use chrono::{DateTime, Utc};
-
-#[cfg(test)]
-use authz_types::CONTEXT_INTERNAL_KEY;
-use serde_json::Value;
 #[cfg(test)]
 use serde_json::Map;
+use serde_json::Value;
 
 use crate::{
     AuthzRuntimeError, AuthzRuntimeResult, EffectiveRoleAssignment, EvaluationRuntime, ParentRef,
     PermissionBits, RoleBits, ScopedPermissionBits, StepUpEvaluator, StepUpResult,
-    SubjectAccessSnapshot, enrich_request_with_snapshots, role_assignment_covers_resource,
+    SubjectAccessSnapshot, enrich_request_with_snapshots,
+    evaluation_runtime::CompiledActionDescriptor, role_assignment_covers_resource,
 };
 
 #[derive(Debug, Clone)]
@@ -67,11 +67,41 @@ impl LocalAuthzEvaluator {
         SubjectAccess: Borrow<SubjectAccessSnapshot>,
         ResourceAccess: Borrow<crate::ResourceAccessSnapshot>,
     {
+        let action = input.request.action.clone();
+        self.evaluate_batch_at(
+            LocalBatchEvaluationInput {
+                tenant_id: input.tenant_id,
+                request: input.request,
+                actions: std::slice::from_ref(&action),
+                subject_access: input.subject_access,
+                resource_access: input.resource_access,
+            },
+            now,
+        )?
+        .pop()
+        .ok_or_else(|| AuthzRuntimeError::cedar("single evaluation returned no response"))
+    }
+
+    pub fn evaluate_batch_at<Tenant, SubjectAccess, ResourceAccess>(
+        &self,
+        input: LocalBatchEvaluationInput<'_, Tenant, SubjectAccess, ResourceAccess>,
+        now: DateTime<Utc>,
+    ) -> AuthzRuntimeResult<Vec<EvaluationResponse>>
+    where
+        Tenant: Borrow<str>,
+        SubjectAccess: Borrow<SubjectAccessSnapshot>,
+        ResourceAccess: Borrow<crate::ResourceAccessSnapshot>,
+    {
+        if input.actions.is_empty() {
+            return Ok(Vec::new());
+        }
         let tenant_id = input.tenant_id.borrow();
         let subject_access = input.subject_access.borrow();
         let resource_access = input.resource_access.borrow();
-        let token_ctx = input.request.token_context.as_ref();
-        let session_ctx = input.request.session_context.as_ref();
+        let token_context = input.request.token_context.clone();
+        let session_context = input.request.session_context.clone();
+        let token_ctx = token_context.as_ref();
+        let session_ctx = session_context.as_ref();
         let assignments = subject_access.active_assignments_at(now);
         let scoped = permissions_for_request_bits(
             &self.runtime,
@@ -80,7 +110,6 @@ impl LocalAuthzEvaluator {
             &input.request.subject,
         );
         let checked_roles = self.runtime.role_ids_sorted(&scoped.checked_roles);
-
         let effective_permissions = if let Some(token_ctx) = token_ctx {
             let resolved =
                 self.runtime
@@ -90,39 +119,23 @@ impl LocalAuthzEvaluator {
                     .invalid_reason
                     .as_deref()
                     .unwrap_or("Token invalid");
-                return Ok(with_checked_roles(
-                    EvaluationResponse::deny_with_reason(reason),
+                return Ok(repeated_denials(
+                    input.actions.len(),
+                    reason,
                     &checked_roles,
                 ));
             }
-
             if token_selected_resource_mismatch(token_ctx, &input.request) {
-                return Ok(with_checked_roles(
-                    EvaluationResponse::deny_with_reason("token_resource_scope"),
+                return Ok(repeated_denials(
+                    input.actions.len(),
+                    "token_resource_scope",
                     &checked_roles,
                 ));
             }
-
-            let token_decision = action_policy_decision_bits(
-                &self.runtime,
-                &input.request.resource.resource_type,
-                &input.request.action.name,
-                &resolved.permissions,
-                &scoped.checked_roles,
-                false,
-            );
-            if !matches!(token_decision, ActionPolicyDecision::AllowMatched) {
-                return Ok(with_checked_roles(
-                    EvaluationResponse::deny_with_reason("token_permission_ceiling"),
-                    &checked_roles,
-                ));
-            }
-
             resolved.permissions
         } else {
             scoped.permissions
         };
-
         if let Some(token_ctx) = token_ctx
             && let Some(org_id) = token_ctx.scopes.org_id.as_deref()
         {
@@ -130,55 +143,65 @@ impl LocalAuthzEvaluator {
             if resource_org != org_id
                 || !token_owner_has_org(&assignments, &token_ctx.owner_id, org_id)
             {
-                return Ok(with_checked_roles(
-                    EvaluationResponse::deny_with_reason("token_org_mismatch"),
+                return Ok(repeated_denials(
+                    input.actions.len(),
+                    "token_org_mismatch",
                     &checked_roles,
                 ));
             }
         }
 
-        let action_policy_decision = action_policy_decision_bits(
-            &self.runtime,
-            &input.request.resource.resource_type,
-            &input.request.action.name,
-            &effective_permissions,
-            &scoped.checked_roles,
-            token_ctx.is_none(),
-        );
-
-        if token_ctx.is_some()
-            && !matches!(action_policy_decision, ActionPolicyDecision::AllowMatched)
-        {
-            return Ok(with_checked_roles(
-                EvaluationResponse::deny_with_reason("token_permission_ceiling"),
-                &checked_roles,
-            ));
-        }
-
-        if !matches!(action_policy_decision, ActionPolicyDecision::AllowMatched)
-            && !public_read_is_declared(&self.runtime, &input.request)
-        {
-            let reason = if matches!(action_policy_decision, ActionPolicyDecision::DenyMatched) {
-                "deny_matched"
-            } else {
-                "no_policy_allow"
-            };
-            return Ok(with_checked_roles(
-                EvaluationResponse::deny_with_reason(reason),
-                &checked_roles,
-            ));
-        }
-
-        if let Some(step_up_response) = step_up_response_for_allowed_request(
-            &self.runtime,
-            &input.request.resource.resource_type,
-            &input.request.action.name,
+        let resource_type = input.request.resource.resource_type.clone();
+        let resource_is_public = input
+            .request
+            .resource
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("is_public"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let action_preparation = BatchActionPreparation {
+            runtime: &self.runtime,
+            resource_type: &resource_type,
+            effective_permissions: &effective_permissions,
+            checked_role_bits: &scoped.checked_roles,
+            token_present: token_ctx.is_some(),
+            checked_roles: &checked_roles,
+            resource_is_public,
             session_ctx,
-            token_ctx.is_some(),
             now,
-        ) {
-            return Ok(step_up_response);
+        };
+        let mut single_action = None;
+        let mut multiple_actions = Vec::new();
+        let prepared_actions = if input.actions.len() == 1 {
+            std::slice::from_mut(
+                single_action.insert(action_preparation.prepare(&input.actions[0])),
+            )
+        } else {
+            multiple_actions.extend(
+                input
+                    .actions
+                    .iter()
+                    .map(|action| action_preparation.prepare(action)),
+            );
+            multiple_actions.as_mut_slice()
+        };
+        if prepared_actions
+            .iter()
+            .all(|action| action.preliminary_response.is_some())
+        {
+            return Ok(prepared_actions
+                .iter_mut()
+                .filter_map(|action| action.preliminary_response.take())
+                .collect());
         }
+        let prepared_action = prepared_actions
+            .iter()
+            .find_map(|action| {
+                (action.preliminary_response.is_none() && action.descriptor.is_some())
+                    .then(|| action.action.clone())
+            })
+            .ok_or_else(|| AuthzRuntimeError::cedar("batch has no prepared Cedar action"))?;
 
         let internal_ctx = build_cedar_internal_context_at(
             &self.runtime,
@@ -189,17 +212,16 @@ impl LocalAuthzEvaluator {
             session_ctx,
             now,
         )?;
-        let enriched = enrich_request_with_snapshots(
+        let mut enriched = enrich_request_with_snapshots(
             tenant_id,
             input.request,
             subject_access,
             resource_access,
         )?;
-        let resource_type = enriched.request.resource.resource_type.clone();
-        let action_name = enriched.request.action.name.clone();
+        enriched.request.action = prepared_action;
         let subject_parents = to_cedar_parent_refs(&enriched.subject_parents);
         let resource_parents = to_cedar_parent_refs(&enriched.resource_parents);
-        let prepared = cedar_prepare_evaluation_owned_with_registry_and_internal_context(
+        let prepared = cedar_prepare_batch_frame_owned_with_registry_and_internal_context(
             self.runtime.cedar_uids(),
             enriched.request,
             &subject_parents,
@@ -207,41 +229,127 @@ impl LocalAuthzEvaluator {
             internal_ctx,
         )
         .map_err(AuthzRuntimeError::cedar)?;
-        let diagnostic_result = cedar_evaluate_prepared_with_policy_sets_diagnostics(
-            &self.runtime.policy_sets,
-            prepared,
-        )
-        .map_err(AuthzRuntimeError::cedar)?;
-        if !diagnostic_result.evaluation_errors.is_empty() {
-            record_cedar_diagnostics(
-                &resource_type,
-                &action_name,
-                self.runtime.config.version,
-                diagnostic_result.determining_policy_ids.len(),
-                &diagnostic_result.evaluation_errors,
-            );
-        }
-        let mut response = diagnostic_result.response;
-
-        if response.decision {
-            response.context = Some(DecisionContext {
-                reason: None,
-                effective_permission: best_permission_for_action_with_bits(
-                    &self.runtime,
+        let mut responses = Vec::with_capacity(prepared_actions.len());
+        for action in prepared_actions {
+            if let Some(response) = action.preliminary_response.take() {
+                responses.push(response);
+                continue;
+            }
+            let descriptor = action.descriptor.ok_or_else(|| {
+                AuthzRuntimeError::cedar("allowed action has no compiled descriptor")
+            })?;
+            let diagnostic_result =
+                cedar_evaluate_batch_frame_action_with_policy_sets_error_diagnostics(
+                    &self.runtime.policy_sets,
+                    &prepared,
+                    &descriptor.cedar_action,
+                )
+                .map_err(AuthzRuntimeError::cedar)?;
+            if !diagnostic_result.evaluation_errors.is_empty() {
+                record_cedar_diagnostics(
                     &resource_type,
-                    &action_name,
-                    &effective_permissions,
-                ),
-                policy_version: None,
-                checked_roles: Some(checked_roles),
-                acr_values: None,
-            });
-        } else {
-            response = with_checked_roles(response, &checked_roles);
+                    &action.action.name,
+                    self.runtime.config.version,
+                    diagnostic_result.determining_policy_count,
+                    &diagnostic_result.evaluation_errors,
+                );
+            }
+            let mut response = diagnostic_result.response;
+            if response.decision {
+                response.context = Some(DecisionContext {
+                    reason: None,
+                    effective_permission: best_permission_for_descriptor(
+                        &self.runtime,
+                        descriptor,
+                        &effective_permissions,
+                    ),
+                    policy_version: None,
+                    checked_roles: Some(checked_roles.clone()),
+                    acr_values: None,
+                });
+            } else {
+                response = with_checked_roles(response, &checked_roles);
+            }
+            responses.push(response);
         }
-
-        Ok(response)
+        Ok(responses)
     }
+}
+
+struct BatchActionPreparation<'a> {
+    runtime: &'a EvaluationRuntime,
+    resource_type: &'a str,
+    effective_permissions: &'a PermissionBits,
+    checked_role_bits: &'a RoleBits,
+    token_present: bool,
+    checked_roles: &'a [String],
+    resource_is_public: bool,
+    session_ctx: Option<&'a SessionContext>,
+    now: DateTime<Utc>,
+}
+
+impl<'a> BatchActionPreparation<'a> {
+    fn prepare<'b>(&'b self, action: &'b Action) -> PreparedBatchAction<'b> {
+        let descriptor = self
+            .runtime
+            .action_descriptor(self.resource_type, &action.name);
+        let decision = descriptor.map_or(ActionPolicyDecision::NoPolicyAllow, |descriptor| {
+            action_policy_decision_for_descriptor(
+                descriptor,
+                self.effective_permissions,
+                self.checked_role_bits,
+                !self.token_present,
+            )
+        });
+        let preliminary_response =
+            if self.token_present && !matches!(decision, ActionPolicyDecision::AllowMatched) {
+                Some(with_checked_roles(
+                    EvaluationResponse::deny_with_reason("token_permission_ceiling"),
+                    self.checked_roles,
+                ))
+            } else if !matches!(decision, ActionPolicyDecision::AllowMatched)
+                && !public_read_is_declared_for_action(
+                    self.runtime,
+                    self.resource_type,
+                    &action.name,
+                    self.resource_is_public,
+                )
+            {
+                let reason = if matches!(decision, ActionPolicyDecision::DenyMatched) {
+                    "deny_matched"
+                } else {
+                    "no_policy_allow"
+                };
+                Some(with_checked_roles(
+                    EvaluationResponse::deny_with_reason(reason),
+                    self.checked_roles,
+                ))
+            } else {
+                step_up_response_for_allowed_request(
+                    self.runtime,
+                    self.resource_type,
+                    &action.name,
+                    self.session_ctx,
+                    self.token_present,
+                    self.now,
+                )
+            };
+        PreparedBatchAction {
+            action,
+            descriptor,
+            preliminary_response,
+        }
+    }
+}
+
+fn repeated_denials(
+    count: usize,
+    reason: &str,
+    checked_roles: &[String],
+) -> Vec<EvaluationResponse> {
+    (0..count)
+        .map(|_| with_checked_roles(EvaluationResponse::deny_with_reason(reason), checked_roles))
+        .collect()
 }
 
 pub(crate) fn record_cedar_diagnostics(
@@ -279,6 +387,27 @@ pub struct LocalEvaluationInput<
     pub request: EvaluationRequest,
     pub subject_access: SubjectAccess,
     pub resource_access: ResourceAccess,
+}
+
+pub struct LocalBatchEvaluationInput<
+    'a,
+    Tenant = String,
+    SubjectAccess = SubjectAccessSnapshot,
+    ResourceAccess = crate::ResourceAccessSnapshot,
+> {
+    pub tenant_id: Tenant,
+    /// Invariant request fields shared by every action. `request.action` is
+    /// ignored; `actions` owns the evaluated action sequence.
+    pub request: EvaluationRequest,
+    pub actions: &'a [Action],
+    pub subject_access: SubjectAccess,
+    pub resource_access: ResourceAccess,
+}
+
+struct PreparedBatchAction<'a> {
+    action: &'a Action,
+    descriptor: Option<&'a CompiledActionDescriptor>,
+    preliminary_response: Option<EvaluationResponse>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,9 +482,24 @@ pub fn action_policy_decision_bits(
     checked_roles: &RoleBits,
     include_role_actions: bool,
 ) -> ActionPolicyDecision {
-    let Some(action_masks) = runtime.action_masks(resource_type, action) else {
+    let Some(descriptor) = runtime.action_descriptor(resource_type, action) else {
         return ActionPolicyDecision::NoPolicyAllow;
     };
+    action_policy_decision_for_descriptor(
+        descriptor,
+        permissions,
+        checked_roles,
+        include_role_actions,
+    )
+}
+
+fn action_policy_decision_for_descriptor(
+    descriptor: &CompiledActionDescriptor,
+    permissions: &PermissionBits,
+    checked_roles: &RoleBits,
+    include_role_actions: bool,
+) -> ActionPolicyDecision {
+    let action_masks = &descriptor.masks;
 
     if permissions.any_intersection(&action_masks.permission_deny) {
         return ActionPolicyDecision::DenyMatched;
@@ -382,37 +526,86 @@ pub fn best_permission_for_action_with_bits(
     action: &str,
     permissions: &PermissionBits,
 ) -> Option<String> {
-    let action_masks = runtime.action_masks(resource_type, action)?;
+    let descriptor = runtime.action_descriptor(resource_type, action)?;
+    best_permission_for_descriptor(runtime, descriptor, permissions)
+}
 
-    let mut best_idx: Option<usize> = None;
-    let mut best_score = 0usize;
-    let mut best_id: Option<&str> = None;
-    permissions.for_each_set_bit(|idx| {
-        if !action_masks.permission_allow.contains(idx)
-            || action_masks.permission_deny.contains(idx)
+fn best_permission_for_descriptor(
+    runtime: &EvaluationRuntime,
+    descriptor: &CompiledActionDescriptor,
+    permissions: &PermissionBits,
+) -> Option<String> {
+    descriptor
+        .best_permission_candidates
+        .iter()
+        .find(|index| permissions.contains(**index))
+        .and_then(|index| runtime.permission_id(*index))
+        .map(ToString::to_string)
+}
+
+#[cfg(test)]
+pub(crate) fn legacy_action_resolution_for_profile(
+    runtime: &EvaluationRuntime,
+    resource_type: &str,
+    action: &str,
+    permissions: &PermissionBits,
+    checked_roles: &RoleBits,
+) -> (ActionPolicyDecision, Option<String>) {
+    let decision = action_policy_decision_bits(
+        runtime,
+        resource_type,
+        action,
+        permissions,
+        checked_roles,
+        true,
+    );
+    let Some(descriptor) = runtime.action_descriptor(resource_type, action) else {
+        return (decision, None);
+    };
+    let mut best_idx = None;
+    let mut best_score = 0;
+    let mut best_id = None;
+    permissions.for_each_set_bit(|index| {
+        if !descriptor.masks.permission_allow.contains(index)
+            || descriptor.masks.permission_deny.contains(index)
         {
             return;
         }
-        let Some(candidate_id) = runtime.permission_id(idx) else {
+        let Some(candidate_id) = runtime.permission_id(index) else {
             return;
         };
-        let candidate_score = runtime.permission_action_score(idx).unwrap_or(0);
-        let should_replace = match (best_idx, best_id) {
-            (None, _) => true,
-            (Some(_), Some(current_id)) => {
-                candidate_score > best_score
-                    || (candidate_score == best_score && candidate_id < current_id)
-            }
-            (Some(_), None) => true,
-        };
-        if should_replace {
-            best_idx = Some(idx);
+        let candidate_score = runtime.permission_action_score(index).unwrap_or(0);
+        if best_idx.is_none()
+            || candidate_score > best_score
+            || (candidate_score == best_score
+                && best_id.is_none_or(|current| candidate_id < current))
+        {
+            best_idx = Some(index);
             best_score = candidate_score;
             best_id = Some(candidate_id);
         }
     });
+    (
+        decision,
+        best_idx.and_then(|index| runtime.permission_id(index).map(ToString::to_string)),
+    )
+}
 
-    best_idx.and_then(|idx| runtime.permission_id(idx).map(ToString::to_string))
+#[cfg(test)]
+pub(crate) fn compiled_action_resolution_for_profile(
+    runtime: &EvaluationRuntime,
+    resource_type: &str,
+    action: &str,
+    permissions: &PermissionBits,
+    checked_roles: &RoleBits,
+) -> (ActionPolicyDecision, Option<String>) {
+    let Some(descriptor) = runtime.action_descriptor(resource_type, action) else {
+        return (ActionPolicyDecision::NoPolicyAllow, None);
+    };
+    (
+        action_policy_decision_for_descriptor(descriptor, permissions, checked_roles, true),
+        best_permission_for_descriptor(runtime, descriptor, permissions),
+    )
 }
 
 #[cfg(test)]
@@ -504,14 +697,7 @@ pub(crate) fn build_internal_context_at(
     );
     authz_map.insert(
         "session_amr".into(),
-        Value::Array(
-            values
-                .session
-                .amr
-                .into_iter()
-                .map(Value::String)
-                .collect(),
-        ),
+        Value::Array(values.session.amr.into_iter().map(Value::String).collect()),
     );
     authz_map.insert(
         "session_auth_age_present".into(),
@@ -519,9 +705,7 @@ pub(crate) fn build_internal_context_at(
     );
     authz_map.insert(
         "session_auth_age_seconds".into(),
-        Value::Number(serde_json::Number::from(
-            values.session.auth_age_seconds,
-        )),
+        Value::Number(serde_json::Number::from(values.session.auth_age_seconds)),
     );
     authz_map.insert(
         "session_mfa_age_present".into(),
@@ -557,8 +741,7 @@ pub(crate) fn build_cedar_internal_context_at(
         .token_resource_filter
         .into_iter()
         .map(|entity| {
-            CedarEntityRef::new(&entity.entity_type, &entity.id)
-                .map_err(AuthzRuntimeError::cedar)
+            CedarEntityRef::new(&entity.entity_type, &entity.id).map_err(AuthzRuntimeError::cedar)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let resource_scopes = values
@@ -754,31 +937,26 @@ fn resource_org(request: &EvaluationRequest) -> Option<&str> {
         })
 }
 
-fn public_read_is_declared(runtime: &EvaluationRuntime, request: &EvaluationRequest) -> bool {
-    if request.action.name != "read" {
+fn public_read_is_declared_for_action(
+    runtime: &EvaluationRuntime,
+    resource_type: &str,
+    action: &str,
+    is_public: bool,
+) -> bool {
+    if action != "read" {
         return false;
     }
-    let Some(resource_type) = runtime
-        .config
-        .get_resource_type(&request.resource.resource_type)
-    else {
+    let Some(resource_type) = runtime.config.get_resource_type(resource_type) else {
         return false;
     };
     if !resource_type
         .actions
         .iter()
-        .any(|action| action.name == request.action.name)
+        .any(|configured_action| configured_action.name == action)
     {
         return false;
     }
-
-    request
-        .resource
-        .properties
-        .as_ref()
-        .and_then(|properties| properties.get("is_public"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+    is_public
 }
 
 fn step_up_response_for_allowed_request(
@@ -893,11 +1071,11 @@ fn allowed_actions_for_resource_bits(
     };
 
     let mut allowed = Vec::new();
-    for (action, masks) in action_map {
-        if !permissions.any_intersection(&masks.permission_allow) {
+    for (action, descriptor) in action_map {
+        if !permissions.any_intersection(&descriptor.masks.permission_allow) {
             continue;
         }
-        if permissions.any_intersection(&masks.permission_deny) {
+        if permissions.any_intersection(&descriptor.masks.permission_deny) {
             continue;
         }
         allowed.push(format!("{resource_type}:{action}"));

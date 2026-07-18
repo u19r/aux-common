@@ -6,7 +6,8 @@ use std::{
 
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-/// Coordinates one active operation per key without imposing a global worker or slot limit.
+/// Coordinates one active operation per key without imposing a global worker or
+/// slot limit.
 #[derive(Clone)]
 pub struct KeyedSingleflight<K> {
     gates: Arc<Mutex<HashMap<K, Weak<AsyncMutex<()>>>>>,
@@ -21,8 +22,7 @@ impl<K> Default for KeyedSingleflight<K> {
 }
 
 impl<K> KeyedSingleflight<K>
-where
-    K: Clone + Eq + Hash,
+where K: Clone + Eq + Hash
 {
     pub async fn lock(&self, key: &K) -> KeyedSingleflightGuard<K> {
         let gate = {

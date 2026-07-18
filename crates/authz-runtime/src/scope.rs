@@ -36,13 +36,7 @@ pub fn classify_scope(scope_type: &str) -> ScopeKind<'_> {
         return ScopeKind::Resource {
             resource_type: scope
                 .get(RESOURCE_PREFIX.len()..)
-                .and_then(|resource_type| {
-                    if resource_type.is_empty() {
-                        None
-                    } else {
-                        Some(resource_type)
-                    }
-                }),
+                .filter(|&resource_type| !resource_type.is_empty()),
         };
     }
 
