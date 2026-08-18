@@ -81,6 +81,8 @@ pub(crate) fn ensure_unique_resource_entity_names(
         "Group",
         "Role",
         "ServiceAccount",
+        "Machine",
+        "Protocol",
         "ApiKey",
         "Org",
         "Tenant",
@@ -135,6 +137,14 @@ fn add_principal_types(schema: &mut serde_json::Value) {
         "shape": { "type": "Record", "attributes": principal_attrs.clone() }
     });
     schema["Authz"]["entityTypes"]["ServiceAccount"] = serde_json::json!({
+        "memberOfTypes": ["Tenant"],
+        "shape": { "type": "Record", "attributes": principal_attrs.clone() }
+    });
+    schema["Authz"]["entityTypes"]["Machine"] = serde_json::json!({
+        "memberOfTypes": ["Tenant"],
+        "shape": { "type": "Record", "attributes": principal_attrs.clone() }
+    });
+    schema["Authz"]["entityTypes"]["Protocol"] = serde_json::json!({
         "memberOfTypes": ["Tenant"],
         "shape": { "type": "Record", "attributes": principal_attrs.clone() }
     });
@@ -244,33 +254,30 @@ fn add_resource_entity_type(
 fn add_action(schema: &mut serde_json::Value, resource_id: &str, action: &str) {
     let action_name = format!("{resource_id}:{action}");
     let resource_entity = to_pascal_case(resource_id);
+    let context_type = format!("{resource_entity}AuthzContext");
 
     let context_schema = serde_json::json!({
         "type": "Record",
         "attributes": {
-            "subject_parents": cedar_attr(
-                serde_json::json!({
-                    "type": "Set",
-                    "element": { "type": "Entity", "name": "Authz::Role" }
-                }),
-                false
-            ),
-            "resource_parents": cedar_attr(
-                serde_json::json!({
-                    "type": "Set",
-                    "element": { "type": "Entity", "name": "Authz::Org" }
-                }),
-                false
-            ),
-            "_authz": cedar_attr(serde_json::json!({ "type": "AuthzContext" }), true)
+            "_authz": cedar_attr(
+                serde_json::json!({ "type": format!("Authz::{context_type}") }),
+                true
+            )
         }
     });
 
-    schema["Authz"]["commonTypes"]["AuthzContext"] = internal_context_schema(&resource_entity);
+    schema["Authz"]["commonTypes"][context_type] = internal_context_schema(&resource_entity);
 
     schema["Authz"]["actions"][action_name] = serde_json::json!({
         "appliesTo": {
-            "principalTypes": ["User", "Group", "Role", "ApiKey"],
+            "principalTypes": [
+                "User",
+                "Group",
+                "Role",
+                "ApiKey",
+                "Machine",
+                "Protocol"
+            ],
             "resourceTypes": [resource_entity],
             "context": context_schema
         }

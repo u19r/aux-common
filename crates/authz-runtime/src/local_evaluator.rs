@@ -4,13 +4,14 @@ use authz_cedar::{
     CedarEntityRef, CedarEvaluationErrorCategory, CedarInternalContext, CedarResourceScope,
     EntityParentRef as CedarEntityParentRef,
     evaluate_batch_frame_action_with_policy_sets_error_diagnostics as cedar_evaluate_batch_frame_action_with_policy_sets_error_diagnostics,
-    prepare_batch_frame_owned_with_registry_and_internal_context as cedar_prepare_batch_frame_owned_with_registry_and_internal_context,
+    prepare_batch_frame_owned_with_registry_and_trusted_internal_context as cedar_prepare_batch_frame_owned_with_registry_and_trusted_internal_context,
 };
 #[cfg(test)]
 use authz_types::CONTEXT_INTERNAL_KEY;
 use authz_types::{
-    Action, DecisionContext, EvaluationRequest, EvaluationResponse, ResourceSelection, RoleScope,
-    SessionContext, TokenContext, TokenScopeType,
+    Action, DecisionContext, EvaluationRequest, EvaluationResponse, JwtContext,
+    MAX_BATCH_EVALUATIONS, ResourceSelection, RoleScope, SessionContext, Subject, SubjectType,
+    TokenContext, TokenScopeType,
 };
 use chrono::{DateTime, Utc};
 #[cfg(test)]
@@ -19,14 +20,85 @@ use serde_json::Value;
 
 use crate::{
     AuthzRuntimeError, AuthzRuntimeResult, EffectiveRoleAssignment, EvaluationRuntime, ParentRef,
-    PermissionBits, RoleBits, ScopedPermissionBits, StepUpEvaluator, StepUpResult,
-    SubjectAccessSnapshot, enrich_request_with_snapshots,
+    PermissionBits, RoleBits, ScopedPermissionBits, SnapshotFreshnessPolicy, StepUpEvaluator,
+    StepUpResult, SubjectAccessSnapshot, enrich_request_with_snapshots_at,
     evaluation_runtime::CompiledActionDescriptor, role_assignment_covers_resource,
 };
 
 #[derive(Debug, Clone)]
 pub struct LocalAuthzEvaluator {
     runtime: Arc<EvaluationRuntime>,
+    snapshot_freshness: SnapshotFreshnessPolicy,
+}
+
+/// Authentication and authorization state that has already been validated by
+/// the application boundary.
+///
+/// `EvaluationRequest` is a wire-shaped value and its JWT, session, and token
+/// fields are caller-owned. They must never be used as proof of identity or
+/// authentication by this storage-free runtime. The application that verifies
+/// those credentials constructs this separate value and passes it alongside
+/// the request. Keeping the fields private prevents accidental mutation after
+/// the trusted boundary; the constructor name makes the provenance obligation
+/// explicit for integrations.
+#[derive(Debug, Clone, Default)]
+pub struct TrustedAuthorizationContext {
+    trusted_subject: Option<TrustedSubject>,
+    jwt_context: Option<JwtContext>,
+    session_context: Option<SessionContext>,
+    token_context: Option<TokenContext>,
+}
+
+#[derive(Debug, Clone)]
+struct TrustedSubject {
+    subject_type: SubjectType,
+    id: String,
+}
+
+impl TrustedAuthorizationContext {
+    /// Construct context for a subject whose credentials the caller has
+    /// already authenticated and validated against its issuer/session store.
+    /// The subject identity is retained and checked before any trusted
+    /// credential is used, preventing a caller from pairing one principal's
+    /// validated claims or token with another principal's request.
+    ///
+    /// This crate intentionally does not know issuer keys, session storage, or
+    /// service-token policy, so it cannot perform that validation itself.
+    #[must_use]
+    pub fn from_validated_parts(
+        subject: &Subject,
+        jwt_context: Option<JwtContext>,
+        session_context: Option<SessionContext>,
+        token_context: Option<TokenContext>,
+    ) -> Self {
+        Self {
+            trusted_subject: Some(TrustedSubject {
+                subject_type: subject.subject_type.clone(),
+                id: subject.id.clone(),
+            }),
+            jwt_context,
+            session_context,
+            token_context,
+        }
+    }
+
+    pub(crate) fn matches_subject(&self, subject: &Subject) -> bool {
+        self.trusted_subject.as_ref().is_none_or(|trusted| {
+            trusted.subject_type == subject.subject_type && trusted.id == subject.id
+        })
+    }
+
+    pub(crate) fn jwt_context(&self) -> Option<&JwtContext> {
+        self.jwt_context.as_ref()
+    }
+
+    pub(crate) fn session_context(&self) -> Option<&SessionContext> {
+        self.session_context.as_ref()
+    }
+
+    pub(crate) fn token_context(&self) -> Option<&TokenContext> {
+        self.token_context.as_ref()
+    }
 }
 
 impl LocalAuthzEvaluator {
@@ -34,11 +106,22 @@ impl LocalAuthzEvaluator {
     pub(crate) fn new(runtime: EvaluationRuntime) -> Self {
         Self {
             runtime: Arc::new(runtime),
+            snapshot_freshness: SnapshotFreshnessPolicy::for_tests(),
         }
     }
 
     pub fn from_arc(runtime: Arc<EvaluationRuntime>) -> Self {
-        Self { runtime }
+        Self::from_arc_with_snapshot_freshness(runtime, SnapshotFreshnessPolicy::default())
+    }
+
+    pub fn from_arc_with_snapshot_freshness(
+        runtime: Arc<EvaluationRuntime>,
+        snapshot_freshness: SnapshotFreshnessPolicy,
+    ) -> Self {
+        Self {
+            runtime,
+            snapshot_freshness,
+        }
     }
 
     pub fn runtime(&self) -> &EvaluationRuntime {
@@ -72,6 +155,7 @@ impl LocalAuthzEvaluator {
             LocalBatchEvaluationInput {
                 tenant_id: input.tenant_id,
                 request: input.request,
+                trusted_context: input.trusted_context,
                 actions: std::slice::from_ref(&action),
                 subject_access: input.subject_access,
                 resource_access: input.resource_access,
@@ -95,25 +179,44 @@ impl LocalAuthzEvaluator {
         if input.actions.is_empty() {
             return Ok(Vec::new());
         }
+        if input.actions.len() > MAX_BATCH_EVALUATIONS {
+            return Err(AuthzRuntimeError::cedar(format!(
+                "batch exceeds maximum of {MAX_BATCH_EVALUATIONS} evaluations"
+            )));
+        }
         let tenant_id = input.tenant_id.borrow();
         let subject_access = input.subject_access.borrow();
         let resource_access = input.resource_access.borrow();
-        let token_context = input.request.token_context.clone();
-        let session_context = input.request.session_context.clone();
-        let token_ctx = token_context.as_ref();
-        let session_ctx = session_context.as_ref();
+        let request = input.request;
+        let mut enriched = enrich_request_with_snapshots_at(
+            tenant_id,
+            request,
+            &input.trusted_context,
+            subject_access,
+            resource_access,
+            now,
+            self.snapshot_freshness,
+        )?;
+        let request = &enriched.request;
+        let token_ctx = request.token_context.as_ref();
+        let session_ctx = request.session_context.as_ref();
         let assignments = subject_access.active_assignments_at(now);
         let scoped = permissions_for_request_bits(
             &self.runtime,
             &assignments,
-            &input.request,
-            &input.request.subject,
+            request,
+            &input.trusted_context,
+            &request.subject,
+            &enriched.subject_parents,
         );
         let checked_roles = self.runtime.role_ids_sorted(&scoped.checked_roles);
         let effective_permissions = if let Some(token_ctx) = token_ctx {
-            let resolved =
-                self.runtime
-                    .resolve_token_permissions_at(&scoped.permissions, token_ctx, now);
+            let resolved = self.runtime.resolve_token_permissions_for_resource_at(
+                &scoped.permissions,
+                token_ctx,
+                token_target_org(request),
+                now,
+            );
             if !resolved.is_valid {
                 let reason = resolved
                     .invalid_reason
@@ -125,7 +228,19 @@ impl LocalAuthzEvaluator {
                     &checked_roles,
                 ));
             }
-            if token_selected_resource_mismatch(token_ctx, &input.request) {
+            if matches!(
+                token_ctx.subject_binding,
+                authz_types::TokenSubjectBinding::Subject
+            ) && (token_ctx.owner_id != request.subject.id
+                || !matches!(request.subject.subject_type, authz_types::SubjectType::User))
+            {
+                return Ok(repeated_denials(
+                    input.actions.len(),
+                    "token_owner_mismatch",
+                    &checked_roles,
+                ));
+            }
+            if token_selected_resource_mismatch(token_ctx, request) {
                 return Ok(repeated_denials(
                     input.actions.len(),
                     "token_resource_scope",
@@ -139,9 +254,14 @@ impl LocalAuthzEvaluator {
         if let Some(token_ctx) = token_ctx
             && let Some(org_id) = token_ctx.scopes.org_id.as_deref()
         {
-            let resource_org = resource_org(&input.request).unwrap_or_default();
+            let resource_org = token_target_org(request).unwrap_or_default();
+            let subject_bound = matches!(
+                token_ctx.subject_binding,
+                authz_types::TokenSubjectBinding::Subject
+            );
             if resource_org != org_id
-                || !token_owner_has_org(&assignments, &token_ctx.owner_id, org_id)
+                || (subject_bound
+                    && !token_owner_has_org(&assignments, &token_ctx.owner_id, org_id))
             {
                 return Ok(repeated_denials(
                     input.actions.len(),
@@ -151,9 +271,8 @@ impl LocalAuthzEvaluator {
             }
         }
 
-        let resource_type = input.request.resource.resource_type.clone();
-        let resource_is_public = input
-            .request
+        let resource_type = request.resource.resource_type.clone();
+        let resource_is_public = request
             .resource
             .properties
             .as_ref()
@@ -205,23 +324,17 @@ impl LocalAuthzEvaluator {
 
         let internal_ctx = build_cedar_internal_context_at(
             &self.runtime,
-            &input.request,
+            request,
             &effective_permissions,
             token_ctx,
             &assignments,
             session_ctx,
             now,
         )?;
-        let mut enriched = enrich_request_with_snapshots(
-            tenant_id,
-            input.request,
-            subject_access,
-            resource_access,
-        )?;
         enriched.request.action = prepared_action;
         let subject_parents = to_cedar_parent_refs(&enriched.subject_parents);
         let resource_parents = to_cedar_parent_refs(&enriched.resource_parents);
-        let prepared = cedar_prepare_batch_frame_owned_with_registry_and_internal_context(
+        let prepared = cedar_prepare_batch_frame_owned_with_registry_and_trusted_internal_context(
             self.runtime.cedar_uids(),
             enriched.request,
             &subject_parents,
@@ -276,20 +389,20 @@ impl LocalAuthzEvaluator {
     }
 }
 
-struct BatchActionPreparation<'a> {
-    runtime: &'a EvaluationRuntime,
-    resource_type: &'a str,
-    effective_permissions: &'a PermissionBits,
-    checked_role_bits: &'a RoleBits,
+struct BatchActionPreparation<'runtime, 'request> {
+    runtime: &'runtime EvaluationRuntime,
+    resource_type: &'request str,
+    effective_permissions: &'request PermissionBits,
+    checked_role_bits: &'request RoleBits,
     token_present: bool,
-    checked_roles: &'a [String],
+    checked_roles: &'request [String],
     resource_is_public: bool,
-    session_ctx: Option<&'a SessionContext>,
+    session_ctx: Option<&'request SessionContext>,
     now: DateTime<Utc>,
 }
 
-impl<'a> BatchActionPreparation<'a> {
-    fn prepare<'b>(&'b self, action: &'b Action) -> PreparedBatchAction<'b> {
+impl<'runtime, 'request> BatchActionPreparation<'runtime, 'request> {
+    fn prepare<'action>(&self, action: &'action Action) -> PreparedBatchAction<'action, 'runtime> {
         let descriptor = self
             .runtime
             .action_descriptor(self.resource_type, &action.name);
@@ -385,6 +498,7 @@ pub struct LocalEvaluationInput<
 > {
     pub tenant_id: Tenant,
     pub request: EvaluationRequest,
+    pub trusted_context: TrustedAuthorizationContext,
     pub subject_access: SubjectAccess,
     pub resource_access: ResourceAccess,
 }
@@ -399,14 +513,15 @@ pub struct LocalBatchEvaluationInput<
     /// Invariant request fields shared by every action. `request.action` is
     /// ignored; `actions` owns the evaluated action sequence.
     pub request: EvaluationRequest,
+    pub trusted_context: TrustedAuthorizationContext,
     pub actions: &'a [Action],
     pub subject_access: SubjectAccess,
     pub resource_access: ResourceAccess,
 }
 
-struct PreparedBatchAction<'a> {
-    action: &'a Action,
-    descriptor: Option<&'a CompiledActionDescriptor>,
+struct PreparedBatchAction<'action, 'runtime> {
+    action: &'action Action,
+    descriptor: Option<&'runtime CompiledActionDescriptor>,
     preliminary_response: Option<EvaluationResponse>,
 }
 
@@ -417,17 +532,34 @@ pub enum ActionPolicyDecision {
     NoPolicyAllow,
 }
 
+/// Resolve the permission ceiling for a request using caller-validated context.
+///
+/// The request remains the source of resource and action identity, but its
+/// credential-bearing fields are intentionally ignored. Callers must pass a
+/// [`TrustedAuthorizationContext`] built after authenticating the JWT, session,
+/// or token against their issuer or session store.
 pub fn permissions_for_request_bits(
     runtime: &EvaluationRuntime,
     assignments: &[EffectiveRoleAssignment],
     request: &EvaluationRequest,
+    trusted_context: &TrustedAuthorizationContext,
     subject: &authz_types::Subject,
+    subject_parents: &[ParentRef],
 ) -> ScopedPermissionBits {
+    if !trusted_context.matches_subject(subject) {
+        return ScopedPermissionBits {
+            permissions: PermissionBits::default(),
+            checked_roles: RoleBits::default(),
+        };
+    }
     let resource_org = resource_org(request);
     let mut permissions = PermissionBits::default();
     let mut checked_roles = RoleBits::default();
 
     for role_assignment in assignments {
+        if !assignment_belongs_to_subject(role_assignment, subject, subject_parents) {
+            continue;
+        }
         let Some(role_idx) = runtime.role_idx(role_assignment.role_id.as_str()) else {
             continue;
         };
@@ -449,13 +581,43 @@ pub fn permissions_for_request_bits(
     if matches!(subject.subject_type, authz_types::SubjectType::Role)
         && let Some(role_idx) = runtime.role_idx(subject.id.as_str())
     {
-        checked_roles.set(role_idx);
-        if let Some(role_permissions) = runtime.role_permissions(role_idx) {
-            permissions.union_with(role_permissions);
+        // A role principal is a compatibility path used by callers that
+        // evaluate a role's tenant-wide policy directly. If the trusted
+        // snapshot contains assignments for that role, those assignments are
+        // authoritative and must belong to this role principal and cover the
+        // requested resource before the role's permissions are considered.
+        // This prevents an out-of-scope role assignment from being bypassed by
+        // the role subject identity.
+        let role_is_scoped = assignments
+            .iter()
+            .any(|assignment| assignment.role_id == subject.id);
+        let role_covers_resource = assignments
+            .iter()
+            .filter(|assignment| assignment.role_id == subject.id)
+            .filter(|assignment| {
+                assignment
+                    .principal_id
+                    .as_deref()
+                    .is_none_or(|principal_id| principal_id == subject.id)
+            })
+            .any(|assignment| {
+                role_assignment_covers_resource(
+                    assignment,
+                    &request.resource.resource_type,
+                    &request.resource.id,
+                    resource_org,
+                )
+            });
+
+        if !role_is_scoped || role_covers_resource {
+            checked_roles.set(role_idx);
+            if let Some(role_permissions) = runtime.role_permissions(role_idx) {
+                permissions.union_with(role_permissions);
+            }
         }
     }
 
-    if let Some(jwt_ctx) = request.jwt_context.as_ref()
+    if let Some(jwt_ctx) = trusted_context.jwt_context()
         && jwt_ctx.is_complete()
     {
         add_jwt_roles_bits(
@@ -472,6 +634,28 @@ pub fn permissions_for_request_bits(
         permissions,
         checked_roles,
     }
+}
+
+fn assignment_belongs_to_subject(
+    assignment: &EffectiveRoleAssignment,
+    subject: &authz_types::Subject,
+    subject_parents: &[ParentRef],
+) -> bool {
+    let Some(principal_id) = assignment.principal_id.as_deref() else {
+        return true;
+    };
+    if principal_id == subject.id {
+        return true;
+    }
+
+    // A group assignment is effective for a user only when the trusted
+    // subject snapshot proves that the user is a member of that exact group.
+    // Other principal types, including role subjects, never inherit through
+    // this compatibility path.
+    matches!(subject.subject_type, authz_types::SubjectType::User)
+        && subject_parents
+            .iter()
+            .any(|parent| parent.ref_type == "group" && parent.id == principal_id)
 }
 
 pub fn action_policy_decision_bits(
@@ -813,9 +997,16 @@ fn internal_context_values_at(
         .map(|token| token_is_valid_at(token, now))
         .unwrap_or(true);
     let token_org_id = token_ctx.and_then(|ctx| ctx.scopes.org_id.clone());
-    let token_owner_org_ids = token_ctx
-        .map(|ctx| token_owner_org_ids_sorted(assignments, &ctx.owner_id))
-        .unwrap_or_default();
+    let token_owner_org_ids = token_ctx.map_or_else(Vec::new, |ctx| {
+        if matches!(
+            ctx.subject_binding,
+            authz_types::TokenSubjectBinding::Delegated
+        ) {
+            ctx.scopes.org_id.iter().cloned().collect()
+        } else {
+            token_owner_org_ids_sorted(assignments, &ctx.owner_id)
+        }
+    });
     let allowed_actions = if token_present {
         allowed_actions_for_resource_bits(
             runtime,
@@ -916,25 +1107,40 @@ fn platform_role_covers_resource(
 fn token_selected_resource_mismatch(token_ctx: &TokenContext, request: &EvaluationRequest) -> bool {
     matches!(token_ctx.scopes.scope_type, TokenScopeType::FineGrained)
         && token_ctx.scopes.fine_grained.as_ref().is_some_and(|fine| {
-            matches!(fine.resource_selection, ResourceSelection::Selected)
-                && !fine.selected_resources.contains(&request.resource.id)
+            if !matches!(fine.resource_selection, ResourceSelection::Selected) {
+                return false;
+            }
+
+            if fine.selected_resources.iter().any(|selected| {
+                selected == &format!("{}:{}", request.resource.resource_type, request.resource.id)
+            }) {
+                return false;
+            }
+
+            let has_bare_id = fine.selected_resources.contains(&request.resource.id);
+            let has_single_resource_type = fine.resource_permissions.len() == 1
+                && fine
+                    .resource_permissions
+                    .contains_key(request.resource.resource_type.as_str());
+            !has_bare_id || !has_single_resource_type
         })
+}
+
+fn token_target_org(request: &EvaluationRequest) -> Option<&str> {
+    if request.resource.resource_type == "organization" {
+        Some(request.resource.id.as_str())
+    } else {
+        resource_org(request)
+    }
 }
 
 fn resource_org(request: &EvaluationRequest) -> Option<&str> {
     request
-        .context
+        .resource
+        .properties
         .as_ref()
-        .and_then(|context| context.attributes.get("org_id"))
+        .and_then(|properties| properties.get("org_id"))
         .and_then(Value::as_str)
-        .or_else(|| {
-            request
-                .resource
-                .properties
-                .as_ref()
-                .and_then(|properties| properties.get("org_id"))
-                .and_then(Value::as_str)
-        })
 }
 
 fn public_read_is_declared_for_action(
@@ -1010,7 +1216,7 @@ fn to_cedar_parent_refs(parents: &[ParentRef]) -> Vec<CedarEntityParentRef> {
 fn token_is_valid_at(token_ctx: &TokenContext, now: DateTime<Utc>) -> bool {
     if token_ctx
         .expires_at
-        .is_some_and(|expires_at| expires_at < now.timestamp())
+        .is_some_and(|expires_at| now.timestamp() >= expires_at)
     {
         return false;
     }
@@ -1105,9 +1311,15 @@ fn internal_token_resource_filter(
     let filter = fine_grained
         .selected_resources
         .iter()
-        .map(|id| InternalEntityRef {
-            entity_type: entity_type.clone(),
-            id: id.clone(),
+        .filter_map(|selected| {
+            let bare_id = (selected == &request.resource.id).then_some(selected.as_str());
+            let typed_id = selected
+                .strip_prefix(&format!("{}:", request.resource.resource_type))
+                .filter(|id| !id.is_empty());
+            bare_id.or(typed_id).map(|id| InternalEntityRef {
+                entity_type: entity_type.clone(),
+                id: id.to_string(),
+            })
         })
         .collect();
     (true, filter)

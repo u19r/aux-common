@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use authz_types::ConfigurationModel;
+use serde_json::Value;
 
 use crate::generate_schema;
 
@@ -39,10 +40,101 @@ fn schema_generation_includes_resources_and_actions() {
     assert!(schema.contains("\"Authz\""));
     assert!(schema.contains("\"entityTypes\""));
     assert!(schema.contains("\"User\""));
+    assert!(schema.contains("\"Machine\""));
+    assert!(schema.contains("\"Protocol\""));
     assert!(schema.contains("\"Document\""));
     assert!(schema.contains("document:read"));
     assert!(schema.contains("classification"));
     assert!(schema.contains("\"required\":true"));
+}
+
+#[test]
+fn given_generated_action_schema_when_reserved_context_keys_are_checked_then_only_authz_is_exposed()
+{
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "read".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![],
+        roles: vec![],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: Vec::new(),
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+    }
+    .into_validated()
+    .expect("valid config");
+
+    let schema = generate_schema(&config).expect("schema");
+
+    assert!(schema.contains("\"_authz\""));
+    assert!(!schema.contains("\"subject_parents\""));
+    assert!(!schema.contains("\"resource_parents\""));
+}
+
+#[test]
+fn multi_resource_schema_keeps_internal_context_bound_to_each_resource() {
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![
+            authz_types::ResourceType {
+                id: "document".into(),
+                name: "Document".into(),
+                description: None,
+                actions: vec![authz_types::ActionDefinition {
+                    name: "read".into(),
+                    description: None,
+                }],
+                context_schema: None,
+            },
+            authz_types::ResourceType {
+                id: "project".into(),
+                name: "Project".into(),
+                description: None,
+                actions: vec![authz_types::ActionDefinition {
+                    name: "read".into(),
+                    description: None,
+                }],
+                context_schema: None,
+            },
+        ],
+        permissions: vec![],
+        roles: vec![],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: Vec::new(),
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+    }
+    .into_validated()
+    .expect("valid config");
+
+    let schema: Value =
+        serde_json::from_str(&generate_schema(&config).expect("schema")).expect("schema JSON");
+    let actions = &schema["Authz"]["actions"];
+    let common_types = &schema["Authz"]["commonTypes"];
+
+    assert_eq!(
+        actions["document:read"]["appliesTo"]["context"]["attributes"]["_authz"]["type"],
+        "Authz::DocumentAuthzContext"
+    );
+    assert_eq!(
+        actions["project:read"]["appliesTo"]["context"]["attributes"]["_authz"]["type"],
+        "Authz::ProjectAuthzContext"
+    );
+    assert!(common_types.get("DocumentAuthzContext").is_some());
+    assert!(common_types.get("ProjectAuthzContext").is_some());
 }
 
 #[test]

@@ -37,6 +37,7 @@ pub(crate) const STATUS_CLASS_ERROR: &str = "error";
 
 pub(crate) const REDIRECT_BLOCKED_METHOD_CHANGE: &str = "redirect_method_change";
 pub(crate) const REDIRECT_BLOCKED_HOST_MISMATCH: &str = "redirect_host_mismatch";
+pub(crate) const REDIRECT_BLOCKED_SCHEME_CHANGE: &str = "redirect_scheme_change";
 pub(crate) const REDIRECT_BLOCKED_TOO_MANY: &str = "redirect_limit_exceeded";
 
 pub(crate) const SSRF_BLOCKED_DOMAIN_NOT_ALLOWLISTED: &str = "domain_not_allowlisted";
@@ -45,7 +46,9 @@ pub(crate) const SSRF_BLOCKED_IP_LITERAL: &str = "ip_literal_host";
 pub(crate) const SSRF_BLOCKED_MISSING_HOST: &str = "missing_host";
 pub(crate) const SSRF_BLOCKED_DNS_FAILURE: &str = "dns_resolution_failed";
 pub(crate) const SSRF_BLOCKED_DNS_EMPTY: &str = "dns_resolution_empty";
+pub(crate) const SSRF_BLOCKED_DNS_TIMEOUT: &str = "dns_resolution_timeout";
 pub(crate) const SSRF_BLOCKED_SCHEME: &str = "disallowed_scheme";
 pub(crate) const SSRF_BLOCKED_USERINFO: &str = "user_info_not_allowed";
 pub(crate) const SSRF_BLOCKED_FRAGMENT: &str = "fragment_not_allowed";
 pub(crate) const SSRF_BLOCKED_PORT: &str = "disallowed_port";
+pub(crate) const SSRF_BLOCKED_HOST_HEADER: &str = "host_header_override";

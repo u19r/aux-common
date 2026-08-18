@@ -50,6 +50,9 @@ pub fn role_assignment_covers_resource(
     resource_org: Option<&str>,
 ) -> bool {
     match assignment.scope_type() {
+        // The public assignment API intentionally defaults an omitted scope to
+        // tenant-wide. Preserve that documented contract for legacy records;
+        // malformed non-tenant scope values still fail closed below.
         None => true,
         Some(scope_type) => match classify_scope(scope_type) {
             ScopeKind::Tenant => true,

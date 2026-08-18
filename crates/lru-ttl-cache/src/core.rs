@@ -8,6 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use tokio::task::AbortHandle;
+
 #[derive(Clone)]
 pub(super) struct CacheCore<K, V> {
     inner: Arc<Mutex<CacheInner<K, V>>>,
@@ -49,6 +51,10 @@ where
         self.disabled
     }
 
+    pub(super) fn coordination_capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub(super) fn insert(&self, key: K, value: V) {
         self.insert_with_ttl(key, value, self.ttl);
     }
@@ -56,21 +62,30 @@ where
     pub(super) fn insert_with_ttl(&self, key: K, value: V, ttl: Duration) {
         let mut inner = self.lock_inner();
         if self.disabled || ttl.is_zero() {
-            inner.entries.remove(&key);
+            if let Some(entry) = inner.entries.remove(&key) {
+                entry.cancel_refresh();
+            }
             return;
         }
         inner.evict_if_needed(&key, self.capacity);
         let access_order = self.next_access_order();
-        inner
+        if let Some(entry) = inner
             .entries
-            .insert(key, CacheEntry::new(value, ttl, access_order));
+            .insert(key, CacheEntry::new(value, ttl, access_order))
+        {
+            entry.cancel_refresh();
+        }
     }
 
     pub(super) fn remove(&self, key: &K) -> Option<V> {
-        self.lock_inner()
-            .entries
-            .remove(key)
-            .map(|entry| entry.value().clone())
+        let entry = self.lock_inner().entries.remove(key);
+        if let Some(entry) = entry {
+            let value = entry.value().clone();
+            entry.cancel_refresh();
+            Some(value)
+        } else {
+            None
+        }
     }
 
     pub(super) fn apply_refresh_if_current(
@@ -101,6 +116,16 @@ where
         true
     }
 
+    pub(super) fn restore_entry_if_missing(&self, key: &K, entry: &CacheEntry<V>) -> bool {
+        let mut inner = self.lock_inner();
+        if inner.entries.contains_key(key) {
+            return false;
+        }
+        inner.evict_if_needed(key, self.capacity);
+        inner.entries.insert(key.clone(), entry.clone());
+        true
+    }
+
     pub(super) fn inspect_entry(&self, key: &K) -> EntryState<V> {
         if self.disabled {
             self.record_miss();
@@ -114,7 +139,9 @@ where
         };
         let entry = entry_ref.clone();
         if entry.is_expired_at(Instant::now()) {
-            inner.entries.remove(key);
+            if let Some(entry) = inner.entries.remove(key) {
+                entry.cancel_refresh();
+            }
             self.record_miss();
             return EntryState::Expired;
         }
@@ -132,7 +159,9 @@ where
         let mut inner = self.lock_inner();
         let entry = inner.entries.get(key)?.clone();
         if entry.is_expired_at(Instant::now()) {
-            inner.entries.remove(key);
+            if let Some(entry) = inner.entries.remove(key) {
+                entry.cancel_refresh();
+            }
             return None;
         }
         entry.touch(self.next_access_order());
@@ -164,7 +193,9 @@ where
             return EntryState::Stale(entry);
         }
 
-        inner.entries.remove(key);
+        if let Some(entry) = inner.entries.remove(key) {
+            entry.cancel_refresh();
+        }
         self.record_miss();
         EntryState::Expired
     }
@@ -232,8 +263,10 @@ where K: Eq + Hash + Clone
             })
             .map(|(key, _)| key.clone());
 
-        if let Some(key) = key_to_remove {
-            self.entries.remove(&key);
+        if let Some(key) = key_to_remove
+            && let Some(entry) = self.entries.remove(&key)
+        {
+            entry.cancel_refresh();
         }
     }
 }
@@ -249,6 +282,8 @@ struct EntryInner<V> {
     expires_at: Instant,
     last_access_order: AtomicU64,
     refreshing: AtomicBool,
+    refresh_cancelled: AtomicBool,
+    refresh_handle: Mutex<Option<AbortHandle>>,
 }
 
 impl<V> CacheEntry<V> {
@@ -262,6 +297,8 @@ impl<V> CacheEntry<V> {
                 expires_at,
                 last_access_order: AtomicU64::new(access_order),
                 refreshing: AtomicBool::new(false),
+                refresh_cancelled: AtomicBool::new(false),
+                refresh_handle: Mutex::new(None),
             }),
         }
     }
@@ -270,7 +307,7 @@ impl<V> CacheEntry<V> {
         now >= self.inner.expires_at
     }
 
-    fn is_stale_at(&self, now: Instant, stale_ttl: Duration) -> bool {
+    pub(super) fn is_stale_at(&self, now: Instant, stale_ttl: Duration) -> bool {
         if stale_ttl.is_zero() {
             return false;
         }
@@ -295,14 +332,35 @@ impl<V> CacheEntry<V> {
     }
 
     pub(super) fn begin_refresh(&self) -> bool {
-        self.inner
+        let started = self
+            .inner
             .refreshing
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .is_ok();
+        if started {
+            self.inner.refresh_cancelled.store(false, Ordering::Release);
+        }
+        started
     }
 
     pub(super) fn finish_refresh(&self) {
         self.inner.refreshing.store(false, Ordering::Release);
+        lock_unpoisoned(&self.inner.refresh_handle).take();
+    }
+
+    pub(super) fn install_refresh_handle(&self, handle: AbortHandle) {
+        if self.inner.refresh_cancelled.load(Ordering::Acquire) {
+            handle.abort();
+            return;
+        }
+        *lock_unpoisoned(&self.inner.refresh_handle) = Some(handle);
+    }
+
+    pub(super) fn cancel_refresh(&self) {
+        self.inner.refresh_cancelled.store(true, Ordering::Release);
+        if let Some(handle) = lock_unpoisoned(&self.inner.refresh_handle).take() {
+            handle.abort();
+        }
     }
 
     fn is_same_entry(&self, other: &Self) -> bool {
@@ -311,6 +369,13 @@ impl<V> CacheEntry<V> {
 
     pub(super) fn value(&self) -> &V {
         &self.inner.value
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 

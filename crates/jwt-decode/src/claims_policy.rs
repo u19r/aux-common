@@ -119,7 +119,7 @@ impl<'a> ClaimsPolicy<'a> {
     fn validate_time(&self, claims: &RegisteredClaims) -> Result<()> {
         let now = Self::unix_seconds(self.now)?;
         let leeway = Self::duration_seconds(self.policy.leeway, "leeway")?;
-        if claims.exp.checked_add(leeway).is_none_or(|exp| exp < now) {
+        if claims.exp.checked_add(leeway).is_none_or(|exp| exp <= now) {
             return Err(JwtDecodeError::new(JwtDecodeErrorKind::Expired));
         }
         if claims
@@ -143,7 +143,7 @@ impl<'a> ClaimsPolicy<'a> {
     fn validate_time_refs(&self, claims: &RegisteredClaimRefs<'_>) -> Result<()> {
         let now = Self::unix_seconds(self.now)?;
         let leeway = Self::duration_seconds(self.policy.leeway, "leeway")?;
-        if claims.exp.checked_add(leeway).is_none_or(|exp| exp < now) {
+        if claims.exp.checked_add(leeway).is_none_or(|exp| exp <= now) {
             return Err(JwtDecodeError::new(JwtDecodeErrorKind::Expired));
         }
         if claims

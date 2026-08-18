@@ -5,8 +5,11 @@ use std::{
 
 use crate::{
     CounterMetric, GaugeMetric, HistogramMetric, MetricLabel, MetricsCrateFacade, MetricsFacade,
-    counter, gauge, histogram, metrics_crate_facade_cache_snapshot, set_metrics_facade,
+    counter, gauge, histogram, metrics_crate_facade_cache_snapshot,
+    recorder::MAX_METRIC_LABEL_VALUE_BYTES, set_metrics_facade,
 };
+
+const EXPECTED_CACHE_LIMIT: usize = 256;
 
 #[test]
 fn authz_projection_operation_metric_has_stable_name() {
@@ -127,6 +130,42 @@ fn storage_cache_metric_names_match_expected_ddb_operation_pattern() {
     assert_eq!(
         GaugeMetric::StorageDdbCacheHitRatioMetric.name(),
         "ddb.cache.hit.ratio"
+    );
+    assert_eq!(
+        GaugeMetric::MetricFederatedProvisionEnabledSources.name(),
+        "authn.federated.provision_enabled_sources"
+    );
+}
+
+#[test]
+fn limits_capacity_metric_names_are_stable() {
+    assert_eq!(
+        CounterMetric::LimitsExpiryReclaimedTotal.name(),
+        "limits.expiry.reclaimed.total"
+    );
+    assert_eq!(
+        CounterMetric::LimitsExpiryRowsScannedTotal.name(),
+        "limits.expiry.rows.scanned.total"
+    );
+    assert_eq!(
+        CounterMetric::LimitsExpirySweepsTotal.name(),
+        "limits.expiry.sweeps.total"
+    );
+    assert_eq!(
+        CounterMetric::LimitsTransitionConflictsTotal.name(),
+        "limits.transition.conflicts.total"
+    );
+    assert_eq!(
+        CounterMetric::LimitsTransitionTotal.name(),
+        "limits.transition.total"
+    );
+    assert_eq!(
+        HistogramMetric::LimitsExpirySweepDurationMs.name(),
+        "limits.expiry.sweep.duration.ms"
+    );
+    assert_eq!(
+        HistogramMetric::LimitsTransitionDurationMs.name(),
+        "limits.transition.duration.ms"
     );
 }
 
@@ -254,4 +293,41 @@ fn metrics_crate_facade_reuses_thread_local_handles() {
 
     let after = metrics_crate_facade_cache_snapshot();
     assert_eq!(after.histograms - before.histograms, 1);
+}
+
+#[test]
+fn dynamic_metric_labels_do_not_grow_the_thread_local_cache_without_bound() {
+    let _guard = METRICS_FACADE_TEST_LOCK.lock().unwrap();
+    let facade = MetricsCrateFacade;
+
+    for index in 0..=EXPECTED_CACHE_LIMIT {
+        facade.record_histogram(
+            HistogramMetric::StorageOperationLatencyMsMetric,
+            &[MetricLabel::new("operation", format!("untrusted-{index}"))],
+            1.0,
+        );
+    }
+
+    let (_, _, histogram_cache_size) =
+        crate::recorder::metrics_crate_facade_thread_local_cache_sizes();
+    assert!(
+        histogram_cache_size <= EXPECTED_CACHE_LIMIT,
+        "dynamic label cache retained {histogram_cache_size} entries"
+    );
+}
+
+#[test]
+fn oversized_metric_labels_are_dropped_before_facade_dispatch() {
+    let _guard = METRICS_FACADE_TEST_LOCK.lock().unwrap();
+    let facade = CapturingMetricsFacade::default();
+    let previous = set_metrics_facade(Arc::new(facade.clone()));
+
+    histogram!(
+        HistogramMetric::StorageOperationLatencyMsMetric,
+        "operation" => "x".repeat(MAX_METRIC_LABEL_VALUE_BYTES + 1)
+    )
+    .record(1.0);
+
+    assert!(facade.calls().is_empty());
+    set_metrics_facade(previous);
 }

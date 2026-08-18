@@ -1,14 +1,16 @@
 use std::{
     collections::{HashMap, HashSet},
     hint::black_box,
+    sync::Arc,
     time::Instant,
 };
 
 use alloc_counter::AllocationGuard;
 use authz_types::{
     Action, ConfigurationModel, Context, EvaluationRequest, FineGrainedScopes, JwtContext,
-    PermissionActionRef, PermissionId, Resource, ResourceSelection, RoleAssignment, RoleScope,
-    Scope, ScopeMappingEntry, Subject, TokenContext, TokenScopeConfig,
+    MAX_BATCH_EVALUATIONS, PermissionActionRef, PermissionId, Resource, ResourceSelection,
+    RoleAssignment, RoleScope, Scope, ScopeMappingEntry, Subject, TokenContext, TokenScopeConfig,
+    TokenSubjectBinding,
 };
 use chrono::{TimeZone, Utc};
 use serde_json::json;
@@ -16,9 +18,9 @@ use serde_json::json;
 use crate::{
     ActionPolicyDecision, EffectiveRoleAssignment, EvaluationRuntime, LocalAuthzEvaluator,
     LocalBatchEvaluationInput, LocalEvaluationInput, ParentRef, ResourceAccessSnapshot,
-    SubjectAccessSnapshot, action_policy_decision_bits, build_subject_parent_template,
-    enrich_request_with_snapshots, local_evaluator::inject_internal_context,
-    permissions_for_request_bits,
+    SnapshotFreshnessPolicy, SubjectAccessSnapshot, TrustedAuthorizationContext,
+    action_policy_decision_bits, build_subject_parent_template,
+    local_evaluator::inject_internal_context, permissions_for_request_bits,
 };
 
 fn prepare_legacy_internal_context(
@@ -31,22 +33,27 @@ fn prepare_legacy_internal_context(
         runtime,
         &assignments,
         &input.request,
+        &input.trusted_context,
         &input.request.subject,
+        &input.subject_access.subject_parents,
     );
     let internal = crate::local_evaluator::build_internal_context_at(
         runtime,
         &input.request,
         &scoped.permissions,
-        input.request.token_context.as_ref(),
+        input.trusted_context.token_context(),
         &assignments,
-        input.request.session_context.as_ref(),
+        input.trusted_context.session_context(),
         now,
     );
-    let mut enriched = enrich_request_with_snapshots(
+    let mut enriched = crate::enrich_request_with_snapshots_at(
         &input.tenant_id,
         input.request.clone(),
+        &input.trusted_context,
         &input.subject_access,
         &input.resource_access,
+        now,
+        crate::SnapshotFreshnessPolicy::for_tests(),
     )
     .expect("legacy enrichment");
     inject_internal_context(&mut enriched.request, internal);
@@ -66,7 +73,7 @@ fn prepare_legacy_internal_context(
             parent_id: parent.id.clone(),
         })
         .collect::<Vec<_>>();
-    authz_cedar::prepare_evaluation_owned_with_parents(
+    authz_cedar::prepare_evaluation_owned_with_trusted_parents(
         enriched.request,
         &subject_parents,
         &resource_parents,
@@ -84,23 +91,28 @@ fn prepare_typed_internal_context(
         runtime,
         &assignments,
         &input.request,
+        &input.trusted_context,
         &input.request.subject,
+        &input.subject_access.subject_parents,
     );
     let internal = crate::local_evaluator::build_cedar_internal_context_at(
         runtime,
         &input.request,
         &scoped.permissions,
-        input.request.token_context.as_ref(),
+        input.trusted_context.token_context(),
         &assignments,
-        input.request.session_context.as_ref(),
+        input.trusted_context.session_context(),
         now,
     )
     .expect("typed internal context");
-    let enriched = enrich_request_with_snapshots(
+    let enriched = crate::enrich_request_with_snapshots_at(
         &input.tenant_id,
         input.request.clone(),
+        &input.trusted_context,
         &input.subject_access,
         &input.resource_access,
+        now,
+        crate::SnapshotFreshnessPolicy::for_tests(),
     )
     .expect("typed enrichment");
     let subject_parents = enriched
@@ -119,7 +131,7 @@ fn prepare_typed_internal_context(
             parent_id: parent.id.clone(),
         })
         .collect::<Vec<_>>();
-    authz_cedar::prepare_evaluation_owned_with_registry_and_internal_context(
+    authz_cedar::prepare_evaluation_owned_with_registry_and_trusted_internal_context(
         runtime.cedar_uids(),
         enriched.request,
         &subject_parents,
@@ -234,8 +246,15 @@ fn build_subject_parent_template_dedupes_parents_and_tracks_resource_scopes() {
 #[test]
 fn enrich_request_with_snapshots_injects_org_properties_without_storage() {
     let request = EvaluationRequest {
-        subject: Subject::user("user_1"),
-        resource: Resource::new("document", "doc_1"),
+        subject: Subject::user("user_1").with_properties(json!({
+            "org_id": "caller_org",
+            "group_id": "caller_group"
+        })),
+        resource: Resource::new("document", "doc_1").with_properties(json!({
+            "org_id": "caller_org",
+            "is_public": true,
+            "owner_id": "caller_owner"
+        })),
         action: Action::new("read"),
         context: None,
         jwt_context: None,
@@ -243,30 +262,51 @@ fn enrich_request_with_snapshots_injects_org_properties_without_storage() {
         token_context: None,
     };
     let subject_access = SubjectAccessSnapshot {
-        subject: Subject::user("user_1"),
+        tenant_id: "tenant_1".to_string(),
+        subject: Subject::user("user_1").with_properties(json!({
+            "org_id": "org_1",
+            "group_id": "group_1"
+        })),
         assignments: Vec::new(),
         subject_parents: vec![parent("org", "org_1")],
         resource_scopes: HashMap::new(),
         fetched_at_ms: 1,
     };
     let resource_access = ResourceAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
         resource_type: "document".to_string(),
         resource_id: "doc_1".to_string(),
+        properties: json!({
+            "org_id": "org_2",
+            "is_public": false,
+            "owner_id": "owner_2"
+        }),
         resource_parents: vec![parent("org", "org_2")],
         fetched_at_ms: 1,
     };
 
-    let enriched =
-        enrich_request_with_snapshots("tenant_1", request, &subject_access, &resource_access)
-            .expect("snapshot enrichment should succeed");
+    let enriched = crate::enrich_request_with_snapshots_at(
+        "tenant_1",
+        request,
+        &TrustedAuthorizationContext::default(),
+        &subject_access,
+        &resource_access,
+        Utc::now(),
+        crate::SnapshotFreshnessPolicy::for_tests(),
+    )
+    .expect("snapshot enrichment should succeed");
 
     assert_eq!(
         enriched.request.subject.properties,
-        Some(json!({ "org_id": "org_1" }))
+        Some(json!({ "org_id": "org_1", "group_id": "group_1" }))
     );
     assert_eq!(
         enriched.request.resource.properties,
-        Some(json!({ "org_id": "org_2" }))
+        Some(json!({
+            "org_id": "org_2",
+            "is_public": false,
+            "owner_id": "owner_2"
+        }))
     );
 }
 
@@ -282,6 +322,7 @@ fn enrich_request_with_snapshots_rejects_mismatched_resource_snapshot() {
         token_context: None,
     };
     let subject_access = SubjectAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
         subject: Subject::user("user_1"),
         assignments: Vec::new(),
         subject_parents: Vec::new(),
@@ -289,19 +330,183 @@ fn enrich_request_with_snapshots_rejects_mismatched_resource_snapshot() {
         fetched_at_ms: 1,
     };
     let resource_access = ResourceAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
         resource_type: "document".to_string(),
         resource_id: "doc_2".to_string(),
+        properties: json!({}),
         resource_parents: Vec::new(),
         fetched_at_ms: 1,
     };
 
-    let error =
-        enrich_request_with_snapshots("tenant_1", request, &subject_access, &resource_access)
-            .expect_err("wrong resource snapshot should fail closed");
+    let error = crate::enrich_request_with_snapshots_at(
+        "tenant_1",
+        request,
+        &TrustedAuthorizationContext::default(),
+        &subject_access,
+        &resource_access,
+        Utc::now(),
+        crate::SnapshotFreshnessPolicy::for_tests(),
+    )
+    .expect_err("wrong resource snapshot should fail closed");
 
     assert!(matches!(
         error,
         crate::AuthzRuntimeError::ResourceSnapshotMismatch
+    ));
+}
+
+#[test]
+fn enrich_request_with_snapshots_rejects_stale_subject_snapshot() {
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let subject_access = SubjectAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
+        subject: Subject::user("user_1"),
+        assignments: Vec::new(),
+        subject_parents: Vec::new(),
+        resource_scopes: HashMap::new(),
+        fetched_at_ms: 1_000,
+    };
+    let resource_access = ResourceAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
+        resource_type: "document".to_string(),
+        resource_id: "doc_1".to_string(),
+        properties: json!({}),
+        resource_parents: Vec::new(),
+        fetched_at_ms: 600_000,
+    };
+
+    let error = crate::enrich_request_with_snapshots_at(
+        "tenant_1",
+        request,
+        &TrustedAuthorizationContext::default(),
+        &subject_access,
+        &resource_access,
+        Utc.timestamp_millis_opt(600_000)
+            .single()
+            .expect("test timestamp"),
+        SnapshotFreshnessPolicy::new(
+            std::time::Duration::from_millis(5_000),
+            std::time::Duration::from_millis(30),
+        ),
+    )
+    .expect_err("stale subject snapshot must fail closed");
+
+    assert!(matches!(
+        error,
+        crate::AuthzRuntimeError::SnapshotStale {
+            snapshot: "subject"
+        }
+    ));
+}
+
+#[test]
+fn enrich_request_with_snapshots_rejects_future_resource_snapshot() {
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let subject_access = SubjectAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
+        subject: Subject::user("user_1"),
+        assignments: Vec::new(),
+        subject_parents: Vec::new(),
+        resource_scopes: HashMap::new(),
+        fetched_at_ms: 100_000,
+    };
+    let resource_access = ResourceAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
+        resource_type: "document".to_string(),
+        resource_id: "doc_1".to_string(),
+        properties: json!({}),
+        resource_parents: Vec::new(),
+        fetched_at_ms: 100_200,
+    };
+
+    let error = crate::enrich_request_with_snapshots_at(
+        "tenant_1",
+        request,
+        &TrustedAuthorizationContext::default(),
+        &subject_access,
+        &resource_access,
+        Utc.timestamp_millis_opt(100_000)
+            .single()
+            .expect("test timestamp"),
+        SnapshotFreshnessPolicy::new(
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_millis(30),
+        ),
+    )
+    .expect_err("future resource snapshot must fail closed");
+
+    assert!(matches!(
+        error,
+        crate::AuthzRuntimeError::SnapshotTimestampInvalid {
+            snapshot: "resource"
+        }
+    ));
+}
+
+#[test]
+fn local_evaluator_default_policy_rejects_stale_snapshots() {
+    let evaluator = LocalAuthzEvaluator::from_arc(Arc::new(runtime_with_read_role()));
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let now = Utc
+        .timestamp_millis_opt(600_000)
+        .single()
+        .expect("test timestamp");
+    let error = evaluator
+        .evaluate_at(
+            LocalEvaluationInput {
+                tenant_id: "tenant_1".to_string(),
+                request,
+                trusted_context: TrustedAuthorizationContext::default(),
+                subject_access: SubjectAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    subject: Subject::user("user_1"),
+                    assignments: Vec::new(),
+                    subject_parents: Vec::new(),
+                    resource_scopes: HashMap::new(),
+                    fetched_at_ms: 1,
+                },
+                resource_access: ResourceAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    resource_type: "document".to_string(),
+                    resource_id: "doc_1".to_string(),
+                    properties: json!({}),
+                    resource_parents: Vec::new(),
+                    fetched_at_ms: 600_000,
+                },
+            },
+            now,
+        )
+        .expect_err("default evaluator policy must reject stale snapshots");
+
+    assert!(matches!(
+        error,
+        crate::AuthzRuntimeError::SnapshotStale {
+            snapshot: "subject"
+        }
     ));
 }
 
@@ -345,6 +550,7 @@ fn typed_internal_context_preserves_non_object_context_normalization() {
             LocalEvaluationInput {
                 tenant_id: "tenant_1".to_string(),
                 subject_access: SubjectAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
                     subject: request.subject.clone(),
                     assignments: vec![assignment("reader", Some("tenant"), None)],
                     subject_parents: vec![parent("role", "reader"), parent("tenant", "tenant_1")],
@@ -352,12 +558,15 @@ fn typed_internal_context_preserves_non_object_context_normalization() {
                     fetched_at_ms: 1,
                 },
                 resource_access: ResourceAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
                     resource_type: "document".to_string(),
                     resource_id: "doc_1".to_string(),
+                    properties: json!({}),
                     resource_parents: vec![parent("tenant", "tenant_1")],
                     fetched_at_ms: 1,
                 },
                 request,
+                trusted_context: TrustedAuthorizationContext::default(),
             },
             now,
         )
@@ -373,6 +582,7 @@ fn effective_assignments_filter_expired_entries_at_supplied_clock() {
         .single()
         .expect("test timestamp should be valid");
     let snapshot = SubjectAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
         subject: Subject::user("user_1"),
         assignments: vec![
             assignment("role_active", Some("tenant"), None),
@@ -414,7 +624,14 @@ fn incomplete_jwt_context_cannot_grant_role_permissions() {
         token_context: None,
     };
 
-    let scoped = permissions_for_request_bits(&runtime, &[], &request, &subject);
+    let scoped = permissions_for_request_bits(
+        &runtime,
+        &[],
+        &request,
+        &TrustedAuthorizationContext::default(),
+        &subject,
+        &[],
+    );
     let decision = action_policy_decision_bits(
         &runtime,
         "document",
@@ -447,7 +664,19 @@ fn complete_jwt_context_can_grant_role_permissions() {
         token_context: None,
     };
 
-    let scoped = permissions_for_request_bits(&runtime, &[], &request, &subject);
+    let scoped = permissions_for_request_bits(
+        &runtime,
+        &[],
+        &request,
+        &TrustedAuthorizationContext::from_validated_parts(
+            &subject,
+            request.jwt_context.clone(),
+            None,
+            None,
+        ),
+        &subject,
+        &[],
+    );
     let decision = action_policy_decision_bits(
         &runtime,
         "document",
@@ -458,6 +687,585 @@ fn complete_jwt_context_can_grant_role_permissions() {
     );
 
     assert_eq!(decision, ActionPolicyDecision::AllowMatched);
+}
+
+#[test]
+fn local_evaluator_ignores_wire_jwt_context_without_trusted_context() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
+    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("read"),
+        context: None,
+        // This is deliberately a complete-looking but unverified wire value.
+        jwt_context: Some(JwtContext {
+            roles: vec![RoleAssignment {
+                role_id: "reader".to_string(),
+                scope: RoleScope::Global,
+            }],
+            ..JwtContext::default()
+        }),
+        session_context: None,
+        token_context: None,
+    };
+    let response = evaluator
+        .evaluate_at(
+            LocalEvaluationInput {
+                tenant_id: "tenant_1".to_string(),
+                request,
+                trusted_context: TrustedAuthorizationContext::default(),
+                subject_access: SubjectAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    subject: Subject::user("user_1"),
+                    assignments: Vec::new(),
+                    subject_parents: Vec::new(),
+                    resource_scopes: HashMap::new(),
+                    fetched_at_ms: 1,
+                },
+                resource_access: ResourceAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    resource_type: "document".to_string(),
+                    resource_id: "doc_1".to_string(),
+                    properties: json!({}),
+                    resource_parents: Vec::new(),
+                    fetched_at_ms: 1,
+                },
+            },
+            now,
+        )
+        .expect("evaluation");
+
+    assert!(
+        !response.decision,
+        "wire JWT claims must not become Cedar role parents without validation"
+    );
+}
+
+#[test]
+fn local_evaluator_accepts_jwt_only_when_context_is_explicitly_trusted() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
+    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let jwt_context = JwtContext {
+        roles: vec![RoleAssignment {
+            role_id: "reader".to_string(),
+            scope: RoleScope::Global,
+        }],
+        ..JwtContext::default()
+    };
+    let response = evaluator
+        .evaluate_at(
+            LocalEvaluationInput {
+                tenant_id: "tenant_1".to_string(),
+                request: EvaluationRequest {
+                    subject: Subject::user("user_1"),
+                    resource: Resource::new("document", "doc_1"),
+                    action: Action::new("read"),
+                    context: None,
+                    jwt_context: None,
+                    session_context: None,
+                    token_context: None,
+                },
+                trusted_context: TrustedAuthorizationContext::from_validated_parts(
+                    &Subject::user("user_1"),
+                    Some(jwt_context),
+                    None,
+                    None,
+                ),
+                subject_access: SubjectAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    subject: Subject::user("user_1"),
+                    assignments: Vec::new(),
+                    subject_parents: Vec::new(),
+                    resource_scopes: HashMap::new(),
+                    fetched_at_ms: 1,
+                },
+                resource_access: ResourceAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    resource_type: "document".to_string(),
+                    resource_id: "doc_1".to_string(),
+                    properties: json!({}),
+                    resource_parents: Vec::new(),
+                    fetched_at_ms: 1,
+                },
+            },
+            now,
+        )
+        .expect("evaluation");
+
+    assert!(
+        response.decision,
+        "validated JWT roles should still be usable"
+    );
+}
+
+#[test]
+fn trusted_context_bound_to_another_subject_is_rejected() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
+    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let jwt_context = JwtContext {
+        roles: vec![RoleAssignment {
+            role_id: "reader".to_string(),
+            scope: RoleScope::Global,
+        }],
+        ..JwtContext::default()
+    };
+
+    let result = evaluator.evaluate_at(
+        LocalEvaluationInput {
+            tenant_id: "tenant_1".to_string(),
+            request: EvaluationRequest {
+                subject: Subject::user("user_2"),
+                resource: Resource::new("document", "doc_1"),
+                action: Action::new("read"),
+                context: None,
+                jwt_context: None,
+                session_context: None,
+                token_context: None,
+            },
+            trusted_context: TrustedAuthorizationContext::from_validated_parts(
+                &Subject::user("user_1"),
+                Some(jwt_context),
+                None,
+                None,
+            ),
+            subject_access: SubjectAccessSnapshot {
+                tenant_id: "tenant_1".to_string(),
+                subject: Subject::user("user_2"),
+                assignments: Vec::new(),
+                subject_parents: Vec::new(),
+                resource_scopes: HashMap::new(),
+                fetched_at_ms: 1,
+            },
+            resource_access: ResourceAccessSnapshot {
+                tenant_id: "tenant_1".to_string(),
+                resource_type: "document".to_string(),
+                resource_id: "doc_1".to_string(),
+                properties: json!({}),
+                resource_parents: Vec::new(),
+                fetched_at_ms: 1,
+            },
+        },
+        now,
+    );
+
+    assert!(matches!(
+        result,
+        Err(crate::AuthzRuntimeError::TrustedContextSubjectMismatch)
+    ));
+}
+
+#[test]
+fn snapshot_enrichment_ignores_wire_jwt_context_without_trusted_context() {
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: Some(JwtContext {
+            roles: vec![RoleAssignment {
+                role_id: "reader".to_string(),
+                scope: RoleScope::Global,
+            }],
+            ..JwtContext::default()
+        }),
+        session_context: None,
+        token_context: None,
+    };
+    let subject_access = SubjectAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
+        subject: Subject::user("user_1"),
+        assignments: Vec::new(),
+        subject_parents: Vec::new(),
+        resource_scopes: HashMap::new(),
+        fetched_at_ms: 1,
+    };
+    let resource_access = ResourceAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
+        resource_type: "document".to_string(),
+        resource_id: "doc_1".to_string(),
+        properties: json!({}),
+        resource_parents: Vec::new(),
+        fetched_at_ms: 1,
+    };
+
+    let enriched = crate::enrich_request_with_snapshots_at(
+        "tenant_1",
+        request,
+        &TrustedAuthorizationContext::default(),
+        &subject_access,
+        &resource_access,
+        Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        SnapshotFreshnessPolicy::for_tests(),
+    )
+    .expect("snapshot enrichment");
+
+    assert!(
+        enriched.subject_parents.is_empty(),
+        "wire JWT roles must not become trusted subject parents"
+    );
+}
+
+#[test]
+fn mismatched_jwt_resource_roles_are_not_added_to_cedar_parents() {
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: Some(JwtContext {
+            roles: vec![RoleAssignment {
+                role_id: "reader".to_string(),
+                scope: RoleScope::Resource {
+                    resource_type: "document".to_string(),
+                    resource_id: "doc_2".to_string(),
+                },
+            }],
+            ..JwtContext::default()
+        }),
+        session_context: None,
+        token_context: None,
+    };
+    let subject_access = SubjectAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
+        subject: request.subject.clone(),
+        assignments: Vec::new(),
+        subject_parents: Vec::new(),
+        resource_scopes: HashMap::new(),
+        fetched_at_ms: 1,
+    };
+    let resource_access = ResourceAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
+        resource_type: "document".to_string(),
+        resource_id: "doc_1".to_string(),
+        properties: json!({}),
+        resource_parents: Vec::new(),
+        fetched_at_ms: 1,
+    };
+
+    let enriched = crate::enrich_request_with_snapshots_at(
+        "tenant_1",
+        request,
+        &TrustedAuthorizationContext::default(),
+        &subject_access,
+        &resource_access,
+        Utc::now(),
+        crate::SnapshotFreshnessPolicy::for_tests(),
+    )
+    .expect("snapshot enrichment");
+    assert!(
+        !enriched
+            .subject_parents
+            .iter()
+            .any(|parent| parent.ref_type == "role" && parent.id == "reader")
+    );
+}
+
+#[test]
+fn off_scope_snapshot_role_parent_cannot_grant_a_tenant_role() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let response = evaluator
+        .evaluate_at(
+            LocalEvaluationInput {
+                tenant_id: "tenant_1".to_string(),
+                subject_access: SubjectAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    subject: request.subject.clone(),
+                    assignments: vec![assignment(
+                        "reader",
+                        Some("resource:document"),
+                        Some("doc_2"),
+                    )],
+                    subject_parents: vec![parent("role", "reader")],
+                    resource_scopes: HashMap::from([(
+                        "document".to_string(),
+                        HashSet::from(["doc_2".to_string()]),
+                    )]),
+                    fetched_at_ms: 1,
+                },
+                resource_access: ResourceAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    resource_type: "document".to_string(),
+                    resource_id: "doc_1".to_string(),
+                    properties: json!({}),
+                    resource_parents: vec![],
+                    fetched_at_ms: 1,
+                },
+                request,
+                trusted_context: TrustedAuthorizationContext::default(),
+            },
+            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        )
+        .expect("evaluation");
+
+    assert!(!response.decision, "off-scope role parent must not allow");
+}
+
+#[test]
+fn given_cross_tenant_snapshot_when_evaluating_then_rejects() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let result = evaluator.evaluate_at(
+        LocalEvaluationInput {
+            tenant_id: "tenant_1".to_string(),
+            subject_access: SubjectAccessSnapshot {
+                tenant_id: "tenant_2".to_string(),
+                subject: request.subject.clone(),
+                assignments: Vec::new(),
+                subject_parents: Vec::new(),
+                resource_scopes: HashMap::new(),
+                fetched_at_ms: 1,
+            },
+            resource_access: ResourceAccessSnapshot {
+                tenant_id: "tenant_1".to_string(),
+                resource_type: "document".to_string(),
+                resource_id: "doc_1".to_string(),
+                properties: json!({}),
+                resource_parents: Vec::new(),
+                fetched_at_ms: 1,
+            },
+            request,
+            trusted_context: TrustedAuthorizationContext::default(),
+        },
+        Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+    );
+
+    assert!(matches!(
+        result,
+        Err(crate::AuthzRuntimeError::TenantSnapshotMismatch)
+    ));
+}
+
+#[test]
+fn given_role_subject_with_out_of_scope_assignment_when_evaluating_then_denies() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
+    let result = evaluator
+        .evaluate_at(
+            LocalEvaluationInput {
+                tenant_id: "tenant_1".to_string(),
+                request: EvaluationRequest {
+                    subject: Subject::role("reader"),
+                    resource: Resource::new("document", "doc_1"),
+                    action: Action::new("read"),
+                    context: None,
+                    jwt_context: None,
+                    session_context: None,
+                    token_context: None,
+                },
+                trusted_context: TrustedAuthorizationContext::default(),
+                subject_access: SubjectAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    subject: Subject::role("reader"),
+                    assignments: vec![role_assignment(
+                        "reader",
+                        "reader",
+                        Some("org"),
+                        Some("org_denied"),
+                    )],
+                    subject_parents: Vec::new(),
+                    resource_scopes: HashMap::new(),
+                    fetched_at_ms: 1,
+                },
+                resource_access: ResourceAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    resource_type: "document".to_string(),
+                    resource_id: "doc_1".to_string(),
+                    properties: json!({"org_id": "org_allowed"}),
+                    resource_parents: vec![parent("tenant", "tenant_1")],
+                    fetched_at_ms: 1,
+                },
+            },
+            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        )
+        .expect("evaluation");
+
+    assert!(
+        !result.decision,
+        "role identity must not bypass an out-of-scope assignment"
+    );
+}
+
+#[test]
+fn given_role_subject_without_assignment_when_role_is_tenant_scoped_then_allows() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
+    let result = evaluator
+        .evaluate_at(
+            LocalEvaluationInput {
+                tenant_id: "tenant_1".to_string(),
+                request: EvaluationRequest {
+                    subject: Subject::role("reader"),
+                    resource: Resource::new("document", "doc_1"),
+                    action: Action::new("read"),
+                    context: None,
+                    jwt_context: None,
+                    session_context: None,
+                    token_context: None,
+                },
+                trusted_context: TrustedAuthorizationContext::default(),
+                subject_access: SubjectAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    subject: Subject::role("reader"),
+                    assignments: Vec::new(),
+                    subject_parents: Vec::new(),
+                    resource_scopes: HashMap::new(),
+                    fetched_at_ms: 1,
+                },
+                resource_access: ResourceAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    resource_type: "document".to_string(),
+                    resource_id: "doc_1".to_string(),
+                    properties: json!({}),
+                    resource_parents: vec![parent("tenant", "tenant_1")],
+                    fetched_at_ms: 1,
+                },
+            },
+            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        )
+        .expect("evaluation");
+
+    assert!(
+        result.decision,
+        "tenant-scoped role subjects retain compatibility"
+    );
+}
+
+#[test]
+fn given_role_subject_assignment_for_foreign_principal_when_scoping_then_denies() {
+    let runtime = runtime_with_read_role();
+    let request = EvaluationRequest {
+        subject: Subject::role("reader"),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+
+    let scoped = permissions_for_request_bits(
+        &runtime,
+        &[assignment("reader", Some("tenant"), None)],
+        &request,
+        &TrustedAuthorizationContext::default(),
+        &request.subject,
+        &[],
+    );
+
+    assert!(!scoped.permissions.contains(0));
+}
+
+#[test]
+fn given_trusted_group_parent_when_group_assignment_scopes_user_then_allows() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let response = evaluator
+        .evaluate_at(
+            LocalEvaluationInput {
+                tenant_id: "tenant_1".to_string(),
+                request: request.clone(),
+                trusted_context: TrustedAuthorizationContext::default(),
+                subject_access: SubjectAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    subject: request.subject.clone(),
+                    assignments: vec![role_assignment("reader", "group_1", Some("tenant"), None)],
+                    subject_parents: vec![
+                        parent("group", "group_1"),
+                        parent("role", "reader"),
+                        parent("tenant", "tenant_1"),
+                    ],
+                    resource_scopes: HashMap::new(),
+                    fetched_at_ms: 1,
+                },
+                resource_access: ResourceAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    resource_type: "document".to_string(),
+                    resource_id: "doc_1".to_string(),
+                    properties: json!({}),
+                    resource_parents: vec![parent("tenant", "tenant_1")],
+                    fetched_at_ms: 1,
+                },
+            },
+            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        )
+        .expect("evaluation");
+
+    assert!(response.decision, "trusted group parent should grant role");
+}
+
+#[test]
+fn given_foreign_group_assignment_without_parent_when_evaluating_then_denies() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let response = evaluator
+        .evaluate_at(
+            LocalEvaluationInput {
+                tenant_id: "tenant_1".to_string(),
+                request: request.clone(),
+                trusted_context: TrustedAuthorizationContext::default(),
+                subject_access: SubjectAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    subject: request.subject.clone(),
+                    assignments: vec![role_assignment(
+                        "reader",
+                        "group_foreign",
+                        Some("tenant"),
+                        None,
+                    )],
+                    subject_parents: vec![
+                        parent("group", "group_1"),
+                        parent("role", "reader"),
+                        parent("tenant", "tenant_1"),
+                    ],
+                    resource_scopes: HashMap::new(),
+                    fetched_at_ms: 1,
+                },
+                resource_access: ResourceAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    resource_type: "document".to_string(),
+                    resource_id: "doc_1".to_string(),
+                    properties: json!({}),
+                    resource_parents: vec![parent("tenant", "tenant_1")],
+                    fetched_at_ms: 1,
+                },
+            },
+            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        )
+        .expect("evaluation");
+
+    assert!(!response.decision, "foreign group must not grant role");
 }
 
 #[test]
@@ -497,6 +1305,7 @@ fn public_resource_does_not_allow_undeclared_read_action() {
     let input = LocalEvaluationInput {
         tenant_id: "tenant_1".to_string(),
         subject_access: SubjectAccessSnapshot {
+            tenant_id: "tenant_1".to_string(),
             subject: request.subject.clone(),
             assignments: vec![],
             subject_parents: vec![],
@@ -504,12 +1313,15 @@ fn public_resource_does_not_allow_undeclared_read_action() {
             fetched_at_ms: 1,
         },
         resource_access: ResourceAccessSnapshot {
+            tenant_id: "tenant_1".to_string(),
             resource_type: "document".to_string(),
             resource_id: "doc_1".to_string(),
+            properties: json!({}),
             resource_parents: vec![],
             fetched_at_ms: 1,
         },
         request,
+        trusted_context: TrustedAuthorizationContext::default(),
     };
     let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
 
@@ -522,7 +1334,63 @@ fn public_resource_does_not_allow_undeclared_read_action() {
     );
 }
 
+#[test]
+fn caller_resource_org_cannot_override_snapshot_org_for_org_scope() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_org_read_role());
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1")
+            .with_properties(json!({ "org_id": "org_allowed" })),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+
+    let response = evaluator
+        .evaluate_at(
+            LocalEvaluationInput {
+                tenant_id: "tenant_1".to_string(),
+                subject_access: SubjectAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    subject: request.subject.clone(),
+                    assignments: vec![assignment("reader", Some("org"), Some("org_allowed"))],
+                    subject_parents: vec![parent("role", "reader"), parent("org", "org_allowed")],
+                    resource_scopes: HashMap::new(),
+                    fetched_at_ms: 1,
+                },
+                resource_access: ResourceAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    resource_type: "document".to_string(),
+                    resource_id: "doc_1".to_string(),
+                    properties: json!({}),
+                    resource_parents: vec![parent("org", "org_actual")],
+                    fetched_at_ms: 1,
+                },
+                request,
+                trusted_context: TrustedAuthorizationContext::default(),
+            },
+            now,
+        )
+        .expect("evaluation");
+
+    assert!(
+        !response.decision,
+        "a caller-controlled org_id must not grant access to an unrelated resource"
+    );
+}
+
 fn runtime_with_read_role() -> EvaluationRuntime {
+    runtime_with_read_role_scope(Scope::Tenant)
+}
+
+fn runtime_with_org_read_role() -> EvaluationRuntime {
+    runtime_with_read_role_scope(Scope::Org)
+}
+
+fn runtime_with_read_role_scope(scope: Scope) -> EvaluationRuntime {
     build_runtime(ConfigurationModel {
         version: 1,
         resource_types: vec![authz_types::ResourceType {
@@ -551,7 +1419,7 @@ fn runtime_with_read_role() -> EvaluationRuntime {
             description: None,
             permissions: vec![authz_types::RolePermission {
                 permission_id: PermissionId::new("document:read").expect("permission id"),
-                scopes: vec![Scope::Tenant],
+                scopes: vec![scope],
             }],
             actions: vec![],
             not_actions: vec![],
@@ -686,8 +1554,14 @@ fn compiled_action_descriptor_profile() {
             token_context: None,
         };
         let assignments = vec![assignment("catalog_reader", Some("tenant"), None)];
-        let scoped =
-            permissions_for_request_bits(&runtime, &assignments, &request, &request.subject);
+        let scoped = permissions_for_request_bits(
+            &runtime,
+            &assignments,
+            &request,
+            &TrustedAuthorizationContext::default(),
+            &request.subject,
+            &[],
+        );
 
         let legacy_guard = AllocationGuard::start(
             module_path!(),
@@ -752,6 +1626,7 @@ fn prepared_local_batch_frame_profile() {
         let evaluator = LocalAuthzEvaluator::new(runtime_with_batch_actions(cardinality));
         let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
         let subject_access = SubjectAccessSnapshot {
+            tenant_id: "tenant_1".to_string(),
             subject: Subject::user("user_1"),
             assignments: vec![assignment("batch_reader", Some("tenant"), None)],
             subject_parents: vec![parent("role", "batch_reader")],
@@ -759,8 +1634,10 @@ fn prepared_local_batch_frame_profile() {
             fetched_at_ms: 1,
         };
         let resource_access = ResourceAccessSnapshot {
+            tenant_id: "tenant_1".to_string(),
             resource_type: "document".to_string(),
             resource_id: "doc_1".to_string(),
+            properties: json!({}),
             resource_parents: vec![parent("tenant", "tenant_1")],
             fetched_at_ms: 1,
         };
@@ -795,6 +1672,7 @@ fn prepared_local_batch_frame_profile() {
                     LocalBatchEvaluationInput {
                         tenant_id: "tenant_1",
                         request: request.clone(),
+                        trusted_context: TrustedAuthorizationContext::default(),
                         actions: &actions,
                         subject_access: &subject_access,
                         resource_access: &resource_access,
@@ -820,6 +1698,7 @@ fn prepared_local_batch_matches_individual_action_evaluations() {
     let evaluator = LocalAuthzEvaluator::new(runtime_with_batch_actions(cardinality));
     let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
     let subject_access = SubjectAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
         subject: Subject::user("user_1"),
         assignments: vec![assignment("batch_reader", Some("tenant"), None)],
         subject_parents: vec![parent("role", "batch_reader")],
@@ -827,8 +1706,10 @@ fn prepared_local_batch_matches_individual_action_evaluations() {
         fetched_at_ms: 1,
     };
     let resource_access = ResourceAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
         resource_type: "document".to_string(),
         resource_id: "doc_1".to_string(),
+        properties: json!({}),
         resource_parents: vec![parent("tenant", "tenant_1")],
         fetched_at_ms: 1,
     };
@@ -854,6 +1735,7 @@ fn prepared_local_batch_matches_individual_action_evaluations() {
                     LocalEvaluationInput {
                         tenant_id: "tenant_1",
                         request,
+                        trusted_context: TrustedAuthorizationContext::default(),
                         subject_access: &subject_access,
                         resource_access: &resource_access,
                     },
@@ -867,6 +1749,7 @@ fn prepared_local_batch_matches_individual_action_evaluations() {
             LocalBatchEvaluationInput {
                 tenant_id: "tenant_1",
                 request: base_request,
+                trusted_context: TrustedAuthorizationContext::default(),
                 actions: &actions,
                 subject_access: &subject_access,
                 resource_access: &resource_access,
@@ -895,6 +1778,7 @@ fn prepared_local_batch_uses_the_explicit_action_sequence() {
         token_context: None,
     };
     let subject_access = SubjectAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
         subject: request.subject.clone(),
         assignments: vec![assignment("batch_reader", Some("tenant"), None)],
         subject_parents: vec![parent("role", "batch_reader")],
@@ -902,8 +1786,10 @@ fn prepared_local_batch_uses_the_explicit_action_sequence() {
         fetched_at_ms: 1,
     };
     let resource_access = ResourceAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
         resource_type: "document".to_string(),
         resource_id: "doc_1".to_string(),
+        properties: json!({}),
         resource_parents: vec![],
         fetched_at_ms: 1,
     };
@@ -913,6 +1799,7 @@ fn prepared_local_batch_uses_the_explicit_action_sequence() {
             LocalBatchEvaluationInput {
                 tenant_id: "tenant_1",
                 request,
+                trusted_context: TrustedAuthorizationContext::default(),
                 actions: &actions,
                 subject_access,
                 resource_access,
@@ -922,6 +1809,55 @@ fn prepared_local_batch_uses_the_explicit_action_sequence() {
         .expect("batch evaluation");
     assert_eq!(result.len(), 2);
     assert!(result.iter().all(|response| response.decision));
+}
+
+#[test]
+fn oversized_local_batches_are_rejected_before_evaluation() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_batch_actions(1));
+    let request = EvaluationRequest {
+        subject: Subject::user("user_1"),
+        resource: Resource::new("document", "doc_1"),
+        action: Action::new("action_0"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+    let subject_access = SubjectAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
+        subject: request.subject.clone(),
+        assignments: vec![assignment("batch_reader", Some("tenant"), None)],
+        subject_parents: vec![parent("role", "batch_reader")],
+        resource_scopes: HashMap::new(),
+        fetched_at_ms: 1,
+    };
+    let resource_access = ResourceAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
+        resource_type: "document".to_string(),
+        resource_id: "doc_1".to_string(),
+        properties: json!({}),
+        resource_parents: vec![],
+        fetched_at_ms: 1,
+    };
+    let actions = (0..=MAX_BATCH_EVALUATIONS)
+        .map(|_| Action::new("action_0"))
+        .collect::<Vec<_>>();
+
+    let error = evaluator
+        .evaluate_batch_at(
+            LocalBatchEvaluationInput {
+                tenant_id: "tenant_1",
+                request,
+                trusted_context: TrustedAuthorizationContext::default(),
+                actions: &actions,
+                subject_access: &subject_access,
+                resource_access: &resource_access,
+            },
+            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        )
+        .expect_err("oversized batches must be bounded");
+
+    assert!(error.to_string().contains("maximum"));
 }
 
 #[test]
@@ -937,14 +1873,22 @@ fn token_expiry_given_reused_subject_snapshot_then_never_reuses_prior_allow_deci
             context: None,
             jwt_context: None,
             session_context: None,
-            token_context: Some(TokenContext {
+            token_context: None,
+        },
+        trusted_context: TrustedAuthorizationContext::from_validated_parts(
+            &Subject::user("user_1"),
+            None,
+            None,
+            Some(TokenContext {
                 token_id: "token_variant".to_string(),
                 owner_id: "user_1".to_string(),
+                subject_binding: TokenSubjectBinding::Subject,
                 scopes: TokenScopeConfig::with_scopes(vec!["document:read".to_string()]),
                 expires_at: Some(expires_at),
             }),
-        },
+        ),
         subject_access: SubjectAccessSnapshot {
+            tenant_id: "tenant_1".to_string(),
             subject: Subject::user("user_1"),
             assignments: vec![assignment("reader", Some("tenant"), None)],
             subject_parents: vec![parent("role", "reader"), parent("tenant", "tenant_1")],
@@ -952,8 +1896,10 @@ fn token_expiry_given_reused_subject_snapshot_then_never_reuses_prior_allow_deci
             fetched_at_ms: 1,
         },
         resource_access: ResourceAccessSnapshot {
+            tenant_id: "tenant_1".to_string(),
             resource_type: "document".to_string(),
             resource_id: "doc_1".to_string(),
+            properties: json!({}),
             resource_parents: vec![parent("tenant", "tenant_1")],
             fetched_at_ms: 1,
         },
@@ -975,10 +1921,68 @@ fn token_expiry_given_reused_subject_snapshot_then_never_reuses_prior_allow_deci
 }
 
 #[test]
+fn token_expiry_at_exact_evaluation_second_is_denied() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
+    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let result = evaluator
+        .evaluate_at(
+            LocalEvaluationInput {
+                tenant_id: "tenant_1".to_string(),
+                request: EvaluationRequest {
+                    subject: Subject::user("user_1"),
+                    resource: Resource::new("document", "doc_1"),
+                    action: Action::new("read"),
+                    context: None,
+                    jwt_context: None,
+                    session_context: None,
+                    token_context: None,
+                },
+                trusted_context: TrustedAuthorizationContext::from_validated_parts(
+                    &Subject::user("user_1"),
+                    None,
+                    None,
+                    Some(TokenContext {
+                        token_id: "token_boundary".to_string(),
+                        owner_id: "user_1".to_string(),
+                        subject_binding: TokenSubjectBinding::Subject,
+                        scopes: TokenScopeConfig::with_scopes(vec!["document:read".to_string()]),
+                        expires_at: Some(1_000),
+                    }),
+                ),
+                subject_access: SubjectAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    subject: Subject::user("user_1"),
+                    assignments: vec![assignment("reader", Some("tenant"), None)],
+                    subject_parents: vec![parent("role", "reader"), parent("tenant", "tenant_1")],
+                    resource_scopes: HashMap::new(),
+                    fetched_at_ms: 1,
+                },
+                resource_access: ResourceAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    resource_type: "document".to_string(),
+                    resource_id: "doc_1".to_string(),
+                    properties: json!({}),
+                    resource_parents: vec![parent("tenant", "tenant_1")],
+                    fetched_at_ms: 1,
+                },
+            },
+            now,
+        )
+        .expect("boundary evaluation");
+
+    assert!(!result.decision, "expiration is an exclusive upper bound");
+    assert_eq!(
+        result.context.and_then(|context| context.reason),
+        Some("token_expired".to_string())
+    );
+}
+
+#[test]
 fn token_variants_given_reused_subject_snapshot_then_each_decision_uses_current_token_context() {
     let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
     let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
     let subject_access = SubjectAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
         subject: Subject::user("user_1"),
         assignments: vec![assignment("reader", Some("tenant"), None)],
         subject_parents: vec![parent("role", "reader"), parent("tenant", "tenant_1")],
@@ -997,12 +2001,20 @@ fn token_variants_given_reused_subject_snapshot_then_each_decision_uses_current_
                         context: None,
                         jwt_context: None,
                         session_context: None,
-                        token_context: Some(token_context),
+                        token_context: None,
                     },
+                    trusted_context: TrustedAuthorizationContext::from_validated_parts(
+                        &Subject::user("user_1"),
+                        None,
+                        None,
+                        Some(token_context),
+                    ),
                     subject_access: subject_access.clone(),
                     resource_access: ResourceAccessSnapshot {
+                        tenant_id: "tenant_1".to_string(),
                         resource_type: "document".to_string(),
                         resource_id: "doc_1".to_string(),
+                        properties: json!({}),
                         resource_parents: vec![parent("tenant", "tenant_1")],
                         fetched_at_ms: 1,
                     },
@@ -1014,6 +2026,7 @@ fn token_variants_given_reused_subject_snapshot_then_each_decision_uses_current_
     let token = |token_id: &str, owner_id: &str, scopes: Vec<&str>, expires_at| TokenContext {
         token_id: token_id.to_string(),
         owner_id: owner_id.to_string(),
+        subject_binding: TokenSubjectBinding::Subject,
         scopes: TokenScopeConfig::with_scopes(scopes.into_iter().map(str::to_string).collect()),
         expires_at: Some(expires_at),
     };
@@ -1028,11 +2041,30 @@ fn token_variants_given_reused_subject_snapshot_then_each_decision_uses_current_
         ))
         .decision
     );
-    assert!(evaluate(token("token_owner", "user_2", vec!["document:read"], 2_000)).decision);
+    let owner_mismatch = evaluate(token("token_owner", "user_2", vec!["document:read"], 2_000));
+    assert!(!owner_mismatch.decision);
+    assert_eq!(
+        owner_mismatch.context.and_then(|context| context.reason),
+        Some("token_owner_mismatch".to_string())
+    );
+    let delegated = TokenContext {
+        subject_binding: TokenSubjectBinding::Delegated,
+        ..token(
+            "token_delegated",
+            "runtime_caller",
+            vec!["document:read"],
+            2_000,
+        )
+    };
+    assert!(
+        evaluate(delegated).decision,
+        "a validated runtime credential must be able to evaluate another subject"
+    );
     assert!(!evaluate(token("token_expired", "user_1", vec!["document:read"], 999)).decision);
     let selected_other_resource = TokenContext {
         token_id: "token_selected_resource".to_string(),
         owner_id: "user_1".to_string(),
+        subject_binding: TokenSubjectBinding::Subject,
         scopes: TokenScopeConfig::fine_grained(FineGrainedScopes {
             resource_selection: ResourceSelection::Selected,
             selected_resources: vec!["doc_2".to_string()],
@@ -1045,6 +2077,376 @@ fn token_variants_given_reused_subject_snapshot_then_each_decision_uses_current_
         expires_at: Some(2_000),
     };
     assert!(!evaluate(selected_other_resource).decision);
+}
+
+#[test]
+fn given_token_owned_by_another_subject_when_evaluating_then_request_is_denied() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
+    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let result = evaluator
+        .evaluate_at(
+            LocalEvaluationInput {
+                tenant_id: "tenant_1".to_string(),
+                request: EvaluationRequest {
+                    subject: Subject::user("user_1"),
+                    resource: Resource::new("document", "doc_1"),
+                    action: Action::new("read"),
+                    context: None,
+                    jwt_context: None,
+                    session_context: None,
+                    token_context: None,
+                },
+                trusted_context: TrustedAuthorizationContext::from_validated_parts(
+                    &Subject::user("user_1"),
+                    None,
+                    None,
+                    Some(TokenContext {
+                        token_id: "token_owned_by_user_2".to_string(),
+                        owner_id: "user_2".to_string(),
+                        subject_binding: TokenSubjectBinding::Subject,
+                        scopes: TokenScopeConfig::with_scopes(vec!["document:read".to_string()]),
+                        expires_at: Some(2_000),
+                    }),
+                ),
+                subject_access: SubjectAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    subject: Subject::user("user_1"),
+                    assignments: vec![assignment("reader", Some("tenant"), None)],
+                    subject_parents: vec![parent("role", "reader"), parent("tenant", "tenant_1")],
+                    resource_scopes: HashMap::new(),
+                    fetched_at_ms: 1,
+                },
+                resource_access: ResourceAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    resource_type: "document".to_string(),
+                    resource_id: "doc_1".to_string(),
+                    properties: json!({}),
+                    resource_parents: vec![parent("tenant", "tenant_1")],
+                    fetched_at_ms: 1,
+                },
+            },
+            now,
+        )
+        .expect("evaluation");
+
+    assert!(
+        !result.decision,
+        "a token cannot be replayed by another subject"
+    );
+    assert_eq!(
+        result.context.and_then(|context| context.reason),
+        Some("token_owner_mismatch".to_string())
+    );
+}
+
+#[test]
+fn fine_grained_token_must_cover_the_permission_action_resource_type() {
+    let runtime = build_runtime(ConfigurationModel {
+        version: 1,
+        resource_types: vec![
+            authz_types::ResourceType {
+                id: "alpha".into(),
+                name: "Alpha".into(),
+                description: None,
+                actions: vec![authz_types::ActionDefinition {
+                    name: "read".into(),
+                    description: None,
+                }],
+                context_schema: None,
+            },
+            authz_types::ResourceType {
+                id: "beta".into(),
+                name: "Beta".into(),
+                description: None,
+                actions: vec![authz_types::ActionDefinition {
+                    name: "read".into(),
+                    description: None,
+                }],
+                context_schema: None,
+            },
+        ],
+        permissions: vec![authz_types::Permission {
+            id: "alpha:cross-read".into(),
+            name: "Cross-resource read".into(),
+            description: None,
+            actions: vec![PermissionActionRef {
+                resource_type: "beta".into(),
+                action_name: "read".into(),
+            }],
+            not_actions: vec![],
+        }],
+        roles: vec![],
+        scope_mappings: vec![],
+        authn_providers: vec![],
+        step_up_rules: vec![],
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+        description: None,
+    });
+    let mut user_permissions = crate::PermissionBits::default();
+    user_permissions.set(0);
+    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+
+    let alpha_bucket = TokenContext {
+        token_id: "token-alpha".into(),
+        owner_id: "user-1".into(),
+        subject_binding: TokenSubjectBinding::Subject,
+        scopes: TokenScopeConfig::fine_grained(FineGrainedScopes {
+            resource_selection: ResourceSelection::All,
+            selected_resources: vec![],
+            resource_permissions: HashMap::from([(
+                "alpha".to_string(),
+                vec!["alpha:cross-read".to_string()],
+            )]),
+            org_permissions: HashMap::new(),
+        }),
+        expires_at: Some(2_000),
+    };
+    assert!(
+        !runtime
+            .resolve_token_permissions_at(&user_permissions, &alpha_bucket, now)
+            .permissions
+            .contains(0),
+        "a permission must not be admitted from an ID prefix unrelated to its actions"
+    );
+
+    let beta_bucket = TokenContext {
+        scopes: TokenScopeConfig::fine_grained(FineGrainedScopes {
+            resource_selection: ResourceSelection::All,
+            selected_resources: vec![],
+            resource_permissions: HashMap::from([(
+                "beta".to_string(),
+                vec!["alpha:cross-read".to_string()],
+            )]),
+            org_permissions: HashMap::new(),
+        }),
+        ..alpha_bucket
+    };
+    assert!(
+        runtime
+            .resolve_token_permissions_at(&user_permissions, &beta_bucket, now)
+            .permissions
+            .contains(0)
+    );
+}
+
+#[test]
+fn given_selected_id_shared_by_two_resource_types_when_token_is_untyped_then_denies() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_multi_resource_read_role());
+    let input = |selected_resources: Vec<String>| LocalEvaluationInput {
+        tenant_id: "tenant_1".to_string(),
+        request: EvaluationRequest {
+            subject: Subject::user("user_1"),
+            resource: Resource::new("project", "shared-id"),
+            action: Action::new("read"),
+            context: None,
+            jwt_context: None,
+            session_context: None,
+            token_context: None,
+        },
+        trusted_context: TrustedAuthorizationContext::from_validated_parts(
+            &Subject::user("user_1"),
+            None,
+            None,
+            Some(TokenContext {
+                token_id: "token_selection".to_string(),
+                owner_id: "user_1".to_string(),
+                subject_binding: TokenSubjectBinding::Subject,
+                scopes: TokenScopeConfig::fine_grained(FineGrainedScopes {
+                    resource_selection: ResourceSelection::Selected,
+                    selected_resources,
+                    resource_permissions: HashMap::from([
+                        ("document".to_string(), vec!["document:read".to_string()]),
+                        ("project".to_string(), vec!["project:read".to_string()]),
+                    ]),
+                    org_permissions: HashMap::new(),
+                }),
+                expires_at: Some(2_000),
+            }),
+        ),
+        subject_access: SubjectAccessSnapshot {
+            tenant_id: "tenant_1".to_string(),
+            subject: Subject::user("user_1"),
+            assignments: vec![assignment("multi_reader", Some("tenant"), None)],
+            subject_parents: vec![parent("role", "multi_reader"), parent("tenant", "tenant_1")],
+            resource_scopes: HashMap::new(),
+            fetched_at_ms: 1,
+        },
+        resource_access: ResourceAccessSnapshot {
+            tenant_id: "tenant_1".to_string(),
+            resource_type: "project".to_string(),
+            resource_id: "shared-id".to_string(),
+            properties: json!({}),
+            resource_parents: vec![parent("tenant", "tenant_1")],
+            fetched_at_ms: 1,
+        },
+    };
+
+    let result = evaluator
+        .evaluate_at(
+            input(vec!["shared-id".to_string()]),
+            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        )
+        .expect("evaluation");
+
+    assert!(
+        !result.decision,
+        "a bare selected id cannot cross resource types"
+    );
+    assert_eq!(
+        result.context.and_then(|context| context.reason),
+        Some("token_resource_scope".to_string())
+    );
+
+    let typed_result = evaluator
+        .evaluate_at(
+            input(vec!["project:shared-id".to_string()]),
+            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        )
+        .expect("typed selection evaluation");
+    assert!(
+        typed_result.decision,
+        "typed selected resources should allow the matching type"
+    );
+}
+
+#[test]
+fn given_org_permission_for_another_org_when_evaluating_then_token_ceiling_denies() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_org_manage_role());
+    let input = LocalEvaluationInput {
+        tenant_id: "tenant_1".to_string(),
+        request: EvaluationRequest {
+            subject: Subject::user("user_1"),
+            resource: Resource::new("organization", "org_denied")
+                .with_properties(json!({"org_id": "org_denied"})),
+            action: Action::new("manage"),
+            context: None,
+            jwt_context: None,
+            session_context: None,
+            token_context: None,
+        },
+        trusted_context: TrustedAuthorizationContext::from_validated_parts(
+            &Subject::user("user_1"),
+            None,
+            None,
+            Some(TokenContext {
+                token_id: "token_org_ceiling".to_string(),
+                owner_id: "user_1".to_string(),
+                subject_binding: TokenSubjectBinding::Subject,
+                scopes: TokenScopeConfig::fine_grained(FineGrainedScopes {
+                    resource_selection: ResourceSelection::All,
+                    selected_resources: Vec::new(),
+                    resource_permissions: HashMap::from([(
+                        "organization".to_string(),
+                        vec!["organization:manage".to_string()],
+                    )]),
+                    org_permissions: HashMap::from([(
+                        "org_allowed".to_string(),
+                        vec!["organization:manage".to_string()],
+                    )]),
+                }),
+                expires_at: Some(2_000),
+            }),
+        ),
+        subject_access: SubjectAccessSnapshot {
+            tenant_id: "tenant_1".to_string(),
+            subject: Subject::user("user_1"),
+            assignments: vec![assignment("org_manager", Some("tenant"), None)],
+            subject_parents: vec![parent("role", "org_manager"), parent("tenant", "tenant_1")],
+            resource_scopes: HashMap::new(),
+            fetched_at_ms: 1,
+        },
+        resource_access: ResourceAccessSnapshot {
+            tenant_id: "tenant_1".to_string(),
+            resource_type: "organization".to_string(),
+            resource_id: "org_denied".to_string(),
+            properties: json!({"org_id": "org_denied"}),
+            resource_parents: vec![parent("tenant", "tenant_1")],
+            fetched_at_ms: 1,
+        },
+    };
+
+    let result = evaluator
+        .evaluate_at(
+            input,
+            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        )
+        .expect("evaluation");
+
+    assert!(
+        !result.decision,
+        "org permission ceilings must bind to target org"
+    );
+}
+
+#[test]
+fn given_org_permission_for_target_org_when_evaluating_then_token_ceiling_allows() {
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_org_manage_role());
+    let result = evaluator
+        .evaluate_at(
+            LocalEvaluationInput {
+                tenant_id: "tenant_1".to_string(),
+                request: EvaluationRequest {
+                    subject: Subject::user("user_1"),
+                    resource: Resource::new("organization", "org_allowed")
+                        .with_properties(json!({"org_id": "org_allowed"})),
+                    action: Action::new("manage"),
+                    context: None,
+                    jwt_context: None,
+                    session_context: None,
+                    token_context: None,
+                },
+                trusted_context: TrustedAuthorizationContext::from_validated_parts(
+                    &Subject::user("user_1"),
+                    None,
+                    None,
+                    Some(TokenContext {
+                        token_id: "token_org_allowed".to_string(),
+                        owner_id: "user_1".to_string(),
+                        subject_binding: TokenSubjectBinding::Subject,
+                        scopes: TokenScopeConfig::fine_grained(FineGrainedScopes {
+                            resource_selection: ResourceSelection::All,
+                            selected_resources: Vec::new(),
+                            resource_permissions: HashMap::from([(
+                                "organization".to_string(),
+                                vec!["organization:manage".to_string()],
+                            )]),
+                            org_permissions: HashMap::from([(
+                                "org_allowed".to_string(),
+                                vec!["organization:manage".to_string()],
+                            )]),
+                        }),
+                        expires_at: Some(2_000),
+                    }),
+                ),
+                subject_access: SubjectAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    subject: Subject::user("user_1"),
+                    assignments: vec![assignment("org_manager", Some("tenant"), None)],
+                    subject_parents: vec![
+                        parent("role", "org_manager"),
+                        parent("tenant", "tenant_1"),
+                    ],
+                    resource_scopes: HashMap::new(),
+                    fetched_at_ms: 1,
+                },
+                resource_access: ResourceAccessSnapshot {
+                    tenant_id: "tenant_1".to_string(),
+                    resource_type: "organization".to_string(),
+                    resource_id: "org_allowed".to_string(),
+                    properties: json!({"org_id": "org_allowed"}),
+                    resource_parents: vec![parent("tenant", "tenant_1")],
+                    fetched_at_ms: 1,
+                },
+            },
+            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        )
+        .expect("evaluation");
+
+    assert!(
+        result.decision,
+        "the target organization's ceiling should allow"
+    );
 }
 
 #[test]
@@ -1061,6 +2463,7 @@ fn borrowed_and_owned_local_inputs_have_identical_decisions() {
         token_context: None,
     };
     let subject_access = SubjectAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
         subject: request.subject.clone(),
         assignments: vec![assignment("reader", Some("tenant"), None)],
         subject_parents: vec![parent("role", "reader"), parent("tenant", "tenant_1")],
@@ -1068,8 +2471,10 @@ fn borrowed_and_owned_local_inputs_have_identical_decisions() {
         fetched_at_ms: 1,
     };
     let resource_access = ResourceAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
         resource_type: "document".to_string(),
         resource_id: "doc_1".to_string(),
+        properties: json!({}),
         resource_parents: vec![parent("tenant", "tenant_1")],
         fetched_at_ms: 1,
     };
@@ -1079,6 +2484,7 @@ fn borrowed_and_owned_local_inputs_have_identical_decisions() {
             LocalEvaluationInput {
                 tenant_id: "tenant_1".to_string(),
                 request: request.clone(),
+                trusted_context: TrustedAuthorizationContext::default(),
                 subject_access: subject_access.clone(),
                 resource_access: resource_access.clone(),
             },
@@ -1090,6 +2496,7 @@ fn borrowed_and_owned_local_inputs_have_identical_decisions() {
             LocalEvaluationInput {
                 tenant_id: "tenant_1",
                 request,
+                trusted_context: TrustedAuthorizationContext::default(),
                 subject_access: &subject_access,
                 resource_access: &resource_access,
             },
@@ -1119,6 +2526,7 @@ fn borrowed_local_input_avoids_snapshot_clones_profile() {
         token_context: None,
     };
     let subject_access = SubjectAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
         subject: request.subject.clone(),
         assignments: (0..64)
             .map(|index| assignment(&format!("reader_{index}"), Some("tenant"), None))
@@ -1133,8 +2541,10 @@ fn borrowed_local_input_avoids_snapshot_clones_profile() {
         fetched_at_ms: 1,
     };
     let resource_access = ResourceAccessSnapshot {
+        tenant_id: "tenant_1".to_string(),
         resource_type: "document".to_string(),
         resource_id: "doc_1".to_string(),
+        properties: json!({}),
         resource_parents: (0..16)
             .map(|index| parent("group", &format!("group_{index}")))
             .collect(),
@@ -1152,6 +2562,7 @@ fn borrowed_local_input_avoids_snapshot_clones_profile() {
         black_box(LocalEvaluationInput {
             tenant_id: tenant_id.to_string(),
             request: request.clone(),
+            trusted_context: TrustedAuthorizationContext::default(),
             subject_access: subject_access.clone(),
             resource_access: resource_access.clone(),
         });
@@ -1169,6 +2580,7 @@ fn borrowed_local_input_avoids_snapshot_clones_profile() {
         black_box(LocalEvaluationInput {
             tenant_id,
             request: request.clone(),
+            trusted_context: TrustedAuthorizationContext::default(),
             subject_access: &subject_access,
             resource_access: &resource_access,
         });
@@ -1183,6 +2595,7 @@ fn borrowed_local_input_avoids_snapshot_clones_profile() {
             black_box(LocalEvaluationInput {
                 tenant_id,
                 request: request.clone(),
+                trusted_context: TrustedAuthorizationContext::default(),
                 subject_access: &subject_access,
                 resource_access: &resource_access,
             });
@@ -1191,6 +2604,7 @@ fn borrowed_local_input_avoids_snapshot_clones_profile() {
             black_box(LocalEvaluationInput {
                 tenant_id: tenant_id.to_string(),
                 request: request.clone(),
+                trusted_context: TrustedAuthorizationContext::default(),
                 subject_access: subject_access.clone(),
                 resource_access: resource_access.clone(),
             });
@@ -1200,6 +2614,7 @@ fn borrowed_local_input_avoids_snapshot_clones_profile() {
             black_box(LocalEvaluationInput {
                 tenant_id: tenant_id.to_string(),
                 request: request.clone(),
+                trusted_context: TrustedAuthorizationContext::default(),
                 subject_access: subject_access.clone(),
                 resource_access: resource_access.clone(),
             });
@@ -1208,6 +2623,7 @@ fn borrowed_local_input_avoids_snapshot_clones_profile() {
             black_box(LocalEvaluationInput {
                 tenant_id,
                 request: request.clone(),
+                trusted_context: TrustedAuthorizationContext::default(),
                 subject_access: &subject_access,
                 resource_access: &resource_access,
             });
@@ -1257,6 +2673,7 @@ fn typed_internal_context_avoids_json_round_trip_profile() {
     let input = LocalEvaluationInput {
         tenant_id: "tenant_1".to_string(),
         subject_access: SubjectAccessSnapshot {
+            tenant_id: "tenant_1".to_string(),
             subject: request.subject.clone(),
             assignments: vec![assignment(
                 "reader",
@@ -1268,12 +2685,18 @@ fn typed_internal_context_avoids_json_round_trip_profile() {
             fetched_at_ms: 1,
         },
         resource_access: ResourceAccessSnapshot {
+            tenant_id: "tenant_1".to_string(),
             resource_type: "document".to_string(),
             resource_id: "doc_1".to_string(),
+            properties: json!({
+                "org_id": "org_1",
+                "classification": "internal"
+            }),
             resource_parents: vec![parent("tenant", "tenant_1")],
             fetched_at_ms: 1,
         },
         request,
+        trusted_context: TrustedAuthorizationContext::default(),
     };
 
     let legacy_guard = AllocationGuard::start(
@@ -1325,10 +2748,199 @@ fn typed_internal_context_avoids_json_round_trip_profile() {
     );
 }
 
+fn runtime_with_multi_resource_read_role() -> EvaluationRuntime {
+    build_runtime(ConfigurationModel {
+        version: 1,
+        resource_types: vec![
+            authz_types::ResourceType {
+                id: "document".into(),
+                name: "Document".into(),
+                description: None,
+                actions: vec![authz_types::ActionDefinition {
+                    name: "read".into(),
+                    description: None,
+                }],
+                context_schema: None,
+            },
+            authz_types::ResourceType {
+                id: "project".into(),
+                name: "Project".into(),
+                description: None,
+                actions: vec![authz_types::ActionDefinition {
+                    name: "read".into(),
+                    description: None,
+                }],
+                context_schema: None,
+            },
+        ],
+        permissions: vec![
+            authz_types::Permission {
+                id: "document:read".into(),
+                name: "Document read".into(),
+                description: None,
+                actions: vec![PermissionActionRef {
+                    resource_type: "document".into(),
+                    action_name: "read".into(),
+                }],
+                not_actions: vec![],
+            },
+            authz_types::Permission {
+                id: "project:read".into(),
+                name: "Project read".into(),
+                description: None,
+                actions: vec![PermissionActionRef {
+                    resource_type: "project".into(),
+                    action_name: "read".into(),
+                }],
+                not_actions: vec![],
+            },
+        ],
+        roles: vec![authz_types::Role {
+            id: "multi_reader".into(),
+            name: "Multi reader".into(),
+            description: None,
+            permissions: vec![
+                authz_types::RolePermission {
+                    permission_id: PermissionId::new("document:read").expect("permission id"),
+                    scopes: vec![Scope::Tenant],
+                },
+                authz_types::RolePermission {
+                    permission_id: PermissionId::new("project:read").expect("permission id"),
+                    scopes: vec![Scope::Tenant],
+                },
+            ],
+            actions: vec![],
+            not_actions: vec![],
+        }],
+        scope_mappings: vec![],
+        authn_providers: vec![],
+        step_up_rules: vec![],
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+        description: None,
+    })
+}
+
+fn runtime_with_org_manage_role() -> EvaluationRuntime {
+    build_runtime(ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "organization".into(),
+            name: "Organization".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "manage".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "organization:manage".into(),
+            name: "Organization manage".into(),
+            description: None,
+            actions: vec![PermissionActionRef {
+                resource_type: "organization".into(),
+                action_name: "manage".into(),
+            }],
+            not_actions: vec![],
+        }],
+        roles: vec![authz_types::Role {
+            id: "org_manager".into(),
+            name: "Organization manager".into(),
+            description: None,
+            permissions: vec![authz_types::RolePermission {
+                permission_id: PermissionId::new("organization:manage").expect("permission id"),
+                scopes: vec![Scope::Tenant],
+            }],
+            actions: vec![],
+            not_actions: vec![],
+        }],
+        scope_mappings: vec![],
+        authn_providers: vec![],
+        step_up_rules: vec![],
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+        description: None,
+    })
+}
+
 fn build_runtime(config: ConfigurationModel) -> EvaluationRuntime {
     let config = config.into_validated().expect("valid config");
     let bundle = authz_cedar::compile_policy_bundle(&config, 1).expect("compiled bundle");
     EvaluationRuntime::build(config, &bundle).expect("runtime")
+}
+
+#[test]
+fn runtime_rejects_bundle_compiled_from_a_different_configuration() {
+    let config_a = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "read".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "document:read".into(),
+            name: "Document read".into(),
+            description: None,
+            actions: vec![PermissionActionRef {
+                resource_type: "document".into(),
+                action_name: "read".into(),
+            }],
+            not_actions: vec![],
+        }],
+        roles: vec![],
+        scope_mappings: vec![],
+        authn_providers: vec![],
+        step_up_rules: vec![],
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+        description: None,
+    }
+    .into_validated()
+    .expect("config A");
+    let config_b = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "write".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "document:write".into(),
+            name: "Document write".into(),
+            description: None,
+            actions: vec![PermissionActionRef {
+                resource_type: "document".into(),
+                action_name: "write".into(),
+            }],
+            not_actions: vec![],
+        }],
+        roles: vec![],
+        scope_mappings: vec![],
+        authn_providers: vec![],
+        step_up_rules: vec![],
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+        description: None,
+    }
+    .into_validated()
+    .expect("config B");
+    let bundle_b = authz_cedar::compile_policy_bundle(&config_b, 1).expect("bundle B");
+
+    let error = EvaluationRuntime::build(config_a, &bundle_b)
+        .expect_err("a bundle from another configuration must be rejected");
+    assert!(error.to_string().contains("bundle"));
 }
 
 fn assignment(
@@ -1336,8 +2948,17 @@ fn assignment(
     scope_type: Option<&str>,
     scope_id: Option<&str>,
 ) -> EffectiveRoleAssignment {
+    role_assignment(role_id, "user_1", scope_type, scope_id)
+}
+
+fn role_assignment(
+    role_id: &str,
+    principal_id: &str,
+    scope_type: Option<&str>,
+    scope_id: Option<&str>,
+) -> EffectiveRoleAssignment {
     EffectiveRoleAssignment {
-        principal_id: Some("user_1".to_string()),
+        principal_id: Some(principal_id.to_string()),
         role_id: role_id.to_string(),
         scope_type: scope_type.map(ToString::to_string),
         scope_id: scope_id.map(ToString::to_string),

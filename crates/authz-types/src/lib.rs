@@ -69,4 +69,6 @@ mod control_plane_requests_tests;
 #[cfg(test)]
 mod evaluation_properties_tests;
 #[cfg(test)]
+mod role_tests;
+#[cfg(test)]
 mod security_tests;

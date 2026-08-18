@@ -6,12 +6,11 @@ use authz_types::{
     Scope, Subject,
 };
 use cedar_policy::PolicySet;
-use serde_json::Value;
 
 use crate::{
     CedarInternalContext, compile_policy_bundle, evaluate_owned_with_policy_sets,
     evaluate_prepared_with_policy_sets, evaluate_with_policy_sets, parse_policy_sets,
-    prepare_evaluation_owned_with_parents_and_internal_context,
+    prepare_evaluation_owned_with_trusted_parents_and_internal_context,
 };
 
 const ITERATIONS: usize = 512;
@@ -19,27 +18,6 @@ const MAX_ALLOCATIONS_PER_RUN: u64 = 1_050_000;
 const MAX_ALLOCATED_BYTES_PER_RUN: u64 = 320_000_000;
 const ISOLATED_ALLOC_GUARD_ENV: &str = "AUTHZ_CEDAR_ISOLATED_ALLOC_GUARD";
 const DIAGNOSTIC_ITERATIONS: usize = 10_000;
-
-fn default_internal_context() -> Value {
-    serde_json::json!({
-        "token_present": false,
-        "token_valid": true,
-        "token_resource_filter_enabled": false,
-        "token_resource_filter": [],
-        "token_org_id_present": false,
-        "token_org_id": "",
-        "token_owner_org_ids": [],
-        "allowed_actions": [],
-        "resource_scopes": [],
-        "session_present": false,
-        "session_acr": 0,
-        "session_amr": [],
-        "session_auth_age_present": false,
-        "session_auth_age_seconds": 0,
-        "session_mfa_age_present": false,
-        "session_mfa_age_seconds": 0
-    })
-}
 
 fn default_typed_internal_context() -> CedarInternalContext {
     CedarInternalContext {
@@ -111,16 +89,10 @@ fn allocation_fixture() -> (crate::ParsedPolicySets, EvaluationRequest) {
     let parsed_policy_sets = parse_policy_sets(&bundle).expect("policy sets should parse");
 
     let request = EvaluationRequest {
-        subject: Subject::user("u1")
-            .with_properties(serde_json::json!({ "display_name": "user one" })),
-        resource: Resource::new("document", "doc1")
-            .with_properties(serde_json::json!({ "owner_id": "u1" })),
+        subject: Subject::user("u1"),
+        resource: Resource::new("document", "doc1"),
         action: Action::new("read"),
-        context: Some(authz_types::Context::new(serde_json::json!({
-            "_authz": default_internal_context(),
-            "subject_parents": [{ "type": "role", "id": "reader" }],
-            "resource_parents": [{ "type": "collection", "id": "col-1" }]
-        }))),
+        context: None,
         jwt_context: None,
         session_context: None,
         token_context: None,
@@ -163,7 +135,7 @@ fn measure_typed_internal_path(
     );
 
     for _ in 0..ITERATIONS {
-        let prepared = prepare_evaluation_owned_with_parents_and_internal_context(
+        let prepared = prepare_evaluation_owned_with_trusted_parents_and_internal_context(
             request.clone(),
             &[],
             &[],
@@ -178,16 +150,16 @@ fn measure_typed_internal_path(
     guard.finish()
 }
 
-fn measure_owned_json_internal_path(
+fn measure_owned_untrusted_path(
     policy_sets: &crate::ParsedPolicySets,
     request: &EvaluationRequest,
 ) -> alloc_counter::AllocationReport<'static> {
     let guard = AllocationGuard::start(
         module_path!(),
-        "authz_cedar_evaluate_with_policy_sets_direct_path",
+        "authz_cedar_evaluate_owned_untrusted_path",
         file!(),
         line!(),
-        Some("owned_json_internal"),
+        Some("owned_untrusted"),
     );
 
     for _ in 0..ITERATIONS {
@@ -223,11 +195,11 @@ fn evaluate_with_policy_sets_direct_path_budget_tests() {
     // ITERATIONS=512): direct_path: 965,457 allocs, 297,774,768 bytes
     let (policy_sets, request) = allocation_fixture();
     let report = measure_direct_path(&policy_sets, &request);
-    let owned_json_report = measure_owned_json_internal_path(&policy_sets, &request);
+    let owned_untrusted_report = measure_owned_untrusted_path(&policy_sets, &request);
     let typed_report = measure_typed_internal_path(&policy_sets, &request);
 
     alloc_counter::emit_report(&report);
-    alloc_counter::emit_report(&owned_json_report);
+    alloc_counter::emit_report(&owned_untrusted_report);
     alloc_counter::emit_report(&typed_report);
 
     assert!(
@@ -243,10 +215,16 @@ fn evaluate_with_policy_sets_direct_path_budget_tests() {
         MAX_ALLOCATED_BYTES_PER_RUN
     );
     assert!(
-        typed_report.allocated_bytes < owned_json_report.allocated_bytes,
-        "typed internal context must allocate fewer bytes: typed={} json={}",
+        typed_report.allocation_count <= MAX_ALLOCATIONS_PER_RUN,
+        "typed internal allocation budget exceeded: actual={} budget={}",
+        typed_report.allocation_count,
+        MAX_ALLOCATIONS_PER_RUN
+    );
+    assert!(
+        typed_report.allocated_bytes <= MAX_ALLOCATED_BYTES_PER_RUN,
+        "typed internal byte budget exceeded: actual={} budget={}",
         typed_report.allocated_bytes,
-        owned_json_report.allocated_bytes
+        MAX_ALLOCATED_BYTES_PER_RUN
     );
 }
 

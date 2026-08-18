@@ -27,12 +27,15 @@ fn my_hot_path_tests() {
 ```
 
 ```rust
-#[tokio::test]
 #[alloc_counter::count_allocations(label = "experiment")]
+#[tokio::test]
 async fn my_async_hot_path_tests() {
     // test body
 }
 ```
+
+Place `count_allocations` before the async test attribute so it wraps the async function before
+the test runtime expands it.
 
 Run with output enabled:
 
@@ -75,6 +78,9 @@ Each report is a single-line JSON object:
   is active.
 - Async guards span every `.await`. Use them only in a dedicated test process with no background
   work, and avoid multi-thread runtimes when a current-thread runtime is sufficient.
+- Keep measured work observable with `std::hint::black_box` or an assertion that consumes its
+  result; release optimization can otherwise remove unused work and make its allocation report
+  misleadingly low.
 - Enforced allocation budgets must run as one named test with `--test-threads=1`, for example:
 
   ```bash

@@ -16,7 +16,7 @@ use tokio::task_local;
 
 use crate::{
     metrics::{CounterMetric, GaugeMetric, HistogramMetric},
-    recorder::MetricLabel,
+    recorder::{MetricLabel, labels_are_valid},
 };
 
 const HEADER_COST_WALL_MS: &str = "x-aux-cost-wall-ms";
@@ -33,9 +33,20 @@ const HEADER_COST_REQUEST_BYTES: &str = "x-aux-cost-request-bytes";
 const HEADER_COST_REMOTE_REQUEST_BYTES: &str = "x-aux-cost-remote-request-bytes";
 const HEADER_COST_REMOTE_RESPONSE_BYTES: &str = "x-aux-cost-remote-response-bytes";
 const HEADER_COST_STORAGE_BREAKDOWN: &str = "x-aux-cost-storage-breakdown";
+const HEADER_COST_DATABASE_CALLS: &str = "x-aux-cost-db-calls";
+const HEADER_COST_DATABASE_SERIAL_WAVES: &str = "x-aux-cost-db-serial-waves";
+const HEADER_COST_DATABASE_MAX_PARALLELISM: &str = "x-aux-cost-db-max-parallelism";
+const HEADER_COST_DATABASE_BREAKDOWN: &str = "x-aux-cost-db-breakdown";
+const HEADER_COST_OPERATION: &str = "x-aux-cost-operation";
 const COST_STABILIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const COST_STABILIZE_IDLE_WINDOW: Duration = Duration::from_millis(250);
 const COST_STABILIZE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const MAX_REQUEST_ID_BYTES: usize = 256;
+pub(crate) const MAX_ACTIVE_REQUESTS: usize = 1_024;
+pub(crate) const MAX_STORAGE_BREAKDOWN_ENTRIES: usize = 256;
+pub(crate) const MAX_STORAGE_BREAKDOWN_HEADER_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_DATABASE_BREAKDOWN_ENTRIES: usize = 128;
+pub(crate) const MAX_OPERATION_BYTES: usize = 512;
 
 type RequestCostCollectorHandle = Arc<Mutex<RequestCostCollector>>;
 
@@ -69,11 +80,27 @@ pub struct RequestCostStorageBreakdown {
     pub entries: Vec<RequestCostStorageBreakdownEntry>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RequestCostDatabaseCallEntry {
+    pub operation: String,
+    pub calls: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct RequestCostSnapshot {
     pub request_id: Option<String>,
+    #[serde(default)]
+    pub operation: Option<String>,
     pub wall_ms: f64,
     pub remote_wait_ms: f64,
+    #[serde(default)]
+    pub db_calls: u64,
+    #[serde(default)]
+    pub db_serial_waves: u64,
+    #[serde(default)]
+    pub db_max_parallelism: u64,
+    #[serde(default)]
+    pub db_call_breakdown: Vec<RequestCostDatabaseCallEntry>,
     pub db_read_ops: u64,
     pub db_write_ops: u64,
     pub db_read_bytes: u64,
@@ -163,7 +190,28 @@ impl CostResponseHeaders {
             HEADER_COST_REMOTE_RESPONSE_BYTES,
             self.snapshot.remote_response_bytes,
         );
-        if let Ok(serialized) = serde_json::to_string(&self.snapshot.storage_breakdown) {
+        insert_header_u64(headers, HEADER_COST_DATABASE_CALLS, self.snapshot.db_calls);
+        insert_header_u64(
+            headers,
+            HEADER_COST_DATABASE_SERIAL_WAVES,
+            self.snapshot.db_serial_waves,
+        );
+        insert_header_u64(
+            headers,
+            HEADER_COST_DATABASE_MAX_PARALLELISM,
+            self.snapshot.db_max_parallelism,
+        );
+        if let Ok(serialized) = serde_json::to_string(&self.snapshot.db_call_breakdown)
+            && serialized.len() <= MAX_STORAGE_BREAKDOWN_HEADER_BYTES
+        {
+            insert_header_string(headers, HEADER_COST_DATABASE_BREAKDOWN, &serialized);
+        }
+        if let Some(operation) = self.snapshot.operation.as_deref() {
+            insert_header_string(headers, HEADER_COST_OPERATION, operation);
+        }
+        if let Ok(serialized) = serde_json::to_string(&self.snapshot.storage_breakdown)
+            && serialized.len() <= MAX_STORAGE_BREAKDOWN_HEADER_BYTES
+        {
             insert_header_string(headers, HEADER_COST_STORAGE_BREAKDOWN, &serialized);
         }
     }
@@ -177,15 +225,34 @@ impl CostResponseHeaders {
             .and_then(|value| value.parse::<u64>().ok());
         let storage_breakdown = headers
             .get(HEADER_COST_STORAGE_BREAKDOWN)
+            .filter(|value| value.as_bytes().len() <= MAX_STORAGE_BREAKDOWN_HEADER_BYTES)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| serde_json::from_str::<RequestCostStorageBreakdown>(value).ok())
             .unwrap_or_default();
+        let db_call_breakdown = headers
+            .get(HEADER_COST_DATABASE_BREAKDOWN)
+            .filter(|value| value.as_bytes().len() <= MAX_STORAGE_BREAKDOWN_HEADER_BYTES)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| serde_json::from_str::<Vec<RequestCostDatabaseCallEntry>>(value).ok())
+            .unwrap_or_default();
+        let operation = headers
+            .get(HEADER_COST_OPERATION)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.len() <= MAX_OPERATION_BYTES)
+            .map(ToOwned::to_owned);
         Some(Self {
             snapshot: RequestCostSnapshot {
                 request_id: None,
+                operation,
                 wall_ms,
                 remote_wait_ms: parse_header_f64(headers, HEADER_COST_REMOTE_WAIT_MS)
                     .unwrap_or(0.0),
+                db_calls: parse_header_u64(headers, HEADER_COST_DATABASE_CALLS).unwrap_or(0),
+                db_serial_waves: parse_header_u64(headers, HEADER_COST_DATABASE_SERIAL_WAVES)
+                    .unwrap_or(0),
+                db_max_parallelism: parse_header_u64(headers, HEADER_COST_DATABASE_MAX_PARALLELISM)
+                    .unwrap_or(0),
+                db_call_breakdown,
                 db_read_ops: parse_header_u64(headers, HEADER_COST_DB_READ_OPS).unwrap_or(0),
                 db_write_ops: parse_header_u64(headers, HEADER_COST_DB_WRITE_OPS).unwrap_or(0),
                 db_read_bytes: parse_header_u64(headers, HEADER_COST_DB_READ_BYTES).unwrap_or(0),
@@ -226,8 +293,14 @@ impl CostResponseHeaders {
 struct RequestCostCollector {
     registration_id: Option<u64>,
     request_id: Option<String>,
+    operation: Option<String>,
     wall_ms: Option<f64>,
     remote_wait_ms: f64,
+    db_calls: u64,
+    db_serial_waves: u64,
+    db_max_parallelism: u64,
+    active_db_calls: u64,
+    db_call_breakdown: BTreeMap<String, u64>,
     db_read_ops: u64,
     db_write_ops: u64,
     db_read_bytes: u64,
@@ -265,8 +338,20 @@ impl RequestCostCollector {
             .collect();
         RequestCostSnapshot {
             request_id: self.request_id.clone(),
+            operation: self.operation.clone(),
             wall_ms: self.wall_ms.unwrap_or_default(),
             remote_wait_ms: self.remote_wait_ms,
+            db_calls: self.db_calls,
+            db_serial_waves: self.db_serial_waves,
+            db_max_parallelism: self.db_max_parallelism,
+            db_call_breakdown: self
+                .db_call_breakdown
+                .iter()
+                .map(|(operation, calls)| RequestCostDatabaseCallEntry {
+                    operation: operation.clone(),
+                    calls: *calls,
+                })
+                .collect(),
             db_read_ops: self.db_read_ops,
             db_write_ops: self.db_write_ops,
             db_read_bytes: self.db_read_bytes,
@@ -309,11 +394,14 @@ fn register_request(
     registration_id: u64,
     request_id: &str,
     collector: &RequestCostCollectorHandle,
-) {
+) -> bool {
     let Ok(mut requests) = registry().requests.lock() else {
-        return;
+        return false;
     };
     requests.retain(|_, request| request.collector.strong_count() > 0);
+    if requests.len() >= MAX_ACTIVE_REQUESTS {
+        return false;
+    }
     requests.insert(
         registration_id,
         ActiveRequest {
@@ -321,6 +409,7 @@ fn register_request(
             collector: Arc::downgrade(collector),
         },
     );
+    true
 }
 
 fn unregister_request(registration_id: u64) {
@@ -374,16 +463,88 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let registration_id = request_id.as_ref().map(|_| next_registration_id());
+    let request_id = request_id.filter(|request_id| request_id.len() <= MAX_REQUEST_ID_BYTES);
     let collector = Arc::new(Mutex::new(RequestCostCollector {
-        registration_id,
         request_id: request_id.clone(),
         ..RequestCostCollector::default()
     }));
-    if let (Some(registration_id), Some(request_id)) = (registration_id, request_id.as_deref()) {
-        register_request(registration_id, request_id, &collector);
+    if let Some(request_id) = request_id.as_deref() {
+        let registration_id = next_registration_id();
+        if register_request(registration_id, request_id, &collector)
+            && let Ok(mut collector) = collector.lock()
+        {
+            collector.registration_id = Some(registration_id);
+        }
     }
     REQUEST_COST_COLLECTOR.scope(collector, future()).await
+}
+
+/// Associates the current request-cost collector with a bounded route name.
+/// Route templates are preferred over raw request paths so this value remains
+/// stable and cannot contain customer identifiers.
+pub fn set_request_cost_operation(operation: &str) {
+    REQUEST_COST_COLLECTOR
+        .try_with(|collector| {
+            let Ok(mut collector) = collector.lock() else {
+                return;
+            };
+            if operation.len() <= MAX_OPERATION_BYTES {
+                collector.operation = Some(operation.to_string());
+                collector.mark_updated();
+            }
+        })
+        .ok();
+}
+
+/// Records one provider-backed database future for the current request.
+/// Dropping the returned guard closes the call and updates active-wave state.
+#[must_use]
+pub fn begin_database_call(operation: &str) -> DatabaseCallGuard {
+    let Ok(collector) = REQUEST_COST_COLLECTOR.try_with(Arc::clone) else {
+        return DatabaseCallGuard { collector: None };
+    };
+    let Ok(mut collector_guard) = collector.lock() else {
+        return DatabaseCallGuard { collector: None };
+    };
+    collector_guard.db_calls = collector_guard.db_calls.saturating_add(1);
+    if collector_guard.active_db_calls == 0 {
+        collector_guard.db_serial_waves = collector_guard.db_serial_waves.saturating_add(1);
+    }
+    collector_guard.active_db_calls = collector_guard.active_db_calls.saturating_add(1);
+    collector_guard.db_max_parallelism = collector_guard
+        .db_max_parallelism
+        .max(collector_guard.active_db_calls);
+    if operation.len() <= MAX_OPERATION_BYTES {
+        if let Some(calls) = collector_guard.db_call_breakdown.get_mut(operation) {
+            *calls = calls.saturating_add(1);
+        } else if collector_guard.db_call_breakdown.len() < MAX_DATABASE_BREAKDOWN_ENTRIES {
+            collector_guard
+                .db_call_breakdown
+                .insert(operation.to_owned(), 1);
+        }
+    }
+    collector_guard.mark_updated();
+    drop(collector_guard);
+    DatabaseCallGuard {
+        collector: Some(collector),
+    }
+}
+
+pub struct DatabaseCallGuard {
+    collector: Option<RequestCostCollectorHandle>,
+}
+
+impl Drop for DatabaseCallGuard {
+    fn drop(&mut self) {
+        let Some(collector) = self.collector.take() else {
+            return;
+        };
+        let Ok(mut collector) = collector.lock() else {
+            return;
+        };
+        collector.active_db_calls = collector.active_db_calls.saturating_sub(1);
+        collector.mark_updated();
+    }
 }
 
 pub async fn finish_request_cost_collection(
@@ -403,7 +564,7 @@ pub async fn finish_request_cost_collection(
         collector.mark_updated();
         (collector.snapshot(), collector.registration_id)
     };
-    if request_id.is_some() {
+    if request_id.is_some() && registration_id.is_some() {
         wait_for_cost_settle(&collector).await;
     }
     let settled = collector
@@ -538,6 +699,9 @@ pub fn record_analytics_request_cost_by_request_id(request_id: &str, row_delta: 
 }
 
 fn record_storage_ops(collector: &mut RequestCostCollector, labels: &[MetricLabel], value: u64) {
+    if !labels_are_valid(labels) {
+        return;
+    }
     let Some((ddb_op, item_kind, direction)) = storage_labels(labels) else {
         return;
     };
@@ -549,14 +713,20 @@ fn record_storage_ops(collector: &mut RequestCostCollector, labels: &[MetricLabe
             collector.db_write_ops = collector.db_write_ops.saturating_add(value);
         }
     }
-    let entry = collector
-        .storage_breakdown
-        .entry((ddb_op, item_kind, direction))
-        .or_insert((0, 0));
+    let key = (ddb_op, item_kind, direction);
+    if !collector.storage_breakdown.contains_key(&key)
+        && collector.storage_breakdown.len() >= MAX_STORAGE_BREAKDOWN_ENTRIES
+    {
+        return;
+    }
+    let entry = collector.storage_breakdown.entry(key).or_insert((0, 0));
     entry.0 = entry.0.saturating_add(value);
 }
 
 fn record_storage_bytes(collector: &mut RequestCostCollector, labels: &[MetricLabel], value: u64) {
+    if !labels_are_valid(labels) {
+        return;
+    }
     let Some((ddb_op, item_kind, direction)) = storage_labels(labels) else {
         return;
     };
@@ -568,10 +738,13 @@ fn record_storage_bytes(collector: &mut RequestCostCollector, labels: &[MetricLa
             collector.db_write_bytes = collector.db_write_bytes.saturating_add(value);
         }
     }
-    let entry = collector
-        .storage_breakdown
-        .entry((ddb_op, item_kind, direction))
-        .or_insert((0, 0));
+    let key = (ddb_op, item_kind, direction);
+    if !collector.storage_breakdown.contains_key(&key)
+        && collector.storage_breakdown.len() >= MAX_STORAGE_BREAKDOWN_ENTRIES
+    {
+        return;
+    }
+    let entry = collector.storage_breakdown.entry(key).or_insert((0, 0));
     entry.1 = entry.1.saturating_add(value);
 }
 
@@ -626,4 +799,28 @@ fn parse_header_f64(headers: &HeaderMap, name: &str) -> Option<f64> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<f64>().ok())
+}
+
+#[cfg(test)]
+pub(crate) fn active_request_registry_len() -> usize {
+    registry()
+        .requests
+        .lock()
+        .map(|mut requests| {
+            requests.retain(|_, request| request.collector.strong_count() > 0);
+            requests.len()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+pub(crate) fn active_request_has_registration() -> bool {
+    REQUEST_COST_COLLECTOR
+        .try_with(|collector| {
+            collector
+                .lock()
+                .map(|collector| collector.registration_id.is_some())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
 }

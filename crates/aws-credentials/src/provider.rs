@@ -1,8 +1,14 @@
 use std::{
-    env, fmt, io,
+    env, fmt,
+    io::{self, Read},
     path::Path,
-    process::Command,
-    time::{Duration, SystemTime},
+    process::{Command, ExitStatus, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant, SystemTime},
 };
 
 use aws_credential_types::{
@@ -10,24 +16,26 @@ use aws_credential_types::{
     provider::{self, ProvideCredentials},
 };
 use aws_smithy_types::date_time::{DateTime, Format};
-use lru_ttl_cache::{CacheConfig, LruTtlCache};
+use futures_util::StreamExt;
+use lru_ttl_cache::{CacheConfig, KeyedSingleflight, LruTtlCache};
 use reqwest::header::AUTHORIZATION as REQWEST_AUTHORIZATION;
 use serde::Deserialize;
 use url::Url;
 
 use crate::constants::{
-    AWS_ACCESS_KEY, AWS_ACCESS_KEY_ID, AWS_CLI_CREDENTIAL_PROVIDER_NAME, AWS_CLI_PROFILE_DEFAULT,
-    AWS_CONFIG_FILE, AWS_CONFIG_RELATIVE_PATH, AWS_CONTAINER_AUTHORIZATION_TOKEN,
-    AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE, AWS_CONTAINER_CREDENTIALS_FULL_URI,
-    AWS_CONTAINER_CREDENTIALS_RELATIVE_URI, AWS_CREDENTIALS_RELATIVE_PATH, AWS_DEFAULT_PROFILE,
-    AWS_EC2_METADATA_DISABLED, AWS_PROFILE, AWS_SECRET_ACCESS_KEY, AWS_SECRET_KEY,
-    AWS_SESSION_TOKEN, AWS_SHARED_CREDENTIALS_FILE, CREDENTIAL_CACHE_CAPACITY,
-    CREDENTIAL_CACHE_STATIC_TTL, CREDENTIAL_REFRESH_FALLBACK, CREDENTIAL_REFRESH_SKEW,
-    DEFAULT_CREDENTIAL_CACHE_KEY, ECS_LOCAL_IPV4_HOST, ECS_RELATIVE_CREDENTIALS_BASE,
+    AWS_ACCESS_KEY, AWS_ACCESS_KEY_ID, AWS_CLI_COMMAND_TIMEOUT, AWS_CLI_CREDENTIAL_PROVIDER_NAME,
+    AWS_CLI_PROFILE_DEFAULT, AWS_CONFIG_FILE, AWS_CONFIG_RELATIVE_PATH,
+    AWS_CONTAINER_AUTHORIZATION_TOKEN, AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE,
+    AWS_CONTAINER_CREDENTIALS_FULL_URI, AWS_CONTAINER_CREDENTIALS_RELATIVE_URI,
+    AWS_CREDENTIALS_RELATIVE_PATH, AWS_DEFAULT_PROFILE, AWS_EC2_METADATA_DISABLED, AWS_PROFILE,
+    AWS_SECRET_ACCESS_KEY, AWS_SECRET_KEY, AWS_SESSION_TOKEN, AWS_SHARED_CREDENTIALS_FILE,
+    CREDENTIAL_CACHE_CAPACITY, CREDENTIAL_CACHE_STATIC_TTL, CREDENTIAL_REFRESH_FALLBACK,
+    CREDENTIAL_REFRESH_SKEW, DEFAULT_CREDENTIAL_CACHE_KEY, ECS_RELATIVE_CREDENTIALS_BASE,
     ECS_TASK_METADATA_PROVIDER_NAME, ENVIRONMENT_PROVIDER_NAME, HOME, IMDS_PROVIDER_NAME,
     IMDS_ROLE_LIST_URL, IMDS_TOKEN_HEADER, IMDS_TOKEN_TTL_HEADER, IMDS_TOKEN_TTL_SECONDS,
-    IMDS_TOKEN_URL, LOCALHOST, LOOPBACK_IPV4, LOOPBACK_IPV6, METADATA_CONNECT_TIMEOUT,
-    METADATA_REQUEST_TIMEOUT, STATIC_PROVIDER_NAME,
+    IMDS_TOKEN_URL, LOCALHOST, MAX_AUTHORIZATION_TOKEN_BYTES, MAX_AWS_CLI_OUTPUT_BYTES,
+    MAX_METADATA_RESPONSE_BYTES, METADATA_CONNECT_TIMEOUT, METADATA_REQUEST_TIMEOUT,
+    STATIC_PROVIDER_NAME,
 };
 
 pub(crate) type CredentialProviderError = provider::error::CredentialsError;
@@ -80,6 +88,7 @@ pub fn resolve_default_chain_credentials_with_expiry()
 pub struct DefaultChainCredentialsProvider {
     client: reqwest::Client,
     cache: LruTtlCache<&'static str, Credentials>,
+    refresh_flight: KeyedSingleflight<&'static str>,
 }
 
 #[derive(Clone)]
@@ -156,6 +165,7 @@ impl fmt::Debug for DefaultChainCredentialsProvider {
         f.debug_struct("DefaultChainCredentialsProvider")
             .field("client", &self.client)
             .field("cache_ttl", &self.cache.ttl())
+            .field("refresh_flight", &"[SINGLEFLIGHT]")
             .finish()
     }
 }
@@ -177,6 +187,9 @@ enum CredentialProviderErrorKind {
         profile: String,
         reason: String,
     },
+    AwsCliOutputTooLarge,
+    AwsCliTimedOut,
+    AuthorizationTokenFileTooLarge,
     InvalidAwsCliCredentialJson(String),
     EcsRelativeUriMustBePath,
     EcsFullUriMissingHost,
@@ -184,6 +197,7 @@ enum CredentialProviderErrorKind {
     EcsFullUriRequiresHttpOrHttps,
     EmptyAuthorizationTokenFile(String),
     IncompleteCredentialResponse,
+    MetadataRequestFailed,
 }
 
 #[derive(Debug)]
@@ -246,6 +260,13 @@ impl fmt::Display for CredentialProviderErrorKind {
                     "failed to export credentials for profile `{profile}`: {reason}"
                 )
             }
+            Self::AwsCliOutputTooLarge => {
+                write!(f, "aws cli credential output exceeds configured limit")
+            }
+            Self::AwsCliTimedOut => f.write_str("aws cli credential command timed out"),
+            Self::AuthorizationTokenFileTooLarge => {
+                write!(f, "authorization token file exceeds configured limit")
+            }
             Self::InvalidAwsCliCredentialJson(error) => {
                 write!(f, "invalid aws cli credential JSON: {error}")
             }
@@ -267,6 +288,7 @@ impl fmt::Display for CredentialProviderErrorKind {
             Self::IncompleteCredentialResponse => f.write_str(
                 "credential response did not include access key id and secret access key",
             ),
+            Self::MetadataRequestFailed => f.write_str("metadata request failed"),
         }
     }
 }
@@ -341,6 +363,7 @@ impl DefaultChainCredentialsProvider {
         let client = reqwest::Client::builder()
             .connect_timeout(METADATA_CONNECT_TIMEOUT)
             .timeout(METADATA_REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(provider::error::CredentialsError::provider_error)?;
 
@@ -351,10 +374,22 @@ impl DefaultChainCredentialsProvider {
                     .with_capacity(CREDENTIAL_CACHE_CAPACITY)
                     .with_ttl(CREDENTIAL_CACHE_STATIC_TTL),
             ),
+            refresh_flight: KeyedSingleflight::default(),
         })
     }
 
     async fn load_credentials(&self) -> provider::Result {
+        if let Some(credentials) = self.cached_credentials() {
+            return Ok(credentials);
+        }
+
+        // Re-check under the singleflight guard.  Without this second cache
+        // read every concurrent miss could independently walk the profile,
+        // ECS, and IMDS chain before any of them stored the result.
+        let _guard = self
+            .refresh_flight
+            .lock(&DEFAULT_CREDENTIAL_CACHE_KEY)
+            .await;
         if let Some(credentials) = self.cached_credentials() {
             return Ok(credentials);
         }
@@ -372,7 +407,7 @@ impl DefaultChainCredentialsProvider {
         self.cache.insert_with_ttl(
             DEFAULT_CREDENTIAL_CACHE_KEY,
             resolved.credentials.clone(),
-            credential_cache_ttl(resolved.refresh_after),
+            credential_cache_ttl(resolved.refresh_after, SystemTime::now()),
         );
     }
 
@@ -383,7 +418,7 @@ impl DefaultChainCredentialsProvider {
 
         let mut provider_errors = Vec::new();
 
-        match resolve_profile_credentials() {
+        match resolve_profile_credentials_async().await {
             Ok(Some(credentials)) => return Ok(credentials),
             Ok(None) => {}
             Err(err) => provider_errors.push(ProviderFailure::new(
@@ -432,10 +467,7 @@ impl DefaultChainCredentialsProvider {
             request = request.header(REQWEST_AUTHORIZATION, token);
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(provider::error::CredentialsError::provider_error)?;
+        let response = request.send().await.map_err(|_| metadata_request_error())?;
         if !response.status().is_success() {
             return Err(provider_error_message(
                 CredentialProviderErrorKind::MetadataEndpointStatus {
@@ -445,9 +477,10 @@ impl DefaultChainCredentialsProvider {
             ));
         }
 
-        let payload = response
-            .json::<MetadataCredentialsResponse>()
+        let body = bounded_response_body(response)
             .await
+            .map_err(provider::error::CredentialsError::provider_error)?;
+        let payload = serde_json::from_slice::<MetadataCredentialsResponse>(&body)
             .map_err(provider::error::CredentialsError::provider_error)?;
 
         metadata_to_credentials(payload, ECS_TASK_METADATA_PROVIDER_NAME).map(Some)
@@ -466,7 +499,7 @@ impl DefaultChainCredentialsProvider {
             .header(IMDS_TOKEN_TTL_HEADER, IMDS_TOKEN_TTL_SECONDS)
             .send()
             .await
-            .map_err(provider::error::CredentialsError::provider_error)?;
+            .map_err(|_| metadata_request_error())?;
         if !token_response.status().is_success() {
             return Err(provider_error_message(
                 CredentialProviderErrorKind::MetadataEndpointStatus {
@@ -476,11 +509,13 @@ impl DefaultChainCredentialsProvider {
             ));
         }
 
-        let token_body = token_response
-            .text()
+        let token_body = bounded_response_body(token_response)
             .await
             .map_err(provider::error::CredentialsError::provider_error)?;
-        let token = token_body.trim().to_owned();
+        let token = std::str::from_utf8(&token_body)
+            .map_err(provider::error::CredentialsError::provider_error)?
+            .trim()
+            .to_owned();
         if token.is_empty() {
             return Err(provider_error_message(
                 CredentialProviderErrorKind::EmptyImdsToken,
@@ -493,7 +528,7 @@ impl DefaultChainCredentialsProvider {
             .header(IMDS_TOKEN_HEADER, token.as_str())
             .send()
             .await
-            .map_err(provider::error::CredentialsError::provider_error)?;
+            .map_err(|_| metadata_request_error())?;
         if !role_response.status().is_success() {
             return Err(provider_error_message(
                 CredentialProviderErrorKind::MetadataEndpointStatus {
@@ -503,11 +538,11 @@ impl DefaultChainCredentialsProvider {
             ));
         }
 
-        let role_body = role_response
-            .text()
+        let role_body = bounded_response_body(role_response)
             .await
             .map_err(provider::error::CredentialsError::provider_error)?;
-        let role_name = role_body
+        let role_name = std::str::from_utf8(&role_body)
+            .map_err(provider::error::CredentialsError::provider_error)?
             .lines()
             .map(str::trim)
             .find(|line| !line.is_empty())
@@ -523,7 +558,7 @@ impl DefaultChainCredentialsProvider {
             .header(IMDS_TOKEN_HEADER, token)
             .send()
             .await
-            .map_err(provider::error::CredentialsError::provider_error)?;
+            .map_err(|_| metadata_request_error())?;
         if !credentials_response.status().is_success() {
             return Err(provider_error_message(
                 CredentialProviderErrorKind::MetadataEndpointStatus {
@@ -533,9 +568,10 @@ impl DefaultChainCredentialsProvider {
             ));
         }
 
-        let payload = credentials_response
-            .json::<MetadataCredentialsResponse>()
+        let body = bounded_response_body(credentials_response)
             .await
+            .map_err(provider::error::CredentialsError::provider_error)?;
+        let payload = serde_json::from_slice::<MetadataCredentialsResponse>(&body)
             .map_err(provider::error::CredentialsError::provider_error)?;
 
         metadata_to_credentials(payload, IMDS_PROVIDER_NAME).map(Some)
@@ -565,7 +601,9 @@ fn resolve_default_chain_blocking() -> CredentialProviderResult<ResolvedCredenti
         )),
     }
 
-    match resolve_ecs_task_credentials_blocking() {
+    let client = blocking_metadata_http_client()?;
+
+    match resolve_ecs_task_credentials_with_blocking_client(&client) {
         Ok(Some(credentials)) => return Ok(credentials),
         Ok(None) => {}
         Err(err) => provider_errors.push(ProviderFailure::new(
@@ -574,7 +612,7 @@ fn resolve_default_chain_blocking() -> CredentialProviderResult<ResolvedCredenti
         )),
     }
 
-    match resolve_imds_credentials_blocking() {
+    match resolve_imds_credentials_with_blocking_client(&client) {
         Ok(Some(credentials)) => return Ok(credentials),
         Ok(None) => {}
         Err(err) => {
@@ -591,6 +629,17 @@ fn resolve_default_chain_blocking() -> CredentialProviderResult<ResolvedCredenti
     Err(provider_error_message(
         CredentialProviderErrorKind::BlockingDefaultChainFailures(provider_errors),
     ))
+}
+
+async fn resolve_profile_credentials_async() -> CredentialProviderResult<Option<ResolvedCredentials>>
+{
+    tokio::task::spawn_blocking(resolve_profile_credentials)
+        .await
+        .map_err(|error| {
+            provider_error_message(CredentialProviderErrorKind::AwsCliRunFailed(format!(
+                "profile resolver task failed: {error}"
+            )))
+        })?
 }
 
 fn resolve_environment_credentials() -> CredentialProviderResult<Option<ResolvedCredentials>> {
@@ -621,6 +670,104 @@ fn resolve_environment_credentials() -> CredentialProviderResult<Option<Resolved
     }
 }
 
+pub(crate) struct BoundedCommandOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) timed_out: bool,
+}
+
+pub(crate) fn run_bounded_command(mut command: Command) -> io::Result<BoundedCommandOutput> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("aws cli stdout pipe was not captured"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("aws cli stderr pipe was not captured"))?;
+    let output_too_large = Arc::new(AtomicBool::new(false));
+    let stdout_too_large = Arc::clone(&output_too_large);
+    let stderr_too_large = Arc::clone(&output_too_large);
+    let stdout_reader = thread::spawn(move || {
+        read_capped(stdout, MAX_AWS_CLI_OUTPUT_BYTES, stdout_too_large.as_ref())
+    });
+    let stderr_reader = thread::spawn(move || {
+        read_capped(stderr, MAX_AWS_CLI_OUTPUT_BYTES, stderr_too_large.as_ref())
+    });
+
+    let deadline = Instant::now() + AWS_CLI_COMMAND_TIMEOUT;
+    let (status, timed_out) = loop {
+        if output_too_large.load(Ordering::Acquire) {
+            let _ = child.kill();
+            break (child.wait()?, false);
+        }
+        if let Some(status) = child.try_wait()? {
+            break (status, false);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            break (child.wait()?, true);
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    let stdout = join_command_reader(stdout_reader)?;
+    let stderr = join_command_reader(stderr_reader)?;
+    Ok(BoundedCommandOutput {
+        status,
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
+fn read_capped<R: Read>(
+    mut reader: R,
+    limit: usize,
+    output_too_large: &AtomicBool,
+) -> io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(limit.saturating_add(1));
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(output);
+        }
+        let remaining = limit.saturating_add(1).saturating_sub(output.len());
+        output.extend_from_slice(&buffer[..read.min(remaining)]);
+        if output.len() > limit {
+            output_too_large.store(true, Ordering::Release);
+            return Ok(output);
+        }
+    }
+}
+
+fn join_command_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other("aws cli output reader panicked"))?
+}
+
+enum BoundedFileReadError {
+    Io(io::Error),
+    TooLarge,
+}
+
+fn read_bounded_file(path: &str, limit: usize) -> Result<Vec<u8>, BoundedFileReadError> {
+    let file = std::fs::File::open(path).map_err(BoundedFileReadError::Io)?;
+    let mut contents = Vec::with_capacity(limit.saturating_add(1));
+    file.take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut contents)
+        .map_err(BoundedFileReadError::Io)?;
+    if contents.len() > limit {
+        return Err(BoundedFileReadError::TooLarge);
+    }
+    Ok(contents)
+}
+
 fn resolve_profile_credentials() -> CredentialProviderResult<Option<ResolvedCredentials>> {
     let profile = requested_profile_name();
     if !should_try_profile_credentials(profile.as_deref()) {
@@ -637,11 +784,17 @@ fn resolve_profile_credentials() -> CredentialProviderResult<Option<ResolvedCred
         command.arg("--profile").arg(profile_name);
     }
 
-    let output = command.output().map_err(|err| {
+    let output = run_bounded_command(command).map_err(|err| {
         provider_error_message(CredentialProviderErrorKind::AwsCliRunFailed(
             err.to_string(),
         ))
     })?;
+    if output.timed_out {
+        return Err(provider_error_message(
+            CredentialProviderErrorKind::AwsCliTimedOut,
+        ));
+    }
+    validate_aws_cli_output_size(&output.stdout, &output.stderr)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         let profile_name = profile.as_deref().unwrap_or(AWS_CLI_PROFILE_DEFAULT);
@@ -676,29 +829,40 @@ fn resolve_profile_credentials() -> CredentialProviderResult<Option<ResolvedCred
     .map(Some)
 }
 
+pub(crate) fn validate_aws_cli_output_size(
+    stdout: &[u8],
+    stderr: &[u8],
+) -> CredentialProviderResult<()> {
+    if stdout.len().saturating_add(stderr.len()) > MAX_AWS_CLI_OUTPUT_BYTES {
+        return Err(provider_error_message(
+            CredentialProviderErrorKind::AwsCliOutputTooLarge,
+        ));
+    }
+    Ok(())
+}
+
 fn blocking_metadata_http_client() -> CredentialProviderResult<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
         .connect_timeout(METADATA_CONNECT_TIMEOUT)
         .timeout(METADATA_REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(provider::error::CredentialsError::provider_error)
 }
 
-fn resolve_ecs_task_credentials_blocking() -> CredentialProviderResult<Option<ResolvedCredentials>>
-{
+fn resolve_ecs_task_credentials_with_blocking_client(
+    client: &reqwest::blocking::Client,
+) -> CredentialProviderResult<Option<ResolvedCredentials>> {
     let Some(uri) = resolve_ecs_task_credentials_uri()? else {
         return Ok(None);
     };
 
-    let client = blocking_metadata_http_client()?;
     let mut request = client.get(uri);
     if let Some(token) = resolve_ecs_authorization_token()? {
         request = request.header(REQWEST_AUTHORIZATION, token);
     }
 
-    let response = request
-        .send()
-        .map_err(provider::error::CredentialsError::provider_error)?;
+    let response = request.send().map_err(|_| metadata_request_error())?;
     if !response.status().is_success() {
         return Err(provider_error_message(
             CredentialProviderErrorKind::MetadataEndpointStatus {
@@ -708,24 +872,26 @@ fn resolve_ecs_task_credentials_blocking() -> CredentialProviderResult<Option<Re
         ));
     }
 
-    let payload = response
-        .json::<MetadataCredentialsResponse>()
+    let body = bounded_blocking_response_body(response)
+        .map_err(provider::error::CredentialsError::provider_error)?;
+    let payload = serde_json::from_slice::<MetadataCredentialsResponse>(&body)
         .map_err(provider::error::CredentialsError::provider_error)?;
 
     metadata_to_credentials(payload, ECS_TASK_METADATA_PROVIDER_NAME).map(Some)
 }
 
-fn resolve_imds_credentials_blocking() -> CredentialProviderResult<Option<ResolvedCredentials>> {
+fn resolve_imds_credentials_with_blocking_client(
+    client: &reqwest::blocking::Client,
+) -> CredentialProviderResult<Option<ResolvedCredentials>> {
     if ec2_metadata_is_disabled() {
         return Ok(None);
     }
 
-    let client = blocking_metadata_http_client()?;
     let token_response = client
         .put(IMDS_TOKEN_URL)
         .header(IMDS_TOKEN_TTL_HEADER, IMDS_TOKEN_TTL_SECONDS)
         .send()
-        .map_err(provider::error::CredentialsError::provider_error)?;
+        .map_err(|_| metadata_request_error())?;
     if !token_response.status().is_success() {
         return Err(provider_error_message(
             CredentialProviderErrorKind::MetadataEndpointStatus {
@@ -735,9 +901,11 @@ fn resolve_imds_credentials_blocking() -> CredentialProviderResult<Option<Resolv
         ));
     }
 
-    let token = token_response
-        .text()
+    let token_body = bounded_blocking_response_body(token_response)
         .map_err(provider::error::CredentialsError::provider_error)?;
+    let token = std::str::from_utf8(&token_body)
+        .map_err(provider::error::CredentialsError::provider_error)?
+        .to_owned();
     if token.trim().is_empty() {
         return Err(provider_error_message(
             CredentialProviderErrorKind::EmptyImdsToken,
@@ -748,7 +916,7 @@ fn resolve_imds_credentials_blocking() -> CredentialProviderResult<Option<Resolv
         .get(IMDS_ROLE_LIST_URL)
         .header(IMDS_TOKEN_HEADER, token.as_str())
         .send()
-        .map_err(provider::error::CredentialsError::provider_error)?;
+        .map_err(|_| metadata_request_error())?;
     if !role_list_response.status().is_success() {
         return Err(provider_error_message(
             CredentialProviderErrorKind::MetadataEndpointStatus {
@@ -758,10 +926,10 @@ fn resolve_imds_credentials_blocking() -> CredentialProviderResult<Option<Resolv
         ));
     }
 
-    let role_body = role_list_response
-        .text()
+    let role_body = bounded_blocking_response_body(role_list_response)
         .map_err(provider::error::CredentialsError::provider_error)?;
-    let role_name = role_body
+    let role_name = std::str::from_utf8(&role_body)
+        .map_err(provider::error::CredentialsError::provider_error)?
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
@@ -772,7 +940,7 @@ fn resolve_imds_credentials_blocking() -> CredentialProviderResult<Option<Resolv
         .get(format!("{IMDS_ROLE_LIST_URL}{role_name}"))
         .header(IMDS_TOKEN_HEADER, token)
         .send()
-        .map_err(provider::error::CredentialsError::provider_error)?;
+        .map_err(|_| metadata_request_error())?;
     if !credentials_response.status().is_success() {
         return Err(provider_error_message(
             CredentialProviderErrorKind::MetadataEndpointStatus {
@@ -782,8 +950,9 @@ fn resolve_imds_credentials_blocking() -> CredentialProviderResult<Option<Resolv
         ));
     }
 
-    let payload = credentials_response
-        .json::<MetadataCredentialsResponse>()
+    let body = bounded_blocking_response_body(credentials_response)
+        .map_err(provider::error::CredentialsError::provider_error)?;
+    let payload = serde_json::from_slice::<MetadataCredentialsResponse>(&body)
         .map_err(provider::error::CredentialsError::provider_error)?;
 
     metadata_to_credentials(payload, IMDS_PROVIDER_NAME).map(Some)
@@ -791,6 +960,58 @@ fn resolve_imds_credentials_blocking() -> CredentialProviderResult<Option<Resolv
 
 fn requested_profile_name() -> Option<String> {
     non_empty_env_var(AWS_PROFILE).or_else(|| non_empty_env_var(AWS_DEFAULT_PROFILE))
+}
+
+async fn bounded_response_body(response: reqwest::Response) -> io::Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_METADATA_RESPONSE_BYTES as u64)
+    {
+        return Err(io::Error::other(
+            "metadata response exceeds configured limit",
+        ));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(io::Error::other)?;
+        if body.len().saturating_add(chunk.len()) > MAX_METADATA_RESPONSE_BYTES {
+            return Err(io::Error::other(
+                "metadata response exceeds configured limit",
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+pub(crate) fn bounded_blocking_response_body(
+    response: reqwest::blocking::Response,
+) -> io::Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_METADATA_RESPONSE_BYTES as u64)
+    {
+        return Err(io::Error::other(
+            "metadata response exceeds configured limit",
+        ));
+    }
+
+    let mut body = Vec::with_capacity(response.content_length().map_or(0, |length| {
+        usize::try_from(length)
+            .unwrap_or(MAX_METADATA_RESPONSE_BYTES)
+            .min(MAX_METADATA_RESPONSE_BYTES)
+    }));
+    response
+        .take(MAX_METADATA_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut body)?;
+    if body.len() > MAX_METADATA_RESPONSE_BYTES {
+        return Err(io::Error::other(
+            "metadata response exceeds configured limit",
+        ));
+    }
+    Ok(body)
 }
 
 fn should_try_profile_credentials(profile: Option<&str>) -> bool {
@@ -821,7 +1042,7 @@ pub fn resolve_ecs_task_credentials_uri() -> CredentialProviderResult<Option<Url
         return Ok(None);
     };
 
-    if relative_uri.starts_with("//") {
+    if relative_uri.starts_with("//") || relative_uri.contains('\\') {
         return Err(invalid_configuration_message(
             CredentialProviderErrorKind::EcsRelativeUriMustBePath,
         ));
@@ -837,6 +1058,12 @@ pub fn resolve_ecs_task_credentials_uri() -> CredentialProviderResult<Option<Url
         .and_then(|base| base.join(&normalized))
         .map_err(provider::error::CredentialsError::invalid_configuration)?;
 
+    if uri.scheme() != "http" || uri.host_str() != Some("169.254.170.2") {
+        return Err(invalid_configuration_message(
+            CredentialProviderErrorKind::EcsRelativeUriMustBePath,
+        ));
+    }
+
     Ok(Some(uri))
 }
 
@@ -844,15 +1071,12 @@ pub fn validate_ecs_full_uri(uri: &Url) -> CredentialProviderResult<()> {
     match uri.scheme() {
         "https" => Ok(()),
         "http" => {
-            let Some(host) = uri.host_str() else {
+            let Some(host) = uri.host() else {
                 return Err(invalid_configuration_message(
                     CredentialProviderErrorKind::EcsFullUriMissingHost,
                 ));
             };
-            if matches!(
-                host,
-                ECS_LOCAL_IPV4_HOST | LOCALHOST | LOOPBACK_IPV4 | LOOPBACK_IPV6
-            ) {
+            if is_allowed_ecs_http_host(&host) {
                 Ok(())
             } else {
                 Err(invalid_configuration_message(
@@ -866,9 +1090,30 @@ pub fn validate_ecs_full_uri(uri: &Url) -> CredentialProviderResult<()> {
     }
 }
 
+fn is_allowed_ecs_http_host(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Ipv4(address) => {
+            *address == std::net::Ipv4Addr::new(169, 254, 170, 2) || address.is_loopback()
+        }
+        url::Host::Ipv6(address) => address.is_loopback(),
+        url::Host::Domain(host) => host.eq_ignore_ascii_case(LOCALHOST),
+    }
+}
+
 pub fn resolve_ecs_authorization_token() -> CredentialProviderResult<Option<String>> {
     if let Some(token_file) = non_empty_env_var(AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE) {
-        let token = std::fs::read_to_string(&token_file)
+        let token_bytes =
+            read_bounded_file(&token_file, MAX_AUTHORIZATION_TOKEN_BYTES).map_err(|error| {
+                match error {
+                    BoundedFileReadError::Io(error) => {
+                        provider::error::CredentialsError::provider_error(error)
+                    }
+                    BoundedFileReadError::TooLarge => provider_error_message(
+                        CredentialProviderErrorKind::AuthorizationTokenFileTooLarge,
+                    ),
+                }
+            })?;
+        let token = std::str::from_utf8(&token_bytes)
             .map_err(provider::error::CredentialsError::provider_error)?;
         let trimmed = token.trim().to_owned();
         if trimmed.is_empty() {
@@ -901,13 +1146,7 @@ fn metadata_to_credentials(
         .expiration
         .as_deref()
         .and_then(parse_expiration_datetime);
-
-    let refresh_after = Some(match expires_after {
-        Some(expires_after) => expires_after
-            .checked_sub(CREDENTIAL_REFRESH_SKEW)
-            .unwrap_or_else(|| SystemTime::now() + CREDENTIAL_REFRESH_FALLBACK),
-        None => SystemTime::now() + CREDENTIAL_REFRESH_FALLBACK,
-    });
+    let refresh_after = Some(metadata_refresh_after(SystemTime::now(), expires_after));
 
     Ok(ResolvedCredentials {
         credentials: Credentials::new(
@@ -938,13 +1177,23 @@ fn parse_expiration_datetime(value: &str) -> Option<SystemTime> {
     SystemTime::try_from(parsed).ok()
 }
 
-fn credential_cache_ttl(refresh_after: Option<SystemTime>) -> Duration {
+pub(crate) fn metadata_refresh_after(
+    now: SystemTime,
+    expires_after: Option<SystemTime>,
+) -> SystemTime {
+    match expires_after {
+        Some(expires_after) => expires_after
+            .checked_sub(CREDENTIAL_REFRESH_SKEW)
+            .unwrap_or(now + CREDENTIAL_REFRESH_FALLBACK),
+        None => now + CREDENTIAL_REFRESH_FALLBACK,
+    }
+}
+
+pub(crate) fn credential_cache_ttl(refresh_after: Option<SystemTime>, now: SystemTime) -> Duration {
     let Some(refresh_after) = refresh_after else {
         return CREDENTIAL_CACHE_STATIC_TTL;
     };
-    refresh_after
-        .duration_since(SystemTime::now())
-        .unwrap_or(Duration::ZERO)
+    refresh_after.duration_since(now).unwrap_or(Duration::ZERO)
 }
 
 fn non_empty_env_var(name: &str) -> Option<String> {
@@ -964,6 +1213,10 @@ fn invalid_configuration_message(kind: CredentialProviderErrorKind) -> Credentia
 
 fn provider_error_message(kind: CredentialProviderErrorKind) -> CredentialProviderError {
     CredentialProviderError::provider_error(io::Error::other(kind))
+}
+
+fn metadata_request_error() -> CredentialProviderError {
+    provider_error_message(CredentialProviderErrorKind::MetadataRequestFailed)
 }
 
 fn not_loaded_error(kind: CredentialProviderErrorKind) -> CredentialProviderError {

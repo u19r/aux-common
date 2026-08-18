@@ -5,7 +5,32 @@ use authz_types::{
 };
 use cedar_policy::PolicySet;
 
-use crate::generate_static_policies;
+use crate::{generate_static_policies, policy_generator::balanced_boolean_expr};
+
+#[test]
+fn boolean_expression_depth_grows_logarithmically() {
+    let terms = (0..64)
+        .map(|index| format!("term{index}"))
+        .collect::<Vec<_>>();
+
+    let expression = balanced_boolean_expr(&terms, "&&");
+    let mut depth = 0_u8;
+    let mut maximum_depth = 0_u8;
+    for character in expression.chars() {
+        match character {
+            '(' => {
+                depth += 1;
+                maximum_depth = maximum_depth.max(depth);
+            }
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+
+    assert_eq!(0, depth, "the generated expression must be balanced");
+    assert_eq!(6, maximum_depth, "64 terms require six binary levels");
+    assert_eq!(63, expression.matches(" && ").count());
+}
 
 fn permission_actions(resource_type: &str, action_names: &[String]) -> Vec<PermissionActionRef> {
     action_names
@@ -314,6 +339,71 @@ fn step_up_policy_includes_session_guard() {
 }
 
 #[test]
+fn step_up_policy_escapes_required_amr_values() {
+    let mut step_up_config = HashMap::new();
+    step_up_config.insert(
+        "document".to_string(),
+        authz_types::StepUpConfig {
+            default_rule: None,
+            action_rules: [("read".to_string(), "mfa".to_string())]
+                .into_iter()
+                .collect(),
+        },
+    );
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "read".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "document:reader".into(),
+            name: "Reader".into(),
+            description: None,
+            actions: permission_actions("document", &["read".into()]),
+            not_actions: vec![],
+        }],
+        roles: vec![authz_types::Role {
+            id: "reader".into(),
+            name: "Reader".into(),
+            description: None,
+            permissions: vec![authz_types::RolePermission {
+                permission_id: PermissionId::new("document:reader").expect("permission id"),
+                scopes: vec![authz_types::Scope::Tenant],
+            }],
+            actions: vec![],
+            not_actions: vec![],
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: vec![authz_types::StepUpRule::require_amr(
+            "mfa",
+            "Require MFA",
+            vec![r#"otp") || true || (context._authz.session_amr.contains("x"#.into()],
+        )],
+        step_up_config,
+        default_step_up_rule: None,
+    }
+    .into_validated()
+    .expect("valid config");
+
+    let policies_json = generate_static_policies(&config).expect("escaped policy should parse");
+    let policy_set = parse_policy_set(&policies_json);
+    let policy_text = template_texts(&policy_set).join("\n");
+    assert!(
+        policy_text.contains(r#"otp\") || true"#),
+        "AMR syntax must be escaped inside the Cedar string literal"
+    );
+}
+
+#[test]
 fn policy_generation_emits_scope_guards_for_all_scopes() {
     let config = ConfigurationModel {
         version: 1,
@@ -449,7 +539,16 @@ fn step_up_policy_includes_auth_age_guard() {
         scope_mappings: Vec::new(),
         description: None,
         authn_providers: vec![],
-        step_up_rules: vec![StepUpRule::require_recent_auth("recent", "Recent", 300)],
+        step_up_rules: vec![StepUpRule {
+            rule_id: "recent".into(),
+            name: "Recent".into(),
+            description: None,
+            required_acr: AcrLevel::RecentAuth,
+            max_auth_age_seconds: Some(300),
+            max_mfa_age_seconds: None,
+            required_amr: Vec::new(),
+            applies_to_api_keys: false,
+        }],
         step_up_config,
         default_step_up_rule: None,
     };
@@ -467,8 +566,16 @@ fn step_up_policy_includes_auth_age_guard() {
         "auth age guard should enforce max age"
     );
     assert!(
+        policy_text.contains("session_acr) == 4") || policy_text.contains("session_acr)) == 4"),
+        "RecentAuth must require the dedicated assurance level"
+    );
+    assert!(
         policy_text.contains("token_present"),
         "auth age guard should allow api keys"
+    );
+    assert!(
+        policy_text.contains("((context._authz).token_present) && ((context._authz).token_valid)"),
+        "an API-key exemption must not bypass an invalid token"
     );
 }
 
@@ -817,11 +924,13 @@ fn different_effects_produce_distinct_templates() {
                 resource_type: "document".into(),
                 action_name: "read".into(),
                 scopes: vec![Scope::Tenant],
+                limit: None,
             }],
             not_actions: vec![authz_types::RoleActionRef {
                 resource_type: "document".into(),
                 action_name: "read".into(),
                 scopes: vec![Scope::Tenant],
+                limit: None,
             }],
         }],
         scope_mappings: Vec::new(),

@@ -44,21 +44,24 @@ impl SignatureAlgorithm {
     }
 }
 
-impl From<jsonwebtoken::Algorithm> for SignatureAlgorithm {
-    fn from(algorithm: jsonwebtoken::Algorithm) -> Self {
+impl TryFrom<jsonwebtoken::Algorithm> for SignatureAlgorithm {
+    type Error = JwtDecodeError;
+
+    fn try_from(algorithm: jsonwebtoken::Algorithm) -> Result<Self> {
         match algorithm {
-            jsonwebtoken::Algorithm::HS256 => Self::HS256,
-            jsonwebtoken::Algorithm::HS384 => Self::HS384,
-            jsonwebtoken::Algorithm::HS512 => Self::HS512,
-            jsonwebtoken::Algorithm::RS256 => Self::RS256,
-            jsonwebtoken::Algorithm::RS384 => Self::RS384,
-            jsonwebtoken::Algorithm::RS512 => Self::RS512,
-            jsonwebtoken::Algorithm::PS256 => Self::PS256,
-            jsonwebtoken::Algorithm::PS384 => Self::PS384,
-            jsonwebtoken::Algorithm::PS512 => Self::PS512,
-            jsonwebtoken::Algorithm::ES256 => Self::ES256,
-            jsonwebtoken::Algorithm::ES384 => Self::ES384,
-            jsonwebtoken::Algorithm::EdDSA => Self::EdDSA,
+            jsonwebtoken::Algorithm::HS256 => Ok(Self::HS256),
+            jsonwebtoken::Algorithm::HS384 => Ok(Self::HS384),
+            jsonwebtoken::Algorithm::HS512 => Ok(Self::HS512),
+            jsonwebtoken::Algorithm::RS256 => Ok(Self::RS256),
+            jsonwebtoken::Algorithm::RS384 => Ok(Self::RS384),
+            jsonwebtoken::Algorithm::RS512 => Ok(Self::RS512),
+            jsonwebtoken::Algorithm::PS256 => Ok(Self::PS256),
+            jsonwebtoken::Algorithm::PS384 => Ok(Self::PS384),
+            jsonwebtoken::Algorithm::PS512 => Ok(Self::PS512),
+            jsonwebtoken::Algorithm::ES256 => Ok(Self::ES256),
+            jsonwebtoken::Algorithm::ES384 => Ok(Self::ES384),
+            jsonwebtoken::Algorithm::EdDSA => Ok(Self::EdDSA),
+            _ => Err(JwtDecodeError::new(JwtDecodeErrorKind::UnsupportedHeader)),
         }
     }
 }

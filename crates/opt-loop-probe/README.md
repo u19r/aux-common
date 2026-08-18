@@ -37,6 +37,15 @@ AUX_OPT_LOOP_ALLOC_SAMPLE_RATE=512 \
 AUX_OPT_LOOP_STACK_DEPTH=32
 ```
 
+The default target and phase path components are sanitized and bounded. Hotspot collection keeps
+at most 1,024 entries, operation labels are bounded to 128 bytes, and captured backtraces are
+bounded to 4 KiB with a maximum stack depth of 64. Operation values are diagnostic identifiers,
+not request data; callers must not pass secrets. Secret-like labels are redacted before they are
+retained. Explicit `AUX_OPT_LOOP_SAMPLE_FILE` and `AUX_OPT_LOOP_HOTSPOT_FILE` paths are trusted
+operator/developer configuration and may intentionally point outside the default run directory.
+Component counters and hotspot aggregates are process-local and may be eventually visible in the
+JSON files; call `force_flush()` when a current snapshot is required.
+
 ## Recording component work
 
 Call the component helpers around work that may pause the optimized loop:

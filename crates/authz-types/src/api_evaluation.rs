@@ -3,7 +3,7 @@ use utoipa::ToSchema;
 
 use crate::{
     Action, AuthzChallenge, BatchEvaluationRequest, Context, EvaluationRequest, EvaluationResponse,
-    JwtContext, SessionContext, Subject, SubjectType, TokenContext,
+    JwtContext, MAX_BATCH_EVALUATIONS, SessionContext, Subject, SubjectType, TokenContext,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -152,12 +152,47 @@ impl From<EvaluationResponse> for ApiEvaluationResponse {
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct ApiBatchEvaluationRequest {
+    #[serde(deserialize_with = "deserialize_bounded_api_evaluations")]
     #[schema(min_items = 1, max_items = 100)]
     pub evaluations: Vec<ApiEvaluationRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_override: Option<ApiSubject>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_context_override: Option<TokenContext>,
+}
+
+fn deserialize_bounded_api_evaluations<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ApiEvaluationRequest>, D::Error>
+where D: serde::Deserializer<'de> {
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Vec<ApiEvaluationRequest>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded API evaluation sequence")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where A: serde::de::SeqAccess<'de> {
+            let mut values = Vec::new();
+            while values.len() < MAX_BATCH_EVALUATIONS {
+                let Some(value) = sequence.next_element()? else {
+                    return Ok(values);
+                };
+                values.push(value);
+            }
+            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom(format!(
+                    "evaluations exceeds maximum of {MAX_BATCH_EVALUATIONS} entries"
+                )));
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(Visitor)
 }
 
 impl From<ApiBatchEvaluationRequest> for BatchEvaluationRequest {

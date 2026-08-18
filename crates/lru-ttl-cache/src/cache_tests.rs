@@ -1,4 +1,5 @@
 use std::{
+    fmt::{self, Write as _},
     hash::{Hash, Hasher},
     hint::black_box,
     sync::{
@@ -10,6 +11,11 @@ use std::{
 };
 
 use tokio::sync::{Barrier, Mutex, Notify};
+use tracing::{
+    Event, Metadata, Subscriber,
+    field::{Field, Visit},
+    span::{Attributes, Id, Record},
+};
 
 use crate::{
     cache::{FetchingLruTtlCache, LruTtlCache},
@@ -56,6 +62,34 @@ async fn fetches_value_when_missing() {
     assert_eq!(1, *guard);
 }
 
+#[tokio::test]
+async fn peek_reads_a_fresh_value_without_starting_refresh() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fetch: FetchFn<String, usize, ()> = {
+        let calls = Arc::clone(&calls);
+        arc_fetch_fn(move |_key: String| {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(1))
+            }
+        })
+    };
+    let cache = FetchingLruTtlCache::new(
+        CacheConfig::<String, usize>::new()
+            .with_ttl(Duration::from_millis(100))
+            .with_fetch(fetch)
+            .with_refresh_ttl(Duration::ZERO),
+    );
+    let key = "peek".to_string();
+    assert_eq!(
+        cache.get_or_fetch(&key).await.expect("initial fetch"),
+        Some(1)
+    );
+    assert_eq!(cache.peek(&key), Some(1));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn triggers_background_refresh() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -97,6 +131,67 @@ async fn triggers_background_refresh() {
 
     tokio::time::sleep(Duration::from_millis(25)).await;
     assert!(call_count.load(Ordering::SeqCst) >= 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_refresh_panic_does_not_disable_future_refreshes() {
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let refresh_started = Arc::new(Notify::new());
+    let fetch: FetchFn<String, usize, ()> = {
+        let call_count = Arc::clone(&call_count);
+        let refresh_started = Arc::clone(&refresh_started);
+        arc_fetch_fn(move |_key: String| {
+            let call_count = Arc::clone(&call_count);
+            let refresh_started = Arc::clone(&refresh_started);
+            async move {
+                match call_count.fetch_add(1, Ordering::SeqCst) + 1 {
+                    1 => Ok(Some(1)),
+                    2 => {
+                        refresh_started.notify_one();
+                        panic!("simulated refresh panic");
+                    }
+                    _ => Ok(Some(3)),
+                }
+            }
+        })
+    };
+    let cache = FetchingLruTtlCache::new(
+        CacheConfig::<String, usize>::new()
+            .with_ttl(Duration::from_secs(1))
+            .with_fetch(fetch)
+            .with_refresh_ttl(Duration::from_millis(5)),
+    );
+    let key = "refresh-panic".to_string();
+
+    assert_eq!(
+        Some(1),
+        cache.get_or_fetch(&key).await.expect("initial fetch")
+    );
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        Some(1),
+        cache
+            .get_or_fetch(&key)
+            .await
+            .expect("first refresh trigger")
+    );
+    refresh_started.notified().await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    assert_eq!(
+        Some(1),
+        cache
+            .get_or_fetch(&key)
+            .await
+            .expect("second refresh trigger")
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while call_count.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("future refresh should run after a panic");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -215,6 +310,200 @@ async fn serves_bounded_stale_value_when_refresh_fails() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_stale_on_error_calls_keep_the_value_during_stale_window() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fetch: FetchFn<String, usize, &'static str> = {
+        let calls = Arc::clone(&calls);
+        arc_fetch_fn(move |_key: String| {
+            let calls = Arc::clone(&calls);
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(Some(7))
+                } else {
+                    Err("fetch failed")
+                }
+            }
+        })
+    };
+    let cache = FetchingLruTtlCache::new(
+        CacheConfig::<String, usize>::new()
+            .with_ttl(Duration::from_millis(5))
+            .with_fetch(fetch),
+    );
+    let key = "repeated-stale".to_string();
+    assert_eq!(
+        Some(7),
+        cache.get_or_fetch(&key).await.expect("initial fetch")
+    );
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    for _ in 0..2 {
+        assert_eq!(
+            Some(7),
+            cache
+                .get_or_fetch_stale_on_error(&key, Duration::from_millis(50))
+                .await
+                .expect("stale value should remain available")
+        );
+    }
+}
+
+#[test]
+fn synchronous_cache_hit_without_runtime_does_not_spawn_refresh() {
+    let fetch: FetchFn<String, usize, ()> =
+        arc_fetch_fn(move |_key: String| async move { Ok(Some(2)) });
+    let cache = FetchingLruTtlCache::new(
+        CacheConfig::<String, usize>::new()
+            .with_ttl(Duration::from_secs(1))
+            .with_fetch(fetch)
+            .with_refresh_ttl(Duration::from_millis(1)),
+    );
+    cache.insert("no-runtime".to_string(), 1);
+    std::thread::sleep(Duration::from_millis(5));
+    assert_eq!(Some(1), cache.cached(&"no-runtime".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evicting_entry_cancels_its_background_refresh() {
+    struct ActiveGuard(Arc<AtomicUsize>);
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let refresh_started = Arc::new(Notify::new());
+    let fetch: FetchFn<String, usize, ()> = {
+        let active = Arc::clone(&active);
+        let calls = Arc::clone(&calls);
+        let refresh_started = Arc::clone(&refresh_started);
+        arc_fetch_fn(move |key: String| {
+            let active = Arc::clone(&active);
+            let calls = Arc::clone(&calls);
+            let refresh_started = Arc::clone(&refresh_started);
+            async move {
+                if key == "A" && calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _guard = ActiveGuard(Arc::clone(&active));
+                    refresh_started.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                Ok(Some(1))
+            }
+        })
+    };
+    let cache = FetchingLruTtlCache::new(
+        CacheConfig::<String, usize>::new()
+            .with_capacity(1)
+            .with_ttl(Duration::from_secs(1))
+            .with_fetch(fetch)
+            .with_refresh_ttl(Duration::from_millis(1)),
+    );
+    cache
+        .get_or_fetch(&"A".to_string())
+        .await
+        .expect("initial fetch");
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert_eq!(Some(1), cache.cached(&"A".to_string()));
+    refresh_started.notified().await;
+
+    cache.insert("B".to_string(), 2);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while active.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("eviction should cancel the refresh task");
+}
+
+struct SecretError;
+
+impl fmt::Debug for SecretError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("token=super-secret")
+    }
+}
+
+#[derive(Clone)]
+struct CapturingSubscriber {
+    events: Arc<StdMutex<Vec<String>>>,
+}
+
+impl Subscriber for CapturingSubscriber {
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        let mut visitor = EventVisitor(String::new());
+        event.record(&mut visitor);
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(visitor.0);
+    }
+
+    fn enter(&self, _span: &Id) {}
+
+    fn exit(&self, _span: &Id) {}
+}
+
+struct EventVisitor(String);
+
+impl Visit for EventVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        let _ = write!(self.0, "{}={value:?};", field.name());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fetch_error_logs_do_not_include_error_debug_payload() {
+    let fetch: FetchFn<String, usize, SecretError> =
+        arc_fetch_fn(move |_key: String| async move { Err(SecretError) });
+    let cache = FetchingLruTtlCache::new(
+        CacheConfig::<String, usize>::new()
+            .with_ttl(Duration::from_millis(5))
+            .with_fetch(fetch),
+    );
+    let key = "secret".to_string();
+    cache.insert(key.clone(), 7);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let _subscriber = tracing::subscriber::set_default(CapturingSubscriber {
+        events: Arc::clone(&events),
+    });
+    assert_eq!(
+        Some(7),
+        cache
+            .get_or_fetch_stale_on_error(&key, Duration::from_millis(50))
+            .await
+            .expect("stale value is returned")
+    );
+    drop(_subscriber);
+
+    let events = events
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .join("\n");
+    assert!(
+        !events.contains("super-secret"),
+        "secret-bearing error debug payload was logged: {events}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refuses_stale_value_after_stale_ttl() {
     let calls = Arc::new(AtomicUsize::new(0));
     let fetch: FetchFn<String, usize, &'static str> = {
@@ -248,6 +537,44 @@ async fn refuses_stale_value_after_stale_ttl() {
         cache
             .get_or_fetch_stale_on_error(&key, Duration::from_millis(5))
             .await
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refuses_stale_value_if_fetch_finishes_after_stale_ttl() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fetch: FetchFn<String, usize, &'static str> = {
+        let calls = Arc::clone(&calls);
+        arc_fetch_fn(move |_key: String| {
+            let calls = Arc::clone(&calls);
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Ok(Some(7));
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                Err("fetch failed")
+            }
+        })
+    };
+    let cache = FetchingLruTtlCache::new(
+        CacheConfig::<String, usize>::new()
+            .with_ttl(Duration::from_millis(5))
+            .with_fetch(fetch),
+    );
+    let key = "stale-fetch-too-slow".to_string();
+
+    cache
+        .get_or_fetch_stale_on_error(&key, Duration::from_millis(10))
+        .await
+        .expect("initial fetch succeeds");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    assert_eq!(
+        Err("fetch failed"),
+        cache
+            .get_or_fetch_stale_on_error(&key, Duration::from_millis(10))
+            .await,
+        "a stale value must not be resurrected after its stale deadline"
     );
 }
 
@@ -509,22 +836,33 @@ async fn cancellation_releases_same_key_followers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fetch_error_releases_same_key_followers_for_retry() {
     let calls = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
     let first_started = Arc::new(Notify::new());
     let release_first = Arc::new(Notify::new());
     let fetch: FetchFn<String, usize, &'static str> = {
         let calls = Arc::clone(&calls);
+        let active = Arc::clone(&active);
+        let maximum = Arc::clone(&maximum);
         let first_started = Arc::clone(&first_started);
         let release_first = Arc::clone(&release_first);
         arc_fetch_fn(move |_key: String| {
             let calls = Arc::clone(&calls);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
             let first_started = Arc::clone(&first_started);
             let release_first = Arc::clone(&release_first);
             async move {
-                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(current, Ordering::SeqCst);
+                let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                if first {
                     first_started.notify_one();
                     release_first.notified().await;
+                    active.fetch_sub(1, Ordering::SeqCst);
                     Err("first fetch failed")
                 } else {
+                    active.fetch_sub(1, Ordering::SeqCst);
                     Ok(Some(11))
                 }
             }
@@ -559,6 +897,7 @@ async fn fetch_error_releases_same_key_followers_for_retry() {
         follower.await.expect("follower task").expect("retry fetch")
     );
     assert_eq!(2, calls.load(Ordering::SeqCst));
+    assert_eq!(1, maximum.load(Ordering::SeqCst));
     assert_eq!(0, cache.in_flight_count());
 }
 
@@ -658,6 +997,62 @@ async fn different_keys_fetch_concurrently() {
     assert_eq!(Some(1), first.expect("first task").expect("first fetch"));
     assert_eq!(Some(1), second.expect("second task").expect("second fetch"));
     assert_eq!(2, maximum_active.load(Ordering::SeqCst));
+    assert_eq!(0, cache.in_flight_count());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn distinct_key_fetch_coordination_is_bounded_by_cache_capacity() {
+    let first_started = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+    let fetch: FetchFn<String, usize, ()> = {
+        let first_started = Arc::clone(&first_started);
+        let release_first = Arc::clone(&release_first);
+        arc_fetch_fn(move |key: String| {
+            let first_started = Arc::clone(&first_started);
+            let release_first = Arc::clone(&release_first);
+            async move {
+                if key == "first" {
+                    first_started.notify_one();
+                    release_first.notified().await;
+                }
+                Ok(Some(1))
+            }
+        })
+    };
+    let cache = FetchingLruTtlCache::new(
+        CacheConfig::<String, usize>::new()
+            .with_capacity(1)
+            .with_ttl(Duration::from_secs(1))
+            .with_fetch(fetch),
+    );
+
+    let first = {
+        let cache = cache.clone();
+        tokio::spawn(async move { cache.get_or_fetch(&"first".to_string()).await })
+    };
+    first_started.notified().await;
+
+    let mut other_tasks = Vec::new();
+    for index in 0..32 {
+        let cache = cache.clone();
+        other_tasks.push(tokio::spawn(async move {
+            cache.get_or_fetch(&format!("other-{index}")).await
+        }));
+    }
+    tokio::task::yield_now().await;
+    assert_eq!(1, cache.in_flight_count());
+
+    release_first.notify_one();
+    assert_eq!(
+        Some(1),
+        first.await.expect("first fetch task").expect("first fetch")
+    );
+    for task in other_tasks {
+        assert_eq!(
+            Some(1),
+            task.await.expect("other fetch task").expect("other fetch")
+        );
+    }
     assert_eq!(0, cache.in_flight_count());
 }
 

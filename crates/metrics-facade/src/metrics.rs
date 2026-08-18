@@ -78,6 +78,11 @@ pub enum CounterMetric {
     MetricHttpRequestAttempts,
     MetricHttpRequestErrors,
     MetricHttpRequestRetries,
+    LimitsExpiryReclaimedTotal,
+    LimitsExpiryRowsScannedTotal,
+    LimitsExpirySweepsTotal,
+    LimitsTransitionConflictsTotal,
+    LimitsTransitionTotal,
     MetricNotificationsDeliveryAttemptTotal,
     MetricNotificationsDeliveryBackpressureTotal,
     MetricNotificationsDeliveryEnqueuedTotal,
@@ -310,6 +315,11 @@ impl CounterMetric {
             Self::MetricHttpRequestAttempts => "http.request.attempts",
             Self::MetricHttpRequestErrors => "http.request.errors",
             Self::MetricHttpRequestRetries => "http.request.retries",
+            Self::LimitsExpiryReclaimedTotal => "limits.expiry.reclaimed.total",
+            Self::LimitsExpiryRowsScannedTotal => "limits.expiry.rows.scanned.total",
+            Self::LimitsExpirySweepsTotal => "limits.expiry.sweeps.total",
+            Self::LimitsTransitionConflictsTotal => "limits.transition.conflicts.total",
+            Self::LimitsTransitionTotal => "limits.transition.total",
             Self::MetricNotificationsDeliveryAttemptTotal => "notifications_delivery_attempt_total",
             Self::MetricNotificationsDeliveryBackpressureTotal => {
                 "notifications_delivery_backpressure_total"
@@ -457,6 +467,7 @@ pub enum GaugeMetric {
     MetricOutboxMaxDelayMs,
     MetricNotificationsWorkerDueBatchSize,
     MetricNotificationsWorkerOldestDueAgeMs,
+    MetricFederatedProvisionEnabledSources,
     PartitionFamilyHotFamiliesMetric,
     PartitionFamilyManagedFamiliesMetric,
     PartitionFamilyOpenPartitionsMetric,
@@ -489,6 +500,9 @@ impl GaugeMetric {
             Self::MetricNotificationsWorkerDueBatchSize => "notifications_worker_due_batch_size",
             Self::MetricNotificationsWorkerOldestDueAgeMs => {
                 "notifications_worker_oldest_due_age_ms"
+            }
+            Self::MetricFederatedProvisionEnabledSources => {
+                "authn.federated.provision_enabled_sources"
             }
             Self::PartitionFamilyHotFamiliesMetric => "partition.family.hot.families",
             Self::PartitionFamilyManagedFamiliesMetric => "partition.family.managed.families",
@@ -534,6 +548,8 @@ pub enum HistogramMetric {
     MetricFederatedProvisionHookLatencyMs,
     MetricFederatedProvisionLatencyMs,
     MetricFederatedProvisionStageLatencyMs,
+    LimitsExpirySweepDurationMs,
+    LimitsTransitionDurationMs,
     MetricHttpRequestLatencyMs,
     MetricOauthUserinfoFallbackLatencyMs,
     MetricQueueMessageDelayMs,
@@ -578,6 +594,8 @@ impl HistogramMetric {
             Self::MetricFederatedProvisionStageLatencyMs => {
                 "authn.federated.provision_stage_latency_ms"
             }
+            Self::LimitsExpirySweepDurationMs => "limits.expiry.sweep.duration.ms",
+            Self::LimitsTransitionDurationMs => "limits.transition.duration.ms",
             Self::MetricHttpRequestLatencyMs | Self::RequestLatencyMetric => {
                 "http.request.latency.ms"
             }

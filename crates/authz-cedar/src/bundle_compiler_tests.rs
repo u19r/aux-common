@@ -6,7 +6,10 @@ use authz_types::{
 };
 use cedar_policy::{EntityUid, Policy, PolicyId, PolicySet, SlotId, Template};
 
-use crate::{SLICE_SOFT_MAX_BYTES, compile_policy_bundle};
+use crate::{
+    MAX_SCHEMA_SLICES, SLICE_SOFT_MAX_BYTES, SchemaSlice, compile_policy_bundle, parse_policy_sets,
+    validate_bundle_integrity,
+};
 
 #[test]
 fn validation_given_unknown_action_then_rejects_policy_set() {
@@ -568,4 +571,93 @@ fn generated_policy_set_losslessly_round_trips_through_pst_json_and_cedar_text()
     let cedar_text = from_json.to_string();
     let from_text = PolicySet::from_str(&cedar_text).expect("diagnostic Cedar text");
     assert_eq!(from_text.num_of_policies(), original_policy_count);
+}
+
+#[test]
+fn parsed_bundles_reject_oversized_policy_slices_before_cedar_parsing() {
+    let mut bundle = compile_policy_bundle(&basic_config(), 1).expect("bundle");
+    bundle.policy_slices[0].policies_json = "x".repeat(SLICE_SOFT_MAX_BYTES + 1);
+
+    let error = parse_policy_sets(&bundle).expect_err("oversized policy slices must be bounded");
+    assert!(error.to_string().contains("policy slice exceeds maximum"));
+}
+
+#[test]
+fn parsed_bundles_reject_excessive_schema_counts_before_hashing() {
+    let config = basic_config();
+    let mut bundle = compile_policy_bundle(&config, 1).expect("bundle");
+    bundle.schema_slices = vec![
+        SchemaSlice {
+            resource_type: "document".into(),
+            schema_json: String::new(),
+            size_bytes: 0,
+        };
+        MAX_SCHEMA_SLICES + 1
+    ];
+
+    let error = validate_bundle_integrity(&bundle)
+        .expect_err("bundles with excessive schema counts must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("schema slice count exceeds maximum")
+    );
+}
+
+#[test]
+fn compiled_bundle_manifest_binds_all_payloads_with_digests() {
+    let bundle = compile_policy_bundle(&basic_config(), 7).expect("bundle");
+
+    assert_eq!(bundle.manifest.version, 7);
+    assert!(
+        bundle
+            .manifest
+            .config_fingerprint
+            .as_deref()
+            .is_some_and(|value| value.len() == 64)
+    );
+    assert!(bundle.manifest.base_schema_sha256.is_some());
+    assert!(
+        bundle
+            .manifest
+            .schema_slices
+            .iter()
+            .all(|slice| slice.sha256.is_some())
+    );
+    assert!(
+        bundle
+            .manifest
+            .policy_slices
+            .iter()
+            .all(|slice| slice.sha256.is_some())
+    );
+    parse_policy_sets(&bundle).expect("compiled bundle integrity");
+}
+
+#[test]
+fn parsed_bundle_rejects_missing_or_mutated_integrity_metadata() {
+    let original = compile_policy_bundle(&basic_config(), 1).expect("bundle");
+
+    let mut missing_fingerprint = original.clone();
+    missing_fingerprint.manifest.config_fingerprint = None;
+    let error = parse_policy_sets(&missing_fingerprint).expect_err("legacy metadata must reject");
+    assert!(
+        error
+            .to_string()
+            .contains("configuration fingerprint is missing")
+    );
+
+    let mut mutated_payload = original.clone();
+    mutated_payload.policy_slices[0].policies_json.push(' ');
+    let error = parse_policy_sets(&mutated_payload).expect_err("mutated payload must reject");
+    assert!(
+        error
+            .to_string()
+            .contains("policy slice size metadata mismatch")
+    );
+
+    let mut mutated_manifest = original;
+    mutated_manifest.manifest.base_schema_sha256 = Some("0".repeat(64));
+    let error = parse_policy_sets(&mutated_manifest).expect_err("mutated manifest must reject");
+    assert!(error.to_string().contains("base schema digest mismatch"));
 }

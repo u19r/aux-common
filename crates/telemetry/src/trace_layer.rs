@@ -63,7 +63,6 @@ pub async fn slow_operation_log(
 ) -> Response {
     let request_span = tracing::Span::current();
     let method = request.method().clone();
-    let raw_path = request.uri().path().to_string();
     let operation_path = bounded_operation_path(&request).to_string();
     let operation_name = format!("{method} {operation_path}");
     let request_bytes = content_length_or_body_size_hint(request.headers(), request.body());
@@ -79,6 +78,7 @@ pub async fn slow_operation_log(
         let operation_name = operation_name.clone();
         let request_id = request_id.clone();
         metrics_facade::begin_request_cost_collection(request_id.clone(), || async move {
+            metrics_facade::set_request_cost_operation(&operation_name);
             let mut response = next.run(request).await;
             finalize_response_metrics(
                 &mut response,
@@ -118,7 +118,7 @@ pub async fn slow_operation_log(
             target = "http.request",
             operation_name = %operation_name,
             method = %method,
-            path = %raw_path,
+            path = %operation_path,
             status_code,
             duration_ms = duration_ms_u64,
             slow_operation_threshold_ms = threshold_ms,
@@ -217,16 +217,29 @@ fn make_span(request: &http::Request<Body>) -> Span {
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| addr.ip());
-    let forwarded = request
+    let trust_forwarded_headers = request
         .extensions()
         .get::<ForwardedHeaderConfig>()
-        .and_then(|config| {
-            config
-                .trust_forwarded_headers
-                .then(|| forwarded_client_ip(request.headers()))
-                .flatten()
-        });
+        .is_some_and(|config| config.trust_forwarded_headers);
+    let forwarded = trust_forwarded_headers
+        .then(|| forwarded_client_ip(request.headers()))
+        .flatten();
     let source_ip = forwarded.or(peer_ip);
+    let forwarded_for = trusted_forwarded_header_value(
+        request.headers(),
+        trust_forwarded_headers,
+        "x-forwarded-for",
+    );
+    let forwarded_host = trusted_forwarded_header_value(
+        request.headers(),
+        trust_forwarded_headers,
+        "x-forwarded-host",
+    );
+    let forwarded_proto = trusted_forwarded_header_value(
+        request.headers(),
+        trust_forwarded_headers,
+        "x-forwarded-proto",
+    );
     let request_bytes = i64::try_from(content_length_or_body_size_hint(
         request.headers(),
         request.body(),
@@ -260,7 +273,9 @@ fn make_span(request: &http::Request<Body>) -> Span {
         span.record(FIELD_OPERATION_NAME, field::display(""));
     }
     span.record("method", field::display(request.method()));
-    span.record("path", field::display(request.uri().path()));
+    // Never emit the attacker-controlled URI path. A matched route template
+    // is bounded and low-cardinality; unmatched requests use `_unmatched`.
+    span.record("path", field::display(bounded_operation_path(request)));
     span.record("host", field::display(host));
     span.record("user_agent", field::display(user_agent));
     if let Some(source_ip) = source_ip {
@@ -268,19 +283,9 @@ fn make_span(request: &http::Request<Body>) -> Span {
     } else {
         span.record(FIELD_SOURCE_IP, field::display(""));
     }
-    record_forwarded_header(request.headers(), &span, "forwarded_for", "x-forwarded-for");
-    record_forwarded_header(
-        request.headers(),
-        &span,
-        "forwarded_host",
-        "x-forwarded-host",
-    );
-    record_forwarded_header(
-        request.headers(),
-        &span,
-        "forwarded_proto",
-        "x-forwarded-proto",
-    );
+    record_forwarded_header(&span, "forwarded_for", forwarded_for);
+    record_forwarded_header(&span, "forwarded_host", forwarded_host);
+    record_forwarded_header(&span, "forwarded_proto", forwarded_proto);
     if let Some(bytes) = request_bytes {
         span.record("request_bytes", bytes);
     }
@@ -322,8 +327,18 @@ fn header_value<'a>(headers: &'a http::HeaderMap, name: &str) -> &'a str {
         .unwrap_or_default()
 }
 
-fn record_forwarded_header(headers: &http::HeaderMap, span: &Span, field_name: &str, header: &str) {
-    let Some(value) = headers.get(header).and_then(|value| value.to_str().ok()) else {
+fn trusted_forwarded_header_value<'a>(
+    headers: &'a http::HeaderMap,
+    trust_forwarded_headers: bool,
+    name: &str,
+) -> Option<&'a str> {
+    trust_forwarded_headers
+        .then(|| header_value(headers, name))
+        .filter(|value| !value.is_empty())
+}
+
+fn record_forwarded_header(span: &Span, field_name: &str, value: Option<&str>) {
+    let Some(value) = value else {
         return;
     };
     span.record(field_name, field::display(value));

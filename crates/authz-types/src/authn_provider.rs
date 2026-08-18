@@ -33,7 +33,7 @@ pub struct AuthnProviderConfig {
     /// Allowed algorithms (e.g., ["RS256","ES256","HS256"]). Defaults to
     /// RS/ES256 if empty.
     #[serde(default)]
-    #[schema(nullable = true, min_items = 1, max_items = 6, example = json!(["RS256", "ES256"]))]
+    #[schema(nullable = true, max_items = 6, example = json!(["RS256", "ES256"]))]
     pub algorithms: Option<Vec<String>>,
     /// Allowed audiences. If None, audience is not enforced.
     #[serde(default)]

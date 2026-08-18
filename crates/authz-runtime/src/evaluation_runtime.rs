@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use authz_cedar::{
     CedarUidRegistry, CompiledBundle, ParsedPolicySets, PreparedCedarAction, parse_policy_sets,
+    validate_bundle_for_config,
 };
 use authz_types::{
     MAX_PERMISSIONS, MAX_ROLES, TokenContext, TokenScopeType, ValidatedConfigurationModel,
@@ -140,7 +141,7 @@ pub struct ActionMasks {
 struct PermissionRuntime {
     id: String,
     action_score: usize,
-    resource_type: String,
+    action_resource_types: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -213,16 +214,24 @@ impl EvaluationRuntime {
             )));
         }
 
+        validate_bundle_for_config(&config, bundle).map_err(AuthzRuntimeError::build)?;
         let policy_sets = parse_policy_sets(bundle).map_err(AuthzRuntimeError::build)?;
         let cedar_uids = CedarUidRegistry::new(&config).map_err(AuthzRuntimeError::build)?;
         let mut permission_index = HashMap::with_capacity(config.permissions.len());
         let mut permissions = Vec::with_capacity(config.permissions.len());
         for (idx, permission) in config.permissions.iter().enumerate() {
             permission_index.insert(permission.id.clone(), idx);
+            let mut action_resource_types = permission
+                .actions
+                .iter()
+                .map(|action| action.resource_type.clone())
+                .collect::<Vec<_>>();
+            action_resource_types.sort();
+            action_resource_types.dedup();
             permissions.push(PermissionRuntime {
                 id: permission.id.clone(),
                 action_score: permission.actions.len() + permission.not_actions.len(),
-                resource_type: permission_resource_type(permission.id.as_str()),
+                action_resource_types,
             });
         }
 
@@ -408,6 +417,16 @@ impl EvaluationRuntime {
         token_ctx: &TokenContext,
         now: DateTime<Utc>,
     ) -> ResolvedPermissionBits {
+        self.resolve_token_permissions_for_resource_at(user_permissions, token_ctx, None, now)
+    }
+
+    pub(crate) fn resolve_token_permissions_for_resource_at(
+        &self,
+        user_permissions: &PermissionBits,
+        token_ctx: &TokenContext,
+        target_org_id: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> ResolvedPermissionBits {
         if token_is_expired_at(token_ctx, now) {
             return ResolvedPermissionBits::invalid("token_expired");
         }
@@ -435,14 +454,37 @@ impl EvaluationRuntime {
                     let Some(permission) = self.permissions.get(permission_idx) else {
                         return;
                     };
-                    let Some(allowed_permissions) = fine_grained
-                        .resource_permissions
-                        .get(permission.resource_type.as_str())
-                    else {
-                        return;
-                    };
-                    if permission_allowed_for_resource(allowed_permissions, permission.id.as_str())
-                    {
+                    let allowed_for_every_action_resource = permission
+                        .action_resource_types
+                        .iter()
+                        .all(|resource_type| {
+                            fine_grained
+                                .resource_permissions
+                                .get(resource_type)
+                                .is_some_and(|allowed_permissions| {
+                                    permission_allowed_for_resource(
+                                        allowed_permissions,
+                                        permission.id.as_str(),
+                                    )
+                                })
+                        });
+                    let allowed_for_target_org = permission
+                        .action_resource_types
+                        .iter()
+                        .filter(|resource_type| resource_type.as_str() == "organization")
+                        .all(|_| {
+                            target_org_id.is_some_and(|org_id| {
+                                fine_grained.org_permissions.get(org_id).is_some_and(
+                                    |allowed_permissions| {
+                                        permission_allowed_for_resource(
+                                            allowed_permissions,
+                                            permission.id.as_str(),
+                                        )
+                                    },
+                                )
+                            })
+                        });
+                    if allowed_for_every_action_resource && allowed_for_target_org {
                         effective.set(permission_idx);
                     }
                 });
@@ -520,13 +562,6 @@ fn action_masks_for_mut<'a>(
         .or_default()
 }
 
-pub(crate) fn permission_resource_type(permission_id: &str) -> String {
-    if let Some((resource_type, _)) = permission_id.split_once(':') {
-        return resource_type.to_string();
-    }
-    permission_id.to_string()
-}
-
 fn permission_allowed_for_resource(allowed_permissions: &[String], permission_id: &str) -> bool {
     allowed_permissions
         .iter()
@@ -536,5 +571,5 @@ fn permission_allowed_for_resource(allowed_permissions: &[String], permission_id
 fn token_is_expired_at(token_ctx: &TokenContext, now: DateTime<Utc>) -> bool {
     token_ctx
         .expires_at
-        .is_some_and(|expires_at| expires_at < now.timestamp())
+        .is_some_and(|expires_at| now.timestamp() >= expires_at)
 }

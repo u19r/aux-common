@@ -74,6 +74,41 @@ fn oauth_debug_output_redacts_all_credential_material() {
     }
 }
 
+#[test]
+fn oauth_endpoint_debug_redacts_url_credentials_and_query_values() {
+    let values = [
+        format!(
+            "{:?}",
+            OAuthTokenEndpoint::new(
+                "https://user:password@example.test/token?secret=query-sentinel"
+            )
+        ),
+        format!(
+            "{:?}",
+            OAuthRevocationEndpoint::new(
+                "https://user:password@example.test/revoke?secret=query-sentinel"
+            )
+        ),
+        format!(
+            "{:?}",
+            OAuthUserinfoEndpoint::new(
+                "https://user:password@example.test/userinfo?secret=query-sentinel"
+            )
+        ),
+    ];
+
+    for debug in values {
+        assert!(
+            !debug.contains("password"),
+            "endpoint debug leaked userinfo: {debug}"
+        );
+        assert!(
+            !debug.contains("query-sentinel"),
+            "endpoint debug leaked query: {debug}"
+        );
+    }
+}
+
 #[derive(Clone)]
 struct RecordingTransport {
     responses: Arc<Mutex<VecDeque<HttpResponse>>>,

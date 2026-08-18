@@ -15,6 +15,18 @@ pub enum AuthzRuntimeError {
 
     #[error("snapshot resource does not match evaluation request")]
     ResourceSnapshotMismatch,
+
+    #[error("snapshot tenant does not match evaluation tenant")]
+    TenantSnapshotMismatch,
+
+    #[error("trusted authorization context does not match evaluation subject")]
+    TrustedContextSubjectMismatch,
+
+    #[error("{snapshot} snapshot timestamp is invalid")]
+    SnapshotTimestampInvalid { snapshot: &'static str },
+
+    #[error("{snapshot} snapshot is stale")]
+    SnapshotStale { snapshot: &'static str },
 }
 
 impl AuthzRuntimeError {

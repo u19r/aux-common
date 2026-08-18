@@ -11,14 +11,18 @@ doctest = false
 [dependencies]
 aws-credential-types = { workspace = true }
 aws-smithy-types = { workspace = true }
+futures-util = { workspace = true }
 lru-ttl-cache = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
 url = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
 [lints.rust]
-unsafe_code = "allow"
 unreachable_pub = "warn"
 
 [lints.clippy]

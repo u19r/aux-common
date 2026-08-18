@@ -308,7 +308,10 @@ fn build_policy_document(
         let condition_clause = build_condition_clause(&conditions);
         builder.add_static_policy(
             "permit",
-            &format!("Authz::Action::\"{}:read\"", rt.id),
+            &format!(
+                "Authz::Action::{}",
+                cedar_string_literal(&format!("{}:read", rt.id))
+            ),
             resource_entity.as_str(),
             condition_clause.as_str(),
         );
@@ -331,8 +334,11 @@ fn append_scoped_action_policies(
             continue;
         }
         let action_ident = format!(
-            "Authz::Action::\"{}:{}\"",
-            action_ref.resource_type, action_ref.action_name
+            "Authz::Action::{}",
+            cedar_string_literal(&format!(
+                "{}:{}",
+                action_ref.resource_type, action_ref.action_name
+            ))
         );
         let action_id = format!("{}:{}", action_ref.resource_type, action_ref.action_name);
 
@@ -376,8 +382,11 @@ fn append_scoped_role_action_policies(
             continue;
         }
         let action_ident = format!(
-            "Authz::Action::\"{}:{}\"",
-            action_ref.resource_type, action_ref.action_name
+            "Authz::Action::{}",
+            cedar_string_literal(&format!(
+                "{}:{}",
+                action_ref.resource_type, action_ref.action_name
+            ))
         );
         let action_id = format!("{}:{}", action_ref.resource_type, action_ref.action_name);
 
@@ -481,11 +490,67 @@ fn build_condition_clause(conditions: &[String]) -> String {
     if conditions.is_empty() {
         return String::new();
     }
-    format!("when {{ {} }}", conditions.join(" && "))
+    format!("when {{ {} }}", balanced_boolean_expr(conditions, "&&"))
+}
+
+pub(super) fn balanced_boolean_expr(expressions: &[String], operator: &str) -> String {
+    let mut expression = String::with_capacity(
+        expressions.iter().map(String::len).sum::<usize>()
+            + expressions.len().saturating_sub(1) * (operator.len() + 4),
+    );
+    append_balanced_boolean_expr(&mut expression, expressions, operator);
+    expression
+}
+
+fn append_balanced_boolean_expr(output: &mut String, expressions: &[String], operator: &str) {
+    match expressions {
+        [] => {}
+        [expression] => output.push_str(expression),
+        _ => {
+            let midpoint = expressions.len() / 2;
+            output.push('(');
+            append_balanced_boolean_expr(output, &expressions[..midpoint], operator);
+            output.push(' ');
+            output.push_str(operator);
+            output.push(' ');
+            append_balanced_boolean_expr(output, &expressions[midpoint..], operator);
+            output.push(')');
+        }
+    }
 }
 
 fn authz_ctx_field(field: &str) -> String {
     format!("context.{}.{}", CONTEXT_INTERNAL_KEY, field)
+}
+
+fn cedar_string_literal(value: &str) -> String {
+    let mut literal = String::with_capacity(value.len() + 2);
+    literal.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => literal.push_str("\\\""),
+            '\\' => literal.push_str("\\\\"),
+            '\n' => literal.push_str("\\n"),
+            '\r' => literal.push_str("\\r"),
+            '\t' => literal.push_str("\\t"),
+            '\u{08}' => literal.push_str("\\b"),
+            '\u{0c}' => literal.push_str("\\f"),
+            character if character.is_control() => {
+                literal.push_str("\\u");
+                for shift in [12, 8, 4, 0] {
+                    let digit = ((character as u32 >> shift) & 0x0f) as u8;
+                    literal.push(char::from(if digit < 10 {
+                        b'0' + digit
+                    } else {
+                        b'a' + digit - 10
+                    }));
+                }
+            }
+            character => literal.push(character),
+        }
+    }
+    literal.push('"');
+    literal
 }
 
 fn token_guard_expr(action_id: &str) -> String {
@@ -497,18 +562,34 @@ fn token_guard_expr(action_id: &str) -> String {
     let token_org_id = authz_ctx_field("token_org_id");
     let token_owner_orgs = authz_ctx_field("token_owner_org_ids");
     let allowed_actions = authz_ctx_field("allowed_actions");
-    format!(
-        "(!{token_present} || ({token_valid} && (!{token_filter_enabled} || resource in \
-         {token_filter}) && (!{token_org_present} || (resource has org_id && resource.org_id == \
-         {token_org_id} && {token_owner_orgs}.contains({token_org_id}))) && \
-         {allowed_actions}.contains(\"{action_id}\")))"
-    )
+    let action_literal = cedar_string_literal(action_id);
+    let resource_filter_guard = format!("(!{token_filter_enabled} || resource in {token_filter})");
+    let org_match = balanced_boolean_expr(
+        &[
+            "resource has org_id".to_string(),
+            format!("resource.org_id == {token_org_id}"),
+            format!("{token_owner_orgs}.contains({token_org_id})"),
+        ],
+        "&&",
+    );
+    let org_guard = format!("(!{token_org_present} || {org_match})");
+    let token_required = balanced_boolean_expr(
+        &[
+            token_valid,
+            resource_filter_guard,
+            org_guard,
+            format!("{allowed_actions}.contains({action_literal})"),
+        ],
+        "&&",
+    );
+    balanced_boolean_expr(&[format!("!{token_present}"), token_required], "||")
 }
 
 fn resource_scope_guard_expr(role_id: &str) -> String {
     let resource_scopes = authz_ctx_field("resource_scopes");
     format!(
-        "{resource_scopes}.contains({{ role: Authz::Role::\"{role_id}\", resource: resource }})"
+        "{resource_scopes}.contains({{ role: Authz::Role::{role_literal}, resource: resource }})",
+        role_literal = cedar_string_literal(role_id)
     )
 }
 
@@ -546,17 +627,19 @@ fn step_up_guard_expr(rule: &StepUpRule) -> String {
         let checks = rule
             .required_amr
             .iter()
-            .map(|amr| format!("{session_amr}.contains(\"{amr}\")"))
+            .map(|amr| format!("{session_amr}.contains({})", cedar_string_literal(amr)))
             .collect::<Vec<_>>();
-        clauses.push(format!("({})", checks.join(" || ")));
+        clauses.push(balanced_boolean_expr(&checks, "||"));
     }
 
-    let session_ok = clauses.join(" && ");
+    let session_ok = balanced_boolean_expr(&clauses, "&&");
     if rule.applies_to_api_keys {
         session_ok
     } else {
         let token_present = authz_ctx_field("token_present");
-        format!("{token_present} || ({session_ok})")
+        let token_valid = authz_ctx_field("token_valid");
+        let valid_token = balanced_boolean_expr(&[token_present, token_valid], "&&");
+        balanced_boolean_expr(&[valid_token, session_ok], "||")
     }
 }
 

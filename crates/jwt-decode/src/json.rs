@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fmt};
+use std::{borrow::Cow, collections::HashSet, fmt};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{
@@ -155,7 +155,7 @@ impl<'de> Visitor<'de> for DuplicateRejectingVisitor {
     where A: MapAccess<'de> {
         let mut inline_names: [Option<Cow<'de, str>>; 16] = std::array::from_fn(|_| None);
         let mut inline_len = 0;
-        let mut overflow_names: Vec<Cow<'de, str>> = Vec::new();
+        let mut overflow_names: HashSet<Cow<'de, str>> = HashSet::new();
         while let Some(name) = map.next_key::<Cow<'de, str>>()? {
             let inline_duplicate = inline_names[..inline_len]
                 .iter()
@@ -169,7 +169,7 @@ impl<'de> Visitor<'de> for DuplicateRejectingVisitor {
                 inline_names[inline_len] = Some(name);
                 inline_len += 1;
             } else {
-                overflow_names.push(name);
+                overflow_names.insert(name);
             }
             map.next_value_seed(DuplicateRejectingSeed)?;
         }

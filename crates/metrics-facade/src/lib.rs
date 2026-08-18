@@ -12,11 +12,21 @@ mod request_cost_tests;
 
 #[cfg(feature = "request-cost")]
 pub use crate::request_cost::{
-    CostResponseHeaders, RequestCostSnapshot, RequestCostStorageBreakdown,
-    RequestCostStorageBreakdownEntry, RequestCostStorageDirection, active_request_id,
-    begin_request_cost_collection, finish_request_cost_collection,
-    record_analytics_request_cost_by_request_id,
+    CostResponseHeaders, DatabaseCallGuard, RequestCostDatabaseCallEntry, RequestCostSnapshot,
+    RequestCostStorageBreakdown, RequestCostStorageBreakdownEntry, RequestCostStorageDirection,
+    active_request_id, begin_database_call, begin_request_cost_collection,
+    finish_request_cost_collection, record_analytics_request_cost_by_request_id,
+    set_request_cost_operation,
 };
+#[cfg(not(feature = "request-cost"))]
+#[derive(Debug, Default)]
+pub struct DatabaseCallGuard;
+
+#[cfg(not(feature = "request-cost"))]
+#[must_use]
+pub fn begin_database_call(_operation: &str) -> DatabaseCallGuard {
+    DatabaseCallGuard
+}
 pub use crate::{
     handles::{counter, gauge, histogram},
     metrics::{CounterMetric, GaugeMetric, HistogramMetric},

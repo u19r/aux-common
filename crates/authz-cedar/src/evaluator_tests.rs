@@ -1,15 +1,16 @@
 use std::{collections::HashMap, str::FromStr};
 
 use authz_types::{
-    AcrLevel, Action, BatchEvaluationRequest, ConfigurationModel, PermissionActionRef,
+    AcrLevel, Action, BatchEvaluationRequest, ConfigurationModel, Context, PermissionActionRef,
     PermissionId, Resource, Scope, StepUpRule, Subject,
 };
 use serde_json::{Map, Value};
 
 use crate::{
-    CedarUidRegistry, EntityParentRef, compile_policy_bundle, evaluate as evaluate_untrusted,
-    evaluate_batch, evaluate_batch_with_policy_sets, evaluate_owned_with_policy_sets,
-    evaluate_owned_with_policy_sets_with_parents, evaluate_with_policy_sets, parse_policy_sets,
+    CedarEntityRef, CedarInternalContext, CedarResourceScope, CedarUidRegistry, EntityParentRef,
+    compile_policy_bundle, evaluate as evaluate_untrusted, evaluate_batch,
+    evaluate_batch_with_policy_sets, evaluate_prepared_with_policy_sets, evaluate_with_policy_sets,
+    parse_policy_sets, prepare_evaluation_owned_with_trusted_parents_and_internal_context,
     prepare_request_uids,
 };
 
@@ -82,12 +83,13 @@ fn evaluate(
     let policy_sets = parse_policy_sets(bundle)?;
     let subject_parents = parent_refs_from_test_context(request, "subject_parents");
     let resource_parents = parent_refs_from_test_context(request, "resource_parents");
-    evaluate_owned_with_policy_sets_with_parents(
-        &policy_sets,
+    let prepared = prepare_evaluation_owned_with_trusted_parents_and_internal_context(
         request.clone(),
         &subject_parents,
         &resource_parents,
-    )
+        typed_internal_context_from_test_context(request),
+    )?;
+    evaluate_prepared_with_policy_sets(&policy_sets, prepared)
 }
 
 fn parent_refs_from_test_context(
@@ -151,6 +153,93 @@ fn context_with_internal(attrs: Value, internal: Value) -> authz_types::Context 
     };
     map.insert("_authz".to_string(), internal);
     authz_types::Context::new(Value::Object(map))
+}
+
+fn typed_internal_context_from_test_context(
+    request: &authz_types::EvaluationRequest,
+) -> CedarInternalContext {
+    let internal = request
+        .context
+        .as_ref()
+        .and_then(|context| context.attributes.get("_authz"))
+        .cloned()
+        .unwrap_or_else(default_internal_context);
+    let bool_field = |key: &str| internal.get(key).and_then(Value::as_bool).unwrap_or(false);
+    let integer_field = |key: &str| {
+        internal
+            .get(key)
+            .and_then(Value::as_i64)
+            .unwrap_or_default()
+    };
+    let string_field = |key: &str| {
+        internal
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let string_list = |key: &str| {
+        internal
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    };
+    let entity_ref = |value: &Value| {
+        let entity = value.get("__entity").expect("test entity wrapper");
+        CedarEntityRef::new(
+            entity
+                .get("type")
+                .and_then(Value::as_str)
+                .expect("test entity type"),
+            entity
+                .get("id")
+                .and_then(Value::as_str)
+                .expect("test entity id"),
+        )
+        .expect("valid test entity ref")
+    };
+    let entity_list = |key: &str| {
+        internal
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(&entity_ref)
+            .collect()
+    };
+    let resource_scopes = internal
+        .get("resource_scopes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|scope| CedarResourceScope {
+            role: entity_ref(scope.get("role").expect("test scope role")),
+            resource: entity_ref(scope.get("resource").expect("test scope resource")),
+        })
+        .collect();
+
+    CedarInternalContext {
+        token_present: bool_field("token_present"),
+        token_valid: bool_field("token_valid"),
+        token_resource_filter_enabled: bool_field("token_resource_filter_enabled"),
+        token_resource_filter: entity_list("token_resource_filter"),
+        resource_scopes,
+        token_org_id_present: bool_field("token_org_id_present"),
+        token_org_id: string_field("token_org_id"),
+        token_owner_org_ids: string_list("token_owner_org_ids"),
+        allowed_actions: string_list("allowed_actions"),
+        session_present: bool_field("session_present"),
+        session_acr: integer_field("session_acr"),
+        session_amr: string_list("session_amr"),
+        session_auth_age_present: bool_field("session_auth_age_present"),
+        session_auth_age_seconds: integer_field("session_auth_age_seconds"),
+        session_mfa_age_present: bool_field("session_mfa_age_present"),
+        session_mfa_age_seconds: integer_field("session_mfa_age_seconds"),
+    }
 }
 
 fn resource_scope_record(role_id: &str, resource_type: &str, resource_id: &str) -> Value {
@@ -330,7 +419,17 @@ fn evaluator_denies_until_implemented() {
 }
 
 #[test]
-fn evaluate_with_policy_sets_rejects_null_context_values() {
+fn untrusted_evaluation_cannot_satisfy_step_up_with_reserved_context() {
+    let mut step_up_config = HashMap::new();
+    step_up_config.insert(
+        "document".to_string(),
+        authz_types::StepUpConfig {
+            default_rule: None,
+            action_rules: [("read".to_string(), "mfa".to_string())]
+                .into_iter()
+                .collect(),
+        },
+    );
     let config = ConfigurationModel {
         version: 1,
         resource_types: vec![authz_types::ResourceType {
@@ -345,18 +444,47 @@ fn evaluate_with_policy_sets_rejects_null_context_values() {
         }],
         permissions: vec![],
         roles: vec![],
-        scope_mappings: vec![],
         description: None,
+        scope_mappings: Vec::new(),
         authn_providers: vec![],
-        step_up_rules: vec![],
-        step_up_config: HashMap::new(),
+        step_up_rules: vec![StepUpRule::require_acr(
+            "mfa",
+            "Require MFA",
+            AcrLevel::MultiFactor,
+        )],
+        step_up_config,
         default_step_up_rule: None,
     }
     .into_validated()
     .expect("valid config");
-
     let bundle = compile_policy_bundle(&config, 1).expect("bundle");
-    let policy_sets = parse_policy_sets(&bundle).expect("parse policy sets");
+    let request = authz_types::EvaluationRequest {
+        subject: Subject::user("u1"),
+        resource: Resource::new("document", "doc1")
+            .with_properties(serde_json::json!({"is_public": true})),
+        action: Action::new("read"),
+        context: Some(context_with_internal(
+            Value::Object(Map::new()),
+            internal_context_with(serde_json::json!({
+                "session_present": true,
+                "session_acr": 2
+            })),
+        )),
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+
+    let error = evaluate_untrusted(&bundle, &request).expect_err("context must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("trusted authorization enrichment")
+    );
+}
+
+#[test]
+fn evaluate_with_policy_sets_rejects_null_context_values() {
     let request = authz_types::EvaluationRequest {
         subject: Subject::user("u1"),
         resource: Resource::new("document", "doc1"),
@@ -370,10 +498,22 @@ fn evaluate_with_policy_sets_rejects_null_context_values() {
         token_context: None,
     };
 
-    let borrowed_error =
-        evaluate_with_policy_sets(&policy_sets, &request).expect_err("null context should fail");
-    let owned_error = evaluate_owned_with_policy_sets(&policy_sets, request)
-        .expect_err("null context should fail");
+    let borrowed_error = prepare_evaluation_owned_with_trusted_parents_and_internal_context(
+        request.clone(),
+        &[],
+        &[],
+        typed_internal_context_from_test_context(&request),
+    )
+    .err()
+    .expect("null context should fail");
+    let owned_error = prepare_evaluation_owned_with_trusted_parents_and_internal_context(
+        request.clone(),
+        &[],
+        &[],
+        typed_internal_context_from_test_context(&request),
+    )
+    .err()
+    .expect("null context should fail");
     assert!(
         borrowed_error
             .to_string()
@@ -389,18 +529,43 @@ fn evaluate_with_policy_sets_rejects_null_context_values() {
 }
 
 #[test]
+fn evaluate_with_policy_sets_rejects_unbounded_context_values() {
+    let request = authz_types::EvaluationRequest {
+        subject: Subject::user("u1"),
+        resource: Resource::new("document", "doc1"),
+        action: Action::new("read"),
+        context: Some(Context::new(serde_json::json!({
+            "nested": (0..=1_024).collect::<Vec<_>>()
+        }))),
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+
+    let error = prepare_evaluation_owned_with_trusted_parents_and_internal_context(
+        request.clone(),
+        &[],
+        &[],
+        typed_internal_context_from_test_context(&request),
+    )
+    .err()
+    .expect("unbounded context collections must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("JSON context collection exceeds")
+    );
+}
+
+#[test]
 fn batch_evaluator_denies_all() {
     let batch = BatchEvaluationRequest {
         evaluations: vec![
             authz_types::EvaluationRequest {
                 subject: Subject::user("u1"),
-                resource: Resource::new("document", "doc1")
-                    .with_properties(serde_json::json!({"is_public": true})),
+                resource: Resource::new("document", "doc1"),
                 action: Action::new("read"),
-                context: Some(context_with_internal(
-                    Value::Object(Map::new()),
-                    default_internal_context(),
-                )),
+                context: None,
                 jwt_context: None,
                 session_context: None,
                 token_context: None,
@@ -409,10 +574,7 @@ fn batch_evaluator_denies_all() {
                 subject: Subject::user("u2"),
                 resource: Resource::new("document", "doc2"),
                 action: Action::new("write"),
-                context: Some(context_with_internal(
-                    Value::Object(Map::new()),
-                    default_internal_context(),
-                )),
+                context: None,
                 jwt_context: None,
                 session_context: None,
                 token_context: None,
@@ -450,7 +612,10 @@ fn batch_evaluator_denies_all() {
 
     let res = evaluate_batch(&bundle, &batch).expect("batch");
     assert_eq!(2, res.evaluations.len());
-    assert!(res.evaluations[0].decision, "public read should allow");
+    assert!(
+        !res.evaluations[0].decision,
+        "batch without trusted enrichment must deny"
+    );
     assert!(
         !res.evaluations[1].decision,
         "write should deny without role"
@@ -458,7 +623,7 @@ fn batch_evaluator_denies_all() {
 }
 
 #[test]
-fn evaluate_with_policy_sets_denies_when_policy_slice_is_missing() {
+fn evaluate_with_policy_sets_rejects_when_policy_slice_is_missing() {
     let config = ConfigurationModel {
         version: 1,
         resource_types: vec![authz_types::ResourceType {
@@ -487,24 +652,8 @@ fn evaluate_with_policy_sets_denies_when_policy_slice_is_missing() {
     bundle
         .policy_slices
         .retain(|slice| slice.resource_type != "document");
-    let policy_sets = parse_policy_sets(&bundle).expect("parse policy sets");
-    let request = authz_types::EvaluationRequest {
-        subject: Subject::user("u1"),
-        resource: Resource::new("document", "doc1"),
-        action: Action::new("read"),
-        context: Some(context_with_internal(
-            Value::Object(Map::new()),
-            default_internal_context(),
-        )),
-        jwt_context: None,
-        session_context: None,
-        token_context: None,
-    };
-
-    let response =
-        evaluate_with_policy_sets(&policy_sets, &request).expect("evaluation should not error");
-
-    assert!(!response.decision, "missing policy slice should deny");
+    let error = parse_policy_sets(&bundle).expect_err("missing policy slice must be rejected");
+    assert!(error.to_string().contains("policy slice manifest mismatch"));
 }
 
 #[test]
@@ -537,19 +686,15 @@ fn evaluate_with_preparsed_policy_sets_matches_standard_evaluate() {
 
     let request = authz_types::EvaluationRequest {
         subject: Subject::user("u1"),
-        resource: Resource::new("document", "doc1")
-            .with_properties(serde_json::json!({"is_public": true})),
+        resource: Resource::new("document", "doc1"),
         action: Action::new("read"),
-        context: Some(context_with_internal(
-            Value::Object(Map::new()),
-            default_internal_context(),
-        )),
+        context: None,
         jwt_context: None,
         session_context: None,
         token_context: None,
     };
 
-    let standard = evaluate(&bundle, &request).expect("standard");
+    let standard = evaluate_untrusted(&bundle, &request).expect("standard");
     let parsed = evaluate_with_policy_sets(&policy_sets, &request).expect("parsed");
     assert_eq!(standard.decision, parsed.decision);
     assert_eq!(standard.challenge.is_some(), parsed.challenge.is_some());
@@ -587,13 +732,9 @@ fn evaluate_batch_with_preparsed_policy_sets_matches_standard_batch() {
         evaluations: vec![
             authz_types::EvaluationRequest {
                 subject: Subject::user("u1"),
-                resource: Resource::new("document", "doc1")
-                    .with_properties(serde_json::json!({"is_public": true})),
+                resource: Resource::new("document", "doc1"),
                 action: Action::new("read"),
-                context: Some(context_with_internal(
-                    Value::Object(Map::new()),
-                    default_internal_context(),
-                )),
+                context: None,
                 jwt_context: None,
                 session_context: None,
                 token_context: None,
@@ -602,10 +743,7 @@ fn evaluate_batch_with_preparsed_policy_sets_matches_standard_batch() {
                 subject: Subject::user("u2"),
                 resource: Resource::new("document", "doc2"),
                 action: Action::new("write"),
-                context: Some(context_with_internal(
-                    Value::Object(Map::new()),
-                    default_internal_context(),
-                )),
+                context: None,
                 jwt_context: None,
                 session_context: None,
                 token_context: None,
@@ -711,11 +849,11 @@ fn untrusted_context_cannot_inject_role_membership_parent() {
         token_context: None,
     };
 
-    let response = evaluate_untrusted(&bundle, &request).expect("evaluation");
-
+    let error = evaluate_untrusted(&bundle, &request).expect_err("context must be rejected");
     assert!(
-        !response.decision,
-        "reserved context keys must not grant role ancestry"
+        error
+            .to_string()
+            .contains("trusted authorization enrichment")
     );
 }
 
@@ -1998,11 +2136,13 @@ fn evaluator_forbid_link_overrides_matching_permit_link() {
                 resource_type: "document".into(),
                 action_name: "read".into(),
                 scopes: vec![Scope::Tenant],
+                limit: None,
             }],
             not_actions: vec![authz_types::RoleActionRef {
                 resource_type: "document".into(),
                 action_name: "read".into(),
                 scopes: vec![Scope::Tenant],
+                limit: None,
             }],
         }],
         description: None,
@@ -2076,6 +2216,119 @@ fn evaluator_keeps_public_read_separate_from_role_policies() {
 }
 
 #[test]
+fn untrusted_evaluation_rejects_caller_owned_resource_properties() {
+    let config = config_with_scope(Scope::Public);
+    let bundle = compile_policy_bundle(&config, 1).expect("bundle");
+    let request = authz_types::EvaluationRequest {
+        subject: Subject::user("attacker"),
+        resource: Resource::new("document", "secret")
+            .with_properties(serde_json::json!({ "is_public": true })),
+        action: Action::new("read"),
+        context: None,
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+
+    let error = evaluate_untrusted(&bundle, &request)
+        .expect_err("caller-owned resource properties must not reach Cedar");
+    assert!(
+        error
+            .to_string()
+            .contains("trusted authorization enrichment"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn untrusted_evaluation_rejects_caller_owned_context() {
+    let config = config_with_scope(Scope::Tenant);
+    let bundle = compile_policy_bundle(&config, 1).expect("bundle");
+    let request = authz_types::EvaluationRequest {
+        subject: Subject::user("attacker"),
+        resource: Resource::new("document", "secret"),
+        action: Action::new("read"),
+        context: Some(Context::new(serde_json::json!({
+            "is_admin": true,
+        }))),
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+
+    let error = evaluate_untrusted(&bundle, &request)
+        .expect_err("caller-owned context must not reach Cedar");
+    assert!(
+        error
+            .to_string()
+            .contains("trusted authorization enrichment"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn untrusted_batch_rejects_caller_owned_security_fields() {
+    let config = config_with_scope(Scope::Public);
+    let bundle = compile_policy_bundle(&config, 1).expect("bundle");
+    let request = BatchEvaluationRequest {
+        evaluations: vec![authz_types::EvaluationRequest {
+            subject: Subject::user("attacker"),
+            resource: Resource::new("document", "secret")
+                .with_properties(serde_json::json!({ "is_public": true })),
+            action: Action::new("read"),
+            context: None,
+            jwt_context: None,
+            session_context: None,
+            token_context: None,
+        }],
+        subject_override: None,
+        token_context_override: None,
+    };
+
+    let error = evaluate_batch(&bundle, &request)
+        .expect_err("batch caller-owned security fields must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("trusted authorization enrichment"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn typed_internal_preparation_drops_wire_owned_generic_context() {
+    let request = authz_types::EvaluationRequest {
+        subject: Subject::user("user-1"),
+        resource: Resource::new("document", "secret"),
+        action: Action::new("read"),
+        context: Some(Context::new(serde_json::json!({
+            "is_admin": true,
+            "request_region": "attacker-controlled",
+        }))),
+        jwt_context: None,
+        session_context: None,
+        token_context: None,
+    };
+
+    let prepared = prepare_evaluation_owned_with_trusted_parents_and_internal_context(
+        request.clone(),
+        &[],
+        &[],
+        typed_internal_context_from_test_context(&request),
+    )
+    .expect("typed preparation");
+    let context = prepared.context();
+
+    assert!(context.and_then(|value| value.get("is_admin")).is_none());
+    assert!(
+        context
+            .and_then(|value| value.get("request_region"))
+            .is_none()
+    );
+    assert!(context.and_then(|value| value.get("_authz")).is_some());
+}
+
+#[test]
 fn diagnostics_retain_determining_policy_and_evaluation_error_categories() {
     use std::str::FromStr;
 
@@ -2102,7 +2355,10 @@ fn diagnostics_retain_determining_policy_and_evaluation_error_categories() {
     let result =
         crate::evaluator::evaluate_prepared_with_policy_set_diagnostics(&policies, &prepared);
 
-    assert!(result.response.decision);
+    assert!(
+        !result.response.decision,
+        "a policy evaluation error must fail closed even when Cedar reports allow"
+    );
     assert_eq!(result.determining_policy_ids.len(), 1);
     assert!(!result.determining_policy_ids[0].is_empty());
     assert_eq!(

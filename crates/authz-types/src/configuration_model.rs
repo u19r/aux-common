@@ -4,19 +4,29 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 use utoipa::ToSchema;
 
 use crate::{
-    ActionPatternExpandError, AuthnProviderConfig, MAX_ACTIONS_PER_RESOURCE_TYPE,
-    MAX_AUTHN_PROVIDERS, MAX_PERMISSIONS, MAX_RESOURCE_TYPES, MAX_ROLES, MAX_SCOPE_MAPPINGS,
-    Permission, PermissionActionRef, ResourceType, Role, RoleActionRef, ScopeMappingEntry,
-    StepUpConfig, StepUpRule, ValidationError, expand_action_patterns,
+    ActionPatternExpandError, AuthnProviderConfig, ExpandedActionRef,
+    MAX_ACTIONS_PER_RESOURCE_TYPE, MAX_AUTHN_PROVIDERS, MAX_PERMISSION_ACTION_REFS,
+    MAX_PERMISSIONS, MAX_RESOURCE_TYPES, MAX_ROLE_ACTION_REFS, MAX_ROLE_ENTRY_SCOPES,
+    MAX_ROLE_PERMISSION_REFS, MAX_ROLES, MAX_SCOPE_MAPPING_INCLUDES, MAX_SCOPE_MAPPING_PERMISSIONS,
+    MAX_SCOPE_MAPPINGS, MAX_STEP_UP_RULES, Permission, PermissionActionRef, ResourceType, Role,
+    RoleActionRef, Scope, ScopeMappingEntry, StepUpConfig, StepUpRule, ValidationError,
+    expand_action_patterns,
 };
 
 const ID_MAX: usize = 128;
 const NAME_MAX: usize = 58;
 const RESOURCE_TYPE_MAX: usize = 58;
 const ACTION_MAX: usize = 58;
+const AUTHN_URL_MAX: usize = 2048;
+const AUTHN_ALGORITHMS_MAX: usize = 6;
+const AUTHN_AUDIENCES_MAX: usize = 25;
+
+type ActionPatternCache =
+    HashMap<(String, String), Result<Vec<ExpandedActionRef>, ActionPatternExpandError>>;
 
 /// Complete authorization configuration model.
 /// This is what customers send to configure their authorization.
@@ -105,6 +115,7 @@ impl ConfigurationModel {
 
     fn validate_with_options(&self, allow_wildcards: bool) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
+        let mut action_pattern_cache = ActionPatternCache::new();
 
         // Check resource type limits
         if self.resource_types.len() > MAX_RESOURCE_TYPES {
@@ -147,10 +158,10 @@ impl ConfigurationModel {
                 )));
             }
 
-            if rt.id.is_empty() || rt.id.len() > 64 {
+            if rt.id.is_empty() || rt.id.len() > RESOURCE_TYPE_MAX {
                 errors.push(ValidationError::OutOfRange {
                     field: "resource_types[].id",
-                    message: "must be 1..=64 characters".into(),
+                    message: format!("must be 1..={RESOURCE_TYPE_MAX} characters"),
                 });
             }
             if rt.name.is_empty() || rt.name.len() > NAME_MAX {
@@ -220,6 +231,20 @@ impl ConfigurationModel {
                     message: "must include at least one action reference".into(),
                 });
             }
+            if perm.actions.len() > MAX_PERMISSION_ACTION_REFS {
+                errors.push(ValidationError::LimitExceeded {
+                    resource: "permission_actions",
+                    limit: MAX_PERMISSION_ACTION_REFS,
+                    actual: perm.actions.len(),
+                });
+            }
+            if perm.not_actions.len() > MAX_PERMISSION_ACTION_REFS {
+                errors.push(ValidationError::LimitExceeded {
+                    resource: "permission_not_actions",
+                    limit: MAX_PERMISSION_ACTION_REFS,
+                    actual: perm.not_actions.len(),
+                });
+            }
             for action in &perm.actions {
                 validate_action_reference(
                     &mut errors,
@@ -228,6 +253,7 @@ impl ConfigurationModel {
                     action.action_name.as_str(),
                     self.resource_types.as_slice(),
                     allow_wildcards,
+                    &mut action_pattern_cache,
                 );
             }
             for action in &perm.not_actions {
@@ -238,6 +264,7 @@ impl ConfigurationModel {
                     action.action_name.as_str(),
                     self.resource_types.as_slice(),
                     allow_wildcards,
+                    &mut action_pattern_cache,
                 );
             }
         }
@@ -253,6 +280,14 @@ impl ConfigurationModel {
         }
         let mut seen_role_ids = HashSet::new();
         let mut seen_role_names = HashSet::new();
+
+        if self.step_up_rules.len() > MAX_STEP_UP_RULES {
+            errors.push(ValidationError::LimitExceeded {
+                resource: "step_up_rules",
+                limit: MAX_STEP_UP_RULES,
+                actual: self.step_up_rules.len(),
+            });
+        }
 
         for role in &self.roles {
             let role_id_key = normalize_name_key(role.id.as_str());
@@ -287,11 +322,39 @@ impl ConfigurationModel {
                     message: "must include permissions or actions".into(),
                 });
             }
+            if role.permissions.len() > MAX_ROLE_PERMISSION_REFS {
+                errors.push(ValidationError::LimitExceeded {
+                    resource: "role_permissions",
+                    limit: MAX_ROLE_PERMISSION_REFS,
+                    actual: role.permissions.len(),
+                });
+            }
+            if role.actions.len() > MAX_ROLE_ACTION_REFS {
+                errors.push(ValidationError::LimitExceeded {
+                    resource: "role_actions",
+                    limit: MAX_ROLE_ACTION_REFS,
+                    actual: role.actions.len(),
+                });
+            }
+            if role.not_actions.len() > MAX_ROLE_ACTION_REFS {
+                errors.push(ValidationError::LimitExceeded {
+                    resource: "role_not_actions",
+                    limit: MAX_ROLE_ACTION_REFS,
+                    actual: role.not_actions.len(),
+                });
+            }
             for permission in &role.permissions {
                 if !perm_ids.contains(permission.permission_id.as_str()) {
                     errors.push(ValidationError::ReferenceNotFound {
                         entity_type: "permission",
                         id: permission.permission_id.as_str().to_string(),
+                    });
+                }
+                if permission.scopes.len() > MAX_ROLE_ENTRY_SCOPES {
+                    errors.push(ValidationError::LimitExceeded {
+                        resource: "role_permission_scopes",
+                        limit: MAX_ROLE_ENTRY_SCOPES,
+                        actual: permission.scopes.len(),
                     });
                 }
             }
@@ -303,7 +366,20 @@ impl ConfigurationModel {
                     action.action_name.as_str(),
                     self.resource_types.as_slice(),
                     allow_wildcards,
+                    &mut action_pattern_cache,
                 );
+                if action.scopes.len() > MAX_ROLE_ENTRY_SCOPES {
+                    errors.push(ValidationError::LimitExceeded {
+                        resource: "role_action_scopes",
+                        limit: MAX_ROLE_ENTRY_SCOPES,
+                        actual: action.scopes.len(),
+                    });
+                }
+                if let Some(limit) = &action.limit
+                    && let Err(error) = limit.validate()
+                {
+                    errors.push(error);
+                }
             }
             for action in &role.not_actions {
                 validate_action_reference(
@@ -313,9 +389,25 @@ impl ConfigurationModel {
                     action.action_name.as_str(),
                     self.resource_types.as_slice(),
                     allow_wildcards,
+                    &mut action_pattern_cache,
                 );
+                if action.scopes.len() > MAX_ROLE_ENTRY_SCOPES {
+                    errors.push(ValidationError::LimitExceeded {
+                        resource: "role_not_action_scopes",
+                        limit: MAX_ROLE_ENTRY_SCOPES,
+                        actual: action.scopes.len(),
+                    });
+                }
+                if action.limit.is_some() {
+                    errors.push(ValidationError::InvalidFormat {
+                        field: "roles[].not_actions[].limit",
+                        message: "limits are only valid on granting actions".to_string(),
+                    });
+                }
             }
         }
+
+        validate_resource_scope_configuration(self, &mut errors, &mut action_pattern_cache);
 
         if self.authn_providers.len() > MAX_AUTHN_PROVIDERS {
             errors.push(ValidationError::LimitExceeded {
@@ -332,17 +424,61 @@ impl ConfigurationModel {
                     message: "issuer must be non-empty".into(),
                 });
             }
-            if !provider.issuer.starts_with("https://") {
+            if !has_nonempty_https_target(&provider.issuer) {
                 errors.push(ValidationError::InvalidFormat {
                     field: "authn_providers[].issuer",
                     message: "issuer must be https".into(),
                 });
             }
-            if !provider.jwks_uri.starts_with("https://") {
+            if provider.issuer.len() > AUTHN_URL_MAX {
+                errors.push(ValidationError::OutOfRange {
+                    field: "authn_providers[].issuer",
+                    message: format!("must be at most {AUTHN_URL_MAX} characters"),
+                });
+            }
+            if provider.jwks_uri.trim().is_empty() {
+                errors.push(ValidationError::InvalidFormat {
+                    field: "authn_providers[].jwks_uri",
+                    message: "jwks_uri must be non-empty".into(),
+                });
+            }
+            if !has_nonempty_https_target(&provider.jwks_uri) {
                 errors.push(ValidationError::InvalidFormat {
                     field: "authn_providers[].jwks_uri",
                     message: "jwks_uri must be https".into(),
                 });
+            }
+            if provider.jwks_uri.len() > AUTHN_URL_MAX {
+                errors.push(ValidationError::OutOfRange {
+                    field: "authn_providers[].jwks_uri",
+                    message: format!("must be at most {AUTHN_URL_MAX} characters"),
+                });
+            }
+            if provider.subject_claim.trim().is_empty() {
+                errors.push(ValidationError::InvalidFormat {
+                    field: "authn_providers[].subject_claim",
+                    message: "subject_claim must be non-empty".into(),
+                });
+            }
+            if provider.subject_claim.len() > NAME_MAX {
+                errors.push(ValidationError::OutOfRange {
+                    field: "authn_providers[].subject_claim",
+                    message: format!("must be 1..={NAME_MAX} characters"),
+                });
+            }
+            if let Some(org_claim) = &provider.org_claim {
+                if org_claim.trim().is_empty() {
+                    errors.push(ValidationError::InvalidFormat {
+                        field: "authn_providers[].org_claim",
+                        message: "org_claim must be non-empty when provided".into(),
+                    });
+                }
+                if org_claim.len() > NAME_MAX {
+                    errors.push(ValidationError::OutOfRange {
+                        field: "authn_providers[].org_claim",
+                        message: format!("must be 1..={NAME_MAX} characters"),
+                    });
+                }
             }
             if let Some(auds) = &provider.audiences
                 && auds.is_empty()
@@ -352,7 +488,23 @@ impl ConfigurationModel {
                     message: "audiences cannot be empty".into(),
                 });
             }
+            if let Some(auds) = &provider.audiences
+                && auds.len() > AUTHN_AUDIENCES_MAX
+            {
+                errors.push(ValidationError::LimitExceeded {
+                    resource: "authn_providers[].audiences",
+                    limit: AUTHN_AUDIENCES_MAX,
+                    actual: auds.len(),
+                });
+            }
             if let Some(algs) = &provider.algorithms {
+                if algs.len() > AUTHN_ALGORITHMS_MAX {
+                    errors.push(ValidationError::LimitExceeded {
+                        resource: "authn_providers[].algorithms",
+                        limit: AUTHN_ALGORITHMS_MAX,
+                        actual: algs.len(),
+                    });
+                }
                 let supported = ["RS256", "RS384", "RS512", "ES256", "ES384", "HS256"];
                 for alg in algs {
                     if !supported.contains(&alg.as_str()) {
@@ -362,6 +514,12 @@ impl ConfigurationModel {
                         });
                     }
                 }
+            }
+            if provider.cache_ttl_seconds == 0 || provider.cache_ttl_seconds > 86_400 {
+                errors.push(ValidationError::OutOfRange {
+                    field: "authn_providers[].cache_ttl_seconds",
+                    message: "must be 1..=86400".into(),
+                });
             }
         }
 
@@ -382,6 +540,20 @@ impl ConfigurationModel {
                 errors.push(ValidationError::InvalidFormat {
                     field: "scope_mappings[].permissions",
                     message: "must include permissions or child scopes".into(),
+                });
+            }
+            if entry.permissions.len() > MAX_SCOPE_MAPPING_PERMISSIONS {
+                errors.push(ValidationError::LimitExceeded {
+                    resource: "scope_mapping_permissions",
+                    limit: MAX_SCOPE_MAPPING_PERMISSIONS,
+                    actual: entry.permissions.len(),
+                });
+            }
+            if entry.includes.len() > MAX_SCOPE_MAPPING_INCLUDES {
+                errors.push(ValidationError::LimitExceeded {
+                    resource: "scope_mapping_includes",
+                    limit: MAX_SCOPE_MAPPING_INCLUDES,
+                    actual: entry.includes.len(),
                 });
             }
         }
@@ -422,6 +594,14 @@ impl ConfigurationModel {
         for rule in &self.step_up_rules {
             if !step_up_ids.insert(rule.rule_id.clone()) {
                 errors.push(ValidationError::DuplicateId(rule.rule_id.clone()));
+            }
+            if rule.required_acr == crate::AcrLevel::RecentAuth
+                && rule.max_auth_age_seconds.is_none()
+            {
+                errors.push(ValidationError::InvalidFormat {
+                    field: "step_up_rules[].max_auth_age_seconds",
+                    message: "is required when required_acr is recent_auth".into(),
+                });
             }
             if let Some(age) = rule.max_auth_age_seconds
                 && age == 0
@@ -510,6 +690,7 @@ impl ConfigurationModel {
         let mut expanded = self.clone();
         let mut errors = Vec::new();
         let resource_types = expanded.resource_types.clone();
+        let mut action_pattern_cache = ActionPatternCache::new();
 
         for permission in &mut expanded.permissions {
             permission.actions = expand_permission_action_refs(
@@ -517,12 +698,14 @@ impl ConfigurationModel {
                 permission.actions.as_slice(),
                 "permissions[].actions[]",
                 &mut errors,
+                &mut action_pattern_cache,
             );
             permission.not_actions = expand_permission_action_refs(
                 resource_types.as_slice(),
                 permission.not_actions.as_slice(),
                 "permissions[].not_actions[]",
                 &mut errors,
+                &mut action_pattern_cache,
             );
         }
 
@@ -532,12 +715,14 @@ impl ConfigurationModel {
                 role.actions.as_slice(),
                 "roles[].actions[]",
                 &mut errors,
+                &mut action_pattern_cache,
             );
             role.not_actions = expand_role_action_refs(
                 resource_types.as_slice(),
                 role.not_actions.as_slice(),
                 "roles[].not_actions[]",
                 &mut errors,
+                &mut action_pattern_cache,
             );
         }
 
@@ -562,6 +747,142 @@ impl ConfigurationModel {
     pub fn get_role(&self, id: &str) -> Option<&Role> {
         self.roles.iter().find(|r| r.id == id)
     }
+}
+
+fn validate_resource_scope_types(
+    errors: &mut Vec<ValidationError>,
+    field: &'static str,
+    scopes: &[Scope],
+    allowed_resource_types: &HashSet<String>,
+) {
+    for scope in scopes {
+        let Some(resource_type) = scope.resource_type() else {
+            continue;
+        };
+        let matches_grant = allowed_resource_types.len() == 1
+            && allowed_resource_types
+                .iter()
+                .any(|allowed| normalize_name_key(allowed) == normalize_name_key(resource_type));
+        if !matches_grant {
+            errors.push(ValidationError::InvalidFormat {
+                field,
+                message: format!(
+                    "resource scope type '{resource_type}' must match the only granted resource \
+                     type"
+                ),
+            });
+        }
+    }
+}
+
+fn validate_resource_scope_configuration(
+    model: &ConfigurationModel,
+    errors: &mut Vec<ValidationError>,
+    action_pattern_cache: &mut ActionPatternCache,
+) {
+    let permission_resource_types: HashMap<_, _> = model
+        .permissions
+        .iter()
+        .map(|permission| {
+            let resource_types = permission
+                .actions
+                .iter()
+                .chain(permission.not_actions.iter())
+                .flat_map(|action| {
+                    expand_action_patterns_cached(
+                        action_pattern_cache,
+                        model.resource_types.as_slice(),
+                        action.resource_type.as_str(),
+                        action.action_name.as_str(),
+                        RESOURCE_TYPE_MAX,
+                        ACTION_MAX,
+                    )
+                    .unwrap_or_default()
+                })
+                .map(|action| action.resource_type)
+                .collect::<HashSet<_>>();
+            (permission.id.as_str(), resource_types)
+        })
+        .collect::<HashMap<_, _>>();
+
+    for role in &model.roles {
+        for permission in &role.permissions {
+            if let Some(resource_types) =
+                permission_resource_types.get(permission.permission_id.as_str())
+            {
+                validate_resource_scope_types(
+                    errors,
+                    "roles[].permissions[].scopes",
+                    &permission.scopes,
+                    resource_types,
+                );
+            }
+        }
+        for action in &role.actions {
+            let resource_types = resource_types_for_action(
+                action_pattern_cache,
+                model.resource_types.as_slice(),
+                action.resource_type.as_str(),
+                action.action_name.as_str(),
+            );
+            validate_resource_scope_types(
+                errors,
+                "roles[].actions[].scopes",
+                &action.scopes,
+                &resource_types,
+            );
+        }
+        for action in &role.not_actions {
+            let resource_types = resource_types_for_action(
+                action_pattern_cache,
+                model.resource_types.as_slice(),
+                action.resource_type.as_str(),
+                action.action_name.as_str(),
+            );
+            validate_resource_scope_types(
+                errors,
+                "roles[].not_actions[].scopes",
+                &action.scopes,
+                &resource_types,
+            );
+        }
+    }
+}
+
+fn resource_types_for_action(
+    action_pattern_cache: &mut ActionPatternCache,
+    resource_types: &[ResourceType],
+    resource_type: &str,
+    action_name: &str,
+) -> HashSet<String> {
+    expand_action_patterns_cached(
+        action_pattern_cache,
+        resource_types,
+        resource_type,
+        action_name,
+        RESOURCE_TYPE_MAX,
+        ACTION_MAX,
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .map(|action| action.resource_type)
+    .collect()
+}
+
+fn has_nonempty_https_target(value: &str) -> bool {
+    if value.trim() != value {
+        return false;
+    }
+
+    if value.chars().any(char::is_whitespace) {
+        return false;
+    }
+
+    let Ok(parsed) = Url::parse(value) else {
+        return false;
+    };
+
+    parsed.scheme() == "https" && parsed.host_str().is_some_and(|host| !host.is_empty())
 }
 
 impl TryFrom<ConfigurationModel> for ValidatedConfigurationModel {
@@ -600,6 +921,7 @@ fn validate_action_reference(
     action_name: &str,
     resource_types: &[ResourceType],
     allow_wildcards: bool,
+    action_pattern_cache: &mut ActionPatternCache,
 ) {
     let has_wildcard = resource_type.contains('*') || action_name.contains('*');
     if has_wildcard && !allow_wildcards {
@@ -610,7 +932,8 @@ fn validate_action_reference(
         return;
     }
 
-    match expand_action_patterns(
+    match expand_action_patterns_cached(
+        action_pattern_cache,
         resource_types,
         resource_type,
         action_name,
@@ -658,16 +981,45 @@ fn validate_action_reference(
     }
 }
 
+fn expand_action_patterns_cached(
+    cache: &mut ActionPatternCache,
+    resource_types: &[ResourceType],
+    resource_type_pattern: &str,
+    action_name_pattern: &str,
+    resource_type_max_len: usize,
+    action_name_max_len: usize,
+) -> Result<Vec<ExpandedActionRef>, ActionPatternExpandError> {
+    let key = (
+        resource_type_pattern.trim().to_ascii_lowercase(),
+        action_name_pattern.trim().to_ascii_lowercase(),
+    );
+    if let Some(result) = cache.get(&key) {
+        return result.clone();
+    }
+
+    let result = expand_action_patterns(
+        resource_types,
+        resource_type_pattern,
+        action_name_pattern,
+        resource_type_max_len,
+        action_name_max_len,
+    );
+    cache.insert(key, result.clone());
+    result
+}
+
 fn expand_permission_action_refs(
     resource_types: &[ResourceType],
     requested: &[PermissionActionRef],
     field: &'static str,
     errors: &mut Vec<ValidationError>,
+    action_pattern_cache: &mut ActionPatternCache,
 ) -> Vec<PermissionActionRef> {
     let mut deduped = HashSet::new();
     let mut expanded = Vec::new();
     for action_ref in requested {
-        match expand_action_patterns(
+        match expand_action_patterns_cached(
+            action_pattern_cache,
             resource_types,
             action_ref.resource_type.as_str(),
             action_ref.action_name.as_str(),
@@ -706,11 +1058,13 @@ fn expand_role_action_refs(
     requested: &[RoleActionRef],
     field: &'static str,
     errors: &mut Vec<ValidationError>,
+    action_pattern_cache: &mut ActionPatternCache,
 ) -> Vec<RoleActionRef> {
     let mut deduped = HashSet::new();
     let mut expanded = Vec::new();
     for action_ref in requested {
-        match expand_action_patterns(
+        match expand_action_patterns_cached(
+            action_pattern_cache,
             resource_types,
             action_ref.resource_type.as_str(),
             action_ref.action_name.as_str(),
@@ -729,12 +1083,14 @@ fn expand_role_action_refs(
                         matched.resource_type.clone(),
                         matched.action_name.clone(),
                         scope_key,
+                        action_ref.limit.clone(),
                     );
                     if deduped.insert(key) {
                         expanded.push(RoleActionRef {
                             resource_type: matched.resource_type,
                             action_name: matched.action_name,
                             scopes: action_ref.scopes.clone(),
+                            limit: action_ref.limit.clone(),
                         });
                     }
                 }
@@ -762,6 +1118,7 @@ fn expand_role_action_refs(
                     .collect::<Vec<_>>()
                     .join("|"),
             ))
+            .then_with(|| left.limit.cmp(&right.limit))
     });
     expanded
 }
@@ -798,5 +1155,53 @@ fn append_expansion_error(
                 id: format!("{resource_type_pattern}:{action_name_pattern}"),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod resource_expansion_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_wildcard_expansion_reuses_the_catalog_match() {
+        let resource_types = vec![ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: (0..4)
+                .map(|index| crate::ActionDefinition {
+                    name: format!("read-{index}"),
+                    description: None,
+                })
+                .collect(),
+            context_schema: None,
+        }];
+        let mut cache = ActionPatternCache::new();
+
+        let first = expand_action_patterns_cached(
+            &mut cache,
+            &resource_types,
+            "document",
+            "read-*",
+            RESOURCE_TYPE_MAX,
+            ACTION_MAX,
+        )
+        .expect("first wildcard expansion");
+        let second = expand_action_patterns_cached(
+            &mut cache,
+            &resource_types,
+            "DOCUMENT",
+            "READ-*",
+            RESOURCE_TYPE_MAX,
+            ACTION_MAX,
+        )
+        .expect("cached wildcard expansion");
+
+        assert_eq!(first, second);
+        assert_eq!(
+            cache.len(),
+            1,
+            "duplicate patterns must not rescan the catalog"
+        );
     }
 }

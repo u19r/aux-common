@@ -248,7 +248,20 @@ pub(crate) fn has_sensitive_suffix(key: &str, suffix: &str) -> bool {
         return false;
     }
 
-    suffix_start == 0 || matches!(key[suffix_start - 1], b'.' | b'_' | b'-')
+    if suffix_start == 0 {
+        return true;
+    }
+
+    if matches!(key[suffix_start - 1], b'.' | b'_' | b'-') {
+        return true;
+    }
+
+    // Treat an ASCII lower/upper (or digit/upper) transition as a field
+    // boundary so names such as `accessToken` and `clientSecret` receive the
+    // same protection as separator-delimited names.  The comparison above is
+    // intentionally ASCII-only because tracing field names are protocol
+    // identifiers, not human text.
+    key[suffix_start].is_ascii_uppercase() && key[suffix_start - 1].is_ascii_alphanumeric()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

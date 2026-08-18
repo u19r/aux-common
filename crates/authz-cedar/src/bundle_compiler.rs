@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use authz_types::ValidatedConfigurationModel;
 use cedar_policy::{
@@ -11,7 +11,7 @@ use crate::{
     StaticPolicyEntry, TemplateGroup, TemplateLinkEntry, generate_base_schema,
     generate_policy_document_for_resource, generate_schema_for_resource,
     schema_generator::ensure_unique_resource_entity_names,
-    slices::{SLICE_SOFT_MAX_BYTES, enforce_size},
+    slices::{SLICE_SOFT_MAX_BYTES, enforce_size, sha256_hex},
     validation::validate_compiled_slices,
 };
 
@@ -22,6 +22,7 @@ pub fn compile_policy_bundle(
     version: u64,
 ) -> Result<CompiledBundle, CedarError> {
     ensure_unique_resource_entity_names(config)?;
+    let config_fingerprint = configuration_fingerprint(config)?;
     let base_schema_json = generate_base_schema()?;
     enforce_size("base schema", base_schema_json.len()).map_err(CedarError::bundle_compilation)?;
 
@@ -46,11 +47,14 @@ pub fn compile_policy_bundle(
     validate_compiled_slices(&schema_slices, &policy_slices)?;
     let manifest = BundleManifest {
         version,
+        config_fingerprint: Some(config_fingerprint),
+        base_schema_sha256: Some(sha256_hex(base_schema_json.as_bytes())),
         schema_slices: schema_slices
             .iter()
             .map(|s| SliceMeta {
                 key: s.resource_type.clone(),
                 size_bytes: s.size_bytes,
+                sha256: Some(sha256_hex(s.schema_json.as_bytes())),
             })
             .collect(),
         policy_slices: policy_slices
@@ -69,6 +73,7 @@ pub fn compile_policy_bundle(
                     key
                 },
                 size_bytes: s.size_bytes,
+                sha256: Some(sha256_hex(s.policies_json.as_bytes())),
             })
             .collect(),
         compiled_at_ms: None,
@@ -81,6 +86,46 @@ pub fn compile_policy_bundle(
         manifest,
         version,
     })
+}
+
+/// Return the stable SHA-256 identity of the validated configuration used to
+/// compile a bundle.  Runtime consumers compare this value before parsing
+/// policy JSON so a valid bundle from another configuration cannot be reused.
+pub fn configuration_fingerprint(
+    config: &ValidatedConfigurationModel,
+) -> Result<String, CedarError> {
+    // The persisted configuration payload deliberately omits the descriptive
+    // top-level note (see AuxFn's ConfigEntity persistence path).  Excluding
+    // it here keeps the bundle identity tied to authorization semantics and
+    // makes a bundle compiled before persistence reusable after hydration.
+    let mut model = (**config).clone();
+    model.description = None;
+    let value = serde_json::to_value(model)
+        .map_err(|error| CedarError::bundle_compilation(error.to_string()))?;
+    let canonical = canonicalize_json(value);
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|error| CedarError::bundle_compilation(error.to_string()))?;
+    Ok(sha256_hex(bytes))
+}
+
+fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            let sorted = object.into_iter().collect::<BTreeMap<_, _>>();
+            let mut canonical = serde_json::Map::with_capacity(sorted.len());
+            for (key, value) in sorted {
+                canonical.insert(key, canonicalize_json(value));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(canonicalize_json)
+                .collect::<Vec<_>>(),
+        ),
+        scalar => scalar,
+    }
 }
 
 fn split_policy_slices(

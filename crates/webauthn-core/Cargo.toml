@@ -1,0 +1,27 @@
+[package]
+publish = false
+name = "webauthn-core"
+version = "0.1.0"
+rust-version.workspace = true
+edition.workspace = true
+description = "Strict WebAuthn ceremony verification over caller-supplied policy and bytes"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+ciborium = { workspace = true }
+p256 = { workspace = true, features = ["ecdsa"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+signature = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+alloc-counter = { workspace = true }
+
+[lints]
+workspace = true

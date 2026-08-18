@@ -11,7 +11,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
 [lints.rust]
-unsafe_code = "allow"
+unsafe_code = "deny"
 unreachable_pub = "warn"
 
 [lints.clippy]

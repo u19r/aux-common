@@ -2,10 +2,14 @@ use std::{collections::VecDeque, sync::Mutex};
 
 use http::{HeaderMap, Method, StatusCode};
 use http_request::{
-    HttpClient, HttpResponse, RetryConfig, Transport, TransportFuture, reqwest::Request,
+    HttpClient, HttpRequestError, HttpRequestErrorKind, HttpResponse, RetryConfig, Transport,
+    TransportFuture, reqwest::Request,
 };
 
-use crate::{AwsSigv4HttpClient, AwsStaticCredentials, CredentialSource};
+use crate::{
+    AwsRequestSigner, AwsSigv4HttpClient, AwsStaticCredentials, CredentialSource, SignableBody,
+    SigningError,
+};
 
 struct QueuedResponse {
     method: Method,
@@ -74,6 +78,53 @@ impl Transport for QueueTransport {
             Ok(next.response)
         })
     }
+
+    fn redirects_disabled(&self) -> bool {
+        true
+    }
+}
+
+struct FailingTransport;
+
+impl std::fmt::Debug for FailingTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FailingTransport")
+    }
+}
+
+struct UntrustedTransport;
+
+impl std::fmt::Debug for UntrustedTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UntrustedTransport")
+    }
+}
+
+impl Transport for UntrustedTransport {
+    fn send(&self, _request: Request) -> TransportFuture {
+        Box::pin(async { Err(HttpRequestError::RequestNotCloneable) })
+    }
+}
+
+impl Transport for FailingTransport {
+    fn send(&self, _request: Request) -> TransportFuture {
+        let source = http_request::reqwest::Proxy::all("not a valid proxy url")
+            .expect_err("invalid proxy should produce a reqwest error")
+            .with_url(
+                http_request::Url::parse("https://service.test/resource?access_token=sentinel")
+                    .expect("url"),
+            );
+        Box::pin(async move {
+            Err(HttpRequestError::Transport {
+                kind: HttpRequestErrorKind::Request,
+                source,
+            })
+        })
+    }
+
+    fn redirects_disabled(&self) -> bool {
+        true
+    }
 }
 
 fn static_credentials() -> CredentialSource {
@@ -102,6 +153,145 @@ fn signed_client_rejects_http_clients_without_a_no_redirect_guarantee() {
     .expect("unconstrained redirect client must be rejected");
 
     assert!(matches!(error, crate::SigningError::RedirectPolicyRequired));
+}
+
+#[test]
+fn signed_client_rejects_custom_transports_without_a_no_redirect_guarantee() {
+    let client = HttpClient::builder()
+        .with_transport(UntrustedTransport)
+        .build()
+        .expect("custom transport client");
+
+    let error = AwsSigv4HttpClient::new(
+        client,
+        "https://service.test",
+        "us-east-1",
+        static_credentials(),
+        "execute-api",
+    )
+    .err()
+    .expect("custom transports must prove redirects are disabled");
+
+    assert!(matches!(error, crate::SigningError::RedirectPolicyRequired));
+}
+
+#[test]
+fn signed_client_rejects_http_endpoints_before_resolving_credentials() {
+    let client = HttpClient::builder().build().expect("http client");
+    let error = AwsSigv4HttpClient::new(
+        client,
+        "http://service.test",
+        "us-east-1",
+        static_credentials(),
+        "execute-api",
+    )
+    .err()
+    .expect("cleartext endpoint must be rejected");
+
+    assert!(matches!(error, SigningError::InsecureTransport));
+}
+
+#[tokio::test]
+async fn signed_client_rejects_paths_that_escape_the_configured_authority() {
+    let client = HttpClient::builder().build().expect("http client");
+    let signed = AwsSigv4HttpClient::new(
+        client,
+        "https://service.test",
+        "us-east-1",
+        static_credentials(),
+        "execute-api",
+    )
+    .expect("signed client");
+
+    let error = signed
+        .send(
+            Method::GET,
+            "//attacker.test/credentials",
+            None,
+            HeaderMap::new(),
+            None,
+        )
+        .await
+        .err()
+        .expect("authority-changing paths must be rejected");
+
+    assert!(matches!(error, SigningError::InvalidUrl(_)));
+}
+
+#[tokio::test]
+async fn signed_client_rejects_caller_supplied_host_headers() {
+    let client = HttpClient::builder().build().expect("http client");
+    let signed = AwsSigv4HttpClient::new(
+        client,
+        "https://service.test",
+        "us-east-1",
+        static_credentials(),
+        "execute-api",
+    )
+    .expect("signed client");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::HOST,
+        http::HeaderValue::from_static("attacker.test"),
+    );
+
+    let error = signed
+        .send(Method::GET, "/resource", None, headers, None)
+        .await
+        .err()
+        .expect("caller-supplied Host headers must be rejected");
+
+    assert!(matches!(error, SigningError::HostHeaderOverride));
+}
+
+#[tokio::test]
+async fn signer_rejects_http_uris_before_signing_credentials() {
+    let signer =
+        AwsRequestSigner::new("us-east-1", static_credentials(), "execute-api").expect("signer");
+    let uri = "http://service.test/resource".parse().expect("uri");
+
+    let error = signer
+        .sign_request("GET", &uri, &HeaderMap::new(), SignableBody::Bytes(&[]))
+        .await
+        .expect_err("cleartext uri must be rejected");
+
+    assert!(matches!(error, SigningError::InsecureTransport));
+}
+
+#[tokio::test]
+async fn signed_client_errors_do_not_include_credential_bearing_request_urls() {
+    let client = HttpClient::builder()
+        .retry(RetryConfig {
+            max_retries: 0,
+            base_delay: std::time::Duration::ZERO,
+            max_delay: std::time::Duration::ZERO,
+            retry_non_idempotent: false,
+        })
+        .with_transport(FailingTransport)
+        .build()
+        .expect("http client");
+    let signed = AwsSigv4HttpClient::new(
+        client,
+        "https://service.test",
+        "us-east-1",
+        static_credentials(),
+        "execute-api",
+    )
+    .expect("signed client");
+
+    let error = signed
+        .send(
+            Method::GET,
+            "/resource?access_token=sentinel",
+            None,
+            HeaderMap::new(),
+            None,
+        )
+        .await
+        .err()
+        .expect("transport should fail");
+
+    assert!(!error.to_string().contains("access_token=sentinel"));
 }
 
 #[tokio::test]
@@ -201,4 +391,42 @@ async fn send_text_preserves_explicit_content_type_override() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.body(), "{\"ok\":true}");
     assert_eq!(response.etag(), None);
+}
+
+#[tokio::test]
+async fn text_response_debug_output_omits_body_and_header_values() {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-secret", http::HeaderValue::from_static("secret-header"));
+    let response = HttpResponse::from_mock(
+        StatusCode::OK,
+        headers,
+        b"secret-response-body".to_vec(),
+        "https://service.test/resource".parse().expect("url"),
+    );
+    let client = HttpClient::builder()
+        .with_transport(QueueTransport::new(vec![QueuedResponse {
+            method: Method::GET,
+            url: "https://service.test/resource".to_string(),
+            expected_content_type: None,
+            response,
+        }]))
+        .build()
+        .expect("http client");
+    let signed = AwsSigv4HttpClient::new(
+        client,
+        "https://service.test",
+        "us-east-1",
+        static_credentials(),
+        "execute-api",
+    )
+    .expect("signed client");
+
+    let response = signed
+        .send_text(Method::GET, "/resource", None, HeaderMap::new(), None)
+        .await
+        .expect("response");
+    let debug = format!("{response:?}");
+
+    assert!(!debug.contains("secret-response-body"));
+    assert!(!debug.contains("secret-header"));
 }

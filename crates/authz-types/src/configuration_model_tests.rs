@@ -2,9 +2,10 @@ use std::collections::HashMap;
 
 use crate::{
     AcrLevel, AuthnProviderConfig, ConfigurationModel, MAX_ACTIONS_PER_RESOURCE_TYPE,
-    MAX_PERMISSIONS, MAX_ROLES, Permission, PermissionActionRef, PermissionId, ResourceType, Role,
-    RoleActionRef, RolePermission, Scope, ScopeMappingEntry, StepUpConfig, StepUpRule,
-    ValidationError,
+    MAX_PERMISSION_ACTION_REFS, MAX_PERMISSIONS, MAX_ROLES, Permission, PermissionActionRef,
+    PermissionId, ResourceType, Role, RoleActionLimit, RoleActionRef, RoleLimitCountScope,
+    RoleLimitCountSource, RoleLimitEnforcementMode, RoleLimitThresholds, RolePermission, Scope,
+    ScopeMappingEntry, StepUpConfig, StepUpRule, ValidationError,
 };
 
 #[test]
@@ -29,6 +30,56 @@ fn detects_duplicate_step_up_rule_ids() {
         errs.iter()
             .any(|e| matches!(e, ValidationError::DuplicateId(id) if id == "r1"))
     );
+}
+
+#[test]
+fn recent_auth_step_up_rules_require_a_freshness_window() {
+    let mut model = base_model();
+    model.step_up_rules = vec![StepUpRule::require_acr(
+        "recent",
+        "Recent authentication",
+        AcrLevel::RecentAuth,
+    )];
+
+    let errors = model
+        .validate()
+        .expect_err("RecentAuth without a freshness window must be rejected");
+    assert!(errors.iter().any(|error| {
+        matches!(
+            error,
+            ValidationError::InvalidFormat { field, message }
+                if *field == "step_up_rules[].max_auth_age_seconds"
+                    && message.contains("required")
+        )
+    }));
+}
+
+#[test]
+fn nested_permission_action_collections_are_bounded() {
+    let mut model = base_model();
+    model.permissions[0].actions = (0..=MAX_PERMISSION_ACTION_REFS)
+        .map(|index| PermissionActionRef {
+            resource_type: "repo".into(),
+            action_name: if index == 0 {
+                "read".into()
+            } else {
+                format!("action_{index}")
+            },
+        })
+        .collect();
+
+    let errors = model
+        .validate()
+        .expect_err("nested permission collections must be bounded");
+    assert!(errors.iter().any(|error| {
+        matches!(
+            error,
+            ValidationError::LimitExceeded { resource, limit, actual }
+                if *resource == "permission_actions"
+                    && *limit == MAX_PERMISSION_ACTION_REFS
+                    && *actual == MAX_PERMISSION_ACTION_REFS + 1
+        )
+    }));
 }
 
 #[test]
@@ -204,6 +255,66 @@ fn duplicate_entity_ids_are_rejected() {
 }
 
 #[test]
+fn resource_scope_type_must_match_the_granted_resource() {
+    let mut model = base_model();
+    model.resource_types.push(ResourceType {
+        id: "other".into(),
+        name: "other".into(),
+        description: None,
+        actions: vec![crate::ActionDefinition {
+            name: "read".into(),
+            description: None,
+        }],
+        context_schema: None,
+    });
+    model.roles[0].permissions[0].scopes = vec![Scope::resource("other")];
+
+    let errors = model
+        .validate()
+        .expect_err("public validation must reject an untyped resource grant");
+    assert!(errors.iter().any(|error| {
+        matches!(
+            error,
+            ValidationError::InvalidFormat { field, message }
+                if *field == "roles[].permissions[].scopes"
+                    && message.contains("must match")
+        )
+    }));
+}
+
+#[test]
+fn resource_scope_rejects_a_permission_spanning_multiple_resource_types() {
+    let mut model = base_model();
+    model.resource_types.push(ResourceType {
+        id: "other".into(),
+        name: "other".into(),
+        description: None,
+        actions: vec![crate::ActionDefinition {
+            name: "read".into(),
+            description: None,
+        }],
+        context_schema: None,
+    });
+    model.permissions[0].actions.push(PermissionActionRef {
+        resource_type: "other".into(),
+        action_name: "read".into(),
+    });
+    model.roles[0].permissions[0].scopes = vec![Scope::resource("repo")];
+
+    let errors = model
+        .into_validated()
+        .expect_err("typed resource scope cannot be reused across heterogeneous actions");
+    assert!(errors.iter().any(|error| {
+        matches!(
+            error,
+            ValidationError::InvalidFormat { field, message }
+                if *field == "roles[].permissions[].scopes"
+                    && message.contains("only granted resource type")
+        )
+    }));
+}
+
+#[test]
 fn permissions_limit_exceeded_is_reported() {
     let mut model = base_model();
     model.permissions = (0..=MAX_PERMISSIONS)
@@ -304,9 +415,72 @@ fn wildcard_patterns_in_permission_and_role_actions_are_valid() {
         resource_type: "repo".into(),
         action_name: "wri*".into(),
         scopes: vec![Scope::Tenant],
+        limit: None,
     }];
 
     assert!(model.validate().is_ok());
+}
+
+#[test]
+fn given_invalid_role_action_limit_when_validating_configuration_then_configuration_is_rejected() {
+    let mut model = base_model();
+    let mut invalid = RoleActionLimit::try_new(
+        "projects",
+        5,
+        "projects",
+        RoleLimitCountScope::Tenant,
+        RoleLimitCountSource::Capacity,
+        RoleLimitEnforcementMode::Hard,
+        120,
+        RoleLimitThresholds::default(),
+    )
+    .expect("valid limit");
+    invalid.count_source = RoleLimitCountSource::CustomerSupplied;
+    model.roles[0].actions[0].limit = Some(invalid);
+
+    let errors = model
+        .validate()
+        .expect_err("invalid customer-supplied hard policy must be rejected");
+    assert!(errors.iter().any(|error| {
+        matches!(
+            error,
+            ValidationError::InvalidFormat { field, .. }
+                if *field == "limit.enforcement_mode"
+        )
+    }));
+}
+
+#[test]
+fn given_limit_on_not_action_when_validating_configuration_then_configuration_is_rejected() {
+    let mut model = base_model();
+    let valid = RoleActionLimit::try_new(
+        "projects",
+        5,
+        "projects",
+        RoleLimitCountScope::Tenant,
+        RoleLimitCountSource::Capacity,
+        RoleLimitEnforcementMode::Hard,
+        120,
+        RoleLimitThresholds::default(),
+    )
+    .expect("valid limit");
+    model.roles[0].not_actions = vec![RoleActionRef {
+        resource_type: "repo".into(),
+        action_name: "read".into(),
+        scopes: vec![Scope::Tenant],
+        limit: Some(valid),
+    }];
+
+    let errors = model
+        .validate()
+        .expect_err("deny entries cannot carry granting limits");
+    assert!(errors.iter().any(|error| {
+        matches!(
+            error,
+            ValidationError::InvalidFormat { field, .. }
+                if *field == "roles[].not_actions[].limit"
+        )
+    }));
 }
 
 #[test]
@@ -486,6 +660,123 @@ fn authn_providers_must_use_https_and_supported_algorithms() {
 }
 
 #[test]
+fn given_authn_provider_urls_with_whitespace_when_validating_then_https_fields_fail_closed() {
+    let mut model = base_model();
+    model.authn_providers.push(AuthnProviderConfig {
+        issuer: "https://issuer.example.test ".into(),
+        jwks_uri: "https://issuer.example.test/\njwks.json".into(),
+        algorithms: None,
+        audiences: None,
+        subject_claim: "sub".into(),
+        org_claim: None,
+        cache_ttl_seconds: 300,
+    });
+
+    let errors = model
+        .validate()
+        .expect_err("whitespace in authn provider URLs must fail validation");
+
+    assert!(errors.iter().any(|error| {
+        matches!(
+            error,
+            ValidationError::InvalidFormat { field, message }
+                if *field == "authn_providers[].issuer" && message == "issuer must be https"
+        )
+    }));
+    assert!(errors.iter().any(|error| {
+        matches!(
+            error,
+            ValidationError::InvalidFormat { field, message }
+                if *field == "authn_providers[].jwks_uri" && message == "jwks_uri must be https"
+        )
+    }));
+}
+
+#[test]
+fn authn_provider_declared_bounds_are_enforced() {
+    let mut model = base_model();
+    model.authn_providers.push(AuthnProviderConfig {
+        issuer: format!("https://{}", "i".repeat(2048)),
+        jwks_uri: format!("https://{}", "j".repeat(2048)),
+        algorithms: Some((0..=6).map(|_| "RS256".to_string()).collect()),
+        audiences: Some((0..=25).map(|_| "auxfn-api".to_string()).collect()),
+        subject_claim: " ".into(),
+        org_claim: Some("o".repeat(59)),
+        cache_ttl_seconds: 86_401,
+    });
+
+    let errors = model
+        .validate()
+        .expect_err("authn provider values outside the published bounds must fail");
+    assert!(errors.iter().any(|error| {
+        matches!(
+            error,
+            ValidationError::OutOfRange { field, .. }
+                if *field == "authn_providers[].issuer"
+        )
+    }));
+    assert!(errors.iter().any(|error| {
+        matches!(
+            error,
+            ValidationError::OutOfRange { field, .. }
+                if *field == "authn_providers[].jwks_uri"
+        )
+    }));
+    assert!(errors.iter().any(|error| {
+        matches!(
+            error,
+            ValidationError::LimitExceeded { resource, .. }
+                if *resource == "authn_providers[].algorithms"
+        )
+    }));
+    assert!(errors.iter().any(|error| {
+        matches!(
+            error,
+            ValidationError::LimitExceeded { resource, .. }
+                if *resource == "authn_providers[].audiences"
+        )
+    }));
+    assert!(errors.iter().any(|error| {
+        matches!(
+            error,
+            ValidationError::InvalidFormat { field, .. }
+                if *field == "authn_providers[].subject_claim"
+        )
+    }));
+    assert!(errors.iter().any(|error| {
+        matches!(
+            error,
+            ValidationError::OutOfRange { field, .. }
+                if *field == "authn_providers[].org_claim"
+        )
+    }));
+    assert!(errors.iter().any(|error| {
+        matches!(
+            error,
+            ValidationError::OutOfRange { field, .. }
+                if *field == "authn_providers[].cache_ttl_seconds"
+        )
+    }));
+}
+
+#[test]
+fn resource_type_id_uses_the_shared_identifier_bound() {
+    let mut model = base_model();
+    model.resource_types[0].id = "r".repeat(59);
+
+    let errors = model
+        .validate()
+        .expect_err("resource type ids must respect the shared identifier bound");
+    assert!(errors.iter().any(|error| {
+        matches!(
+            error,
+            ValidationError::OutOfRange { field, .. }
+                if *field == "resource_types[].id"
+        )
+    }));
+}
+
+#[test]
 fn default_step_up_rule_must_reference_existing_rule() {
     let mut model = base_model();
     model.default_step_up_rule = Some("rule_missing".into());
@@ -569,6 +860,7 @@ fn base_model() -> ConfigurationModel {
                 resource_type: "repo".into(),
                 action_name: "read".into(),
                 scopes: vec![Scope::Tenant],
+                limit: None,
             }],
             not_actions: vec![],
         }],

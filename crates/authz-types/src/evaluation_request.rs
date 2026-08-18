@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::{Action, Context, JwtContext, Resource, SessionContext, Subject, TokenContext};
+use crate::{
+    Action, Context, JwtContext, MAX_BATCH_EVALUATIONS, Resource, SessionContext, Subject,
+    TokenContext,
+};
 
 /// Single authorization evaluation request.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -64,6 +67,7 @@ pub struct EvaluationRequest {
     }]
 }))]
 pub struct BatchEvaluationRequest {
+    #[serde(deserialize_with = "deserialize_bounded_evaluations")]
     #[schema(max_items = 100, example = json!([{
         "subject": { "type": "user", "id": "user_123" },
         "resource": { "type": "document", "id": "doc_456" },
@@ -84,4 +88,38 @@ pub struct BatchEvaluationRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = true)]
     pub token_context_override: Option<TokenContext>,
+}
+
+fn deserialize_bounded_evaluations<'de, D>(
+    deserializer: D,
+) -> Result<Vec<EvaluationRequest>, D::Error>
+where D: serde::Deserializer<'de> {
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Vec<EvaluationRequest>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded evaluation sequence")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where A: serde::de::SeqAccess<'de> {
+            let mut values = Vec::new();
+            while values.len() < MAX_BATCH_EVALUATIONS {
+                let Some(value) = sequence.next_element()? else {
+                    return Ok(values);
+                };
+                values.push(value);
+            }
+            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom(format!(
+                    "evaluations exceeds maximum of {MAX_BATCH_EVALUATIONS} entries"
+                )));
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(Visitor)
 }

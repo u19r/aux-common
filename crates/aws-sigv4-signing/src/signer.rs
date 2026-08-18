@@ -15,6 +15,8 @@ use url::Url;
 
 use crate::{SignableBody, SigningError};
 
+const MAX_PRESIGN_EXPIRY: Duration = Duration::from_hours(168);
+
 #[derive(Debug, Clone)]
 pub struct AwsRequestSigner {
     region: String,
@@ -74,6 +76,7 @@ impl AwsRequestSigner {
         body: SignableBody<'_>,
         signing_time: SystemTime,
     ) -> Result<HeaderMap, SigningError> {
+        require_https(uri)?;
         let credentials = self
             .credentials
             .provide_credentials()
@@ -169,6 +172,8 @@ impl AwsRequestSigner {
         expires_in: Duration,
         signing_time: SystemTime,
     ) -> Result<Uri, SigningError> {
+        require_https(uri)?;
+        validate_presign_expiry(expires_in)?;
         let credentials = self
             .credentials
             .provide_credentials()
@@ -235,4 +240,19 @@ impl AwsRequestSigner {
             .parse::<Uri>()
             .map_err(|err| SigningError::InvalidUri(err.to_string()))
     }
+}
+
+fn require_https(uri: &Uri) -> Result<(), SigningError> {
+    if uri.scheme_str() == Some("https") {
+        Ok(())
+    } else {
+        Err(SigningError::InsecureTransport)
+    }
+}
+
+fn validate_presign_expiry(expires_in: Duration) -> Result<(), SigningError> {
+    if expires_in.is_zero() || expires_in > MAX_PRESIGN_EXPIRY {
+        return Err(SigningError::InvalidPresignExpiry);
+    }
+    Ok(())
 }

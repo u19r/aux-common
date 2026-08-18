@@ -230,3 +230,59 @@ async fn sign_request_preserves_explicit_host_header_and_presign_uses_query_para
     );
     assert!(!query.iter().any(|(key, _)| key == "X-Amz-Content-Sha256"));
 }
+
+#[tokio::test]
+async fn given_zero_presign_expiry_when_presigning_then_rejects_request() {
+    let signer = AwsRequestSigner::new(
+        "us-east-1",
+        CredentialSource::Static(AwsStaticCredentials {
+            access_key_id: "AKIDEXAMPLE".to_string(),
+            secret_access_key: "very-secret".to_string(),
+            session_token: None,
+        }),
+        "execute-api",
+    )
+    .expect("signer");
+    let uri: Uri = "https://api.example.com/customers".parse().expect("uri");
+
+    let error = signer
+        .presign_request(
+            "GET",
+            &uri,
+            &HeaderMap::new(),
+            SignableBody::Bytes(&[]),
+            Duration::ZERO,
+        )
+        .await
+        .expect_err("zero expiry must be rejected");
+
+    assert!(matches!(error, crate::SigningError::InvalidPresignExpiry));
+}
+
+#[tokio::test]
+async fn given_expiry_over_seven_days_when_presigning_then_rejects_request() {
+    let signer = AwsRequestSigner::new(
+        "us-east-1",
+        CredentialSource::Static(AwsStaticCredentials {
+            access_key_id: "AKIDEXAMPLE".to_string(),
+            secret_access_key: "very-secret".to_string(),
+            session_token: None,
+        }),
+        "execute-api",
+    )
+    .expect("signer");
+    let uri: Uri = "https://api.example.com/customers".parse().expect("uri");
+
+    let error = signer
+        .presign_request(
+            "GET",
+            &uri,
+            &HeaderMap::new(),
+            SignableBody::Bytes(&[]),
+            Duration::from_secs(604_801),
+        )
+        .await
+        .expect_err("expiry above AWS limit must be rejected");
+
+    assert!(matches!(error, crate::SigningError::InvalidPresignExpiry));
+}

@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    io::Write,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -122,6 +123,26 @@ fn mock_json_response(headers: HeaderMap, body: &serde_json::Value) -> HttpRespo
         serde_json::to_vec(&body).expect("encode mock json body"),
         Url::parse("https://example.test/resource").expect("mock response url"),
     )
+}
+
+fn transport_error_with_sensitive_url() -> HttpRequestError {
+    let source = reqwest::Proxy::all("not a valid proxy url")
+        .expect_err("invalid proxy should produce a reqwest error")
+        .with_url(Url::parse("https://example.test/resource?access_token=sentinel").expect("url"));
+    source.into()
+}
+
+#[test]
+fn request_attempt_diagnostics_do_not_log_sensitive_path_or_query() {
+    let url = Url::parse("https://example.test/private/secret-token?access_token=sentinel")
+        .expect("request URL");
+    let diagnostics = crate::client::request_attempt_diagnostics(&url);
+    let output = format!("{diagnostics:?}");
+    assert!(output.contains("host: \"example.test\""));
+    assert!(output.contains("path_length: 21"));
+    assert!(output.contains("query_present: true"));
+    assert!(!output.contains("secret-token"));
+    assert!(!output.contains("access_token=sentinel"));
 }
 
 #[tokio::test]
@@ -789,4 +810,172 @@ async fn mock_response_bytes_url_and_cache_ttl_fallback_are_preserved() {
         !response.expired(),
         "invalid max-age directives should fall back to the caller-provided ttl"
     );
+}
+
+#[tokio::test]
+async fn default_success_body_limit_rejects_oversized_response() {
+    let body = vec![b'x'; crate::constants::DEFAULT_MAX_RESPONSE_LENGTH_BYTES + 1];
+    let error = HttpResponse::from_mock(
+        StatusCode::OK,
+        HeaderMap::new(),
+        body,
+        Url::parse("https://example.test/large").expect("response url"),
+    )
+    .bytes()
+    .await
+    .expect_err("successful response bodies must have a default bound");
+
+    assert!(matches!(error, HttpRequestError::ResponseTooLarge { .. }));
+}
+
+#[tokio::test]
+async fn extreme_cache_control_max_age_does_not_panic() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("max-age=18446744073709551615"),
+    );
+    let client = HttpClientBuilder::new()
+        .with_transport(SequenceTransport::from_responses(vec![Ok(
+            mock_json_response(headers, &json!({ "issuer": "https://issuer.example.test" })),
+        )]))
+        .build()
+        .expect("build http client");
+
+    let join = tokio::spawn(async move {
+        client
+            .get_json_with_cache::<serde_json::Value>(
+                "https://example.test/discovery",
+                Duration::from_secs(30),
+            )
+            .await
+    })
+    .await;
+
+    assert!(
+        join.is_ok(),
+        "untrusted cache metadata must not panic the task"
+    );
+}
+
+#[test]
+fn returned_transport_error_diagnostics_redact_sensitive_url() {
+    let error = transport_error_with_sensitive_url();
+    let display = error.to_string();
+    let debug = format!("{error:?}");
+    let source = std::error::Error::source(&error).expect("transport source");
+    let source_display = source.to_string();
+    let source_debug = format!("{source:?}");
+
+    assert!(
+        !display.contains("access_token=sentinel"),
+        "display leaked URL"
+    );
+    assert!(!debug.contains("access_token=sentinel"), "debug leaked URL");
+    assert!(
+        !source_display.contains("access_token=sentinel"),
+        "source display leaked URL"
+    );
+    assert!(
+        !source_debug.contains("access_token=sentinel"),
+        "source debug leaked URL"
+    );
+}
+
+#[test]
+fn capped_reqwest_response_cannot_escape_as_raw_response() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind response server");
+    let address = listener.local_addr().expect("response server address");
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept response request");
+        let mut request = [0_u8; 1024];
+        let _ = std::io::Read::read(&mut stream, &mut request);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody")
+            .expect("write response");
+    });
+
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async move {
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/resource"))
+            .send()
+            .await
+            .expect("response");
+        assert!(
+            HttpResponse::from_reqwest(response)
+                .with_max_body_size(Some(1))
+                .into_reqwest()
+                .is_none(),
+            "capped responses must not expose an uncapped reqwest body"
+        );
+    });
+}
+
+#[test]
+fn http_client_builder_debug_redacts_default_header_values() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer client-debug-sentinel"),
+    );
+    let builder =
+        HttpClientBuilder::new().with_reqwest_builder(|builder| builder.default_headers(headers));
+    let builder_debug = format!("{builder:?}");
+    assert!(!builder_debug.contains("client-debug-sentinel"));
+}
+
+#[test]
+fn http_client_debug_redacts_default_header_values() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer client-debug-sentinel"),
+    );
+    let builder =
+        HttpClientBuilder::new().with_reqwest_builder(|builder| builder.default_headers(headers));
+
+    let client = builder.build().expect("build client");
+    let client_debug = format!("{client:?}");
+    assert!(!client_debug.contains("client-debug-sentinel"));
+}
+
+#[test]
+fn http_request_builder_debug_redacts_headers_query_and_body() {
+    let client = HttpClientBuilder::new().build().expect("build client");
+    let request = client
+        .get("https://example.test/resource")
+        .header("authorization", "Bearer request-debug-sentinel")
+        .query(&[("secret", "query-debug-sentinel")])
+        .body("body-debug-sentinel");
+    let request_debug = format!("{request:?}");
+    for secret in [
+        "request-debug-sentinel",
+        "query-debug-sentinel",
+        "body-debug-sentinel",
+    ] {
+        assert!(
+            !request_debug.contains(secret),
+            "request debug leaked {secret}"
+        );
+    }
+}
+
+#[test]
+fn http_error_debug_redacts_retained_response_body() {
+    let error = HttpRequestError::HttpStatus {
+        status: StatusCode::BAD_REQUEST,
+        body: Some("response-body-debug-sentinel".to_string()),
+    };
+    assert!(!format!("{error:?}").contains("response-body-debug-sentinel"));
+}
+
+#[test]
+fn custom_transport_does_not_claim_redirects_are_disabled() {
+    let client = HttpClientBuilder::new()
+        .with_transport(SequenceTransport::from_responses(Vec::new()))
+        .build()
+        .expect("build client");
+
+    assert!(!client.redirects_disabled());
 }

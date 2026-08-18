@@ -1,10 +1,7 @@
 use std::time::Duration;
 
 pub(crate) const ECS_RELATIVE_CREDENTIALS_BASE: &str = "http://169.254.170.2";
-pub(crate) const ECS_LOCAL_IPV4_HOST: &str = "169.254.170.2";
 pub(crate) const LOCALHOST: &str = "localhost";
-pub(crate) const LOOPBACK_IPV4: &str = "127.0.0.1";
-pub(crate) const LOOPBACK_IPV6: &str = "::1";
 
 pub(crate) const IMDS_TOKEN_URL: &str = "http://169.254.169.254/latest/api/token";
 pub(crate) const IMDS_ROLE_LIST_URL: &str =
@@ -15,6 +12,10 @@ pub(crate) const IMDS_TOKEN_HEADER: &str = "X-aws-ec2-metadata-token";
 
 pub(crate) const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 pub(crate) const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const MAX_METADATA_RESPONSE_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_AWS_CLI_OUTPUT_BYTES: usize = 256 * 1024;
+pub(crate) const AWS_CLI_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const MAX_AUTHORIZATION_TOKEN_BYTES: usize = 64 * 1024;
 pub(crate) const CREDENTIAL_REFRESH_SKEW: Duration = Duration::from_mins(5);
 pub(crate) const CREDENTIAL_REFRESH_FALLBACK: Duration = Duration::from_mins(10);
 pub(crate) const CREDENTIAL_CACHE_STATIC_TTL: Duration = Duration::from_hours(24);

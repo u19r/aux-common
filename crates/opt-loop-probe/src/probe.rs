@@ -3,12 +3,15 @@ use std::{
     backtrace::Backtrace,
     cell::Cell,
     collections::{HashMap, hash_map::DefaultHasher},
-    env, fs,
+    env,
+    fmt::{self, Write},
+    fs,
     hash::{Hash, Hasher},
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicI64, AtomicU64, Ordering},
+        atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -19,7 +22,9 @@ use serde::{Deserialize, Serialize};
 use crate::constants::{
     DEFAULT_ALLOC_SAMPLE_RATE, DEFAULT_STACK_DEPTH, ENV_ALLOC_SAMPLE_RATE, ENV_ENABLED,
     ENV_HOTSPOT_FILE, ENV_PHASE, ENV_SAMPLE_FILE, ENV_SAMPLE_INDEX, ENV_STACK_DEPTH, ENV_TARGET_ID,
-    FLUSH_EVERY_ALLOC_EVENTS,
+    FLUSH_EVERY_ALLOC_EVENTS, MAX_BACKTRACE_BYTES, MAX_HOTSPOT_FILE_BYTES, MAX_HOTSPOTS,
+    MAX_OPERATION_BYTES, MAX_PHASE_BYTES, MAX_SAMPLE_FILE_BYTES, MAX_STACK_DEPTH,
+    MAX_TARGET_ID_BYTES,
 };
 
 thread_local! {
@@ -175,6 +180,7 @@ pub(crate) struct ProbeState {
     pub(crate) bg_job_bytes: AtomicU64,
     pub(crate) analytics_calls: AtomicU64,
     pub(crate) analytics_bytes: AtomicU64,
+    pub(crate) hotspot_count: AtomicUsize,
     pub(crate) hotspots: Mutex<HashMap<String, HotspotAggregate>>,
     pub(crate) flush_lock: Mutex<()>,
 }
@@ -185,8 +191,14 @@ impl ProbeState {
             return None;
         }
 
-        let target_id = env::var(ENV_TARGET_ID).unwrap_or_else(|_| "unknown".to_string());
-        let phase = env::var(ENV_PHASE).unwrap_or_else(|_| "unknown".to_string());
+        let target_id = env::var(ENV_TARGET_ID).map_or_else(
+            |_| "unknown".to_string(),
+            |value| sanitize_path_component(&value, MAX_TARGET_ID_BYTES),
+        );
+        let phase = env::var(ENV_PHASE).map_or_else(
+            |_| "unknown".to_string(),
+            |value| sanitize_path_component(&value, MAX_PHASE_BYTES),
+        );
         let sample_index = env::var(ENV_SAMPLE_INDEX)
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -220,7 +232,7 @@ impl ProbeState {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_STACK_DEPTH);
+            .map_or(DEFAULT_STACK_DEPTH, |v| v.min(MAX_STACK_DEPTH));
 
         let state = Self {
             config: ProbeConfig {
@@ -249,6 +261,7 @@ impl ProbeState {
             bg_job_bytes: AtomicU64::new(0),
             analytics_calls: AtomicU64::new(0),
             analytics_bytes: AtomicU64::new(0),
+            hotspot_count: AtomicUsize::new(0),
             hotspots: Mutex::new(HashMap::new()),
             flush_lock: Mutex::new(()),
         };
@@ -305,7 +318,6 @@ impl ProbeState {
         calls.fetch_add(1, Ordering::Relaxed);
         total_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.record_hotspot(kind, Some(operation), bytes);
-        self.flush();
     }
 
     pub(crate) fn record_storage_call(&self, operation: &str, bytes: u64) {
@@ -359,14 +371,28 @@ impl ProbeState {
     }
 
     pub(crate) fn record_hotspot(&self, kind: &str, operation: Option<&str>, bytes: u64) {
+        if self.hotspot_count.load(Ordering::Relaxed) >= MAX_HOTSPOTS {
+            return;
+        }
+
+        let kind = sanitize_diagnostic_label(kind, MAX_OPERATION_BYTES);
+        let operation =
+            operation.map(|value| sanitize_diagnostic_label(value, MAX_OPERATION_BYTES));
         let backtrace = capture_backtrace(self.config.stack_depth);
         let stack_hash = hash_string(&backtrace);
-        let key = format!("{kind}:{}:{stack_hash}", operation.unwrap_or("-"));
+        let key = format!(
+            "{kind}:{}:{stack_hash}",
+            operation.as_deref().unwrap_or("-")
+        );
 
         if let Ok(mut guard) = self.hotspots.lock() {
+            let previous_len = guard.len();
+            if previous_len >= MAX_HOTSPOTS {
+                return;
+            }
             let entry = guard.entry(key).or_insert_with(|| HotspotAggregate {
-                kind: kind.to_string(),
-                operation: operation.map(ToOwned::to_owned),
+                kind,
+                operation,
                 stack_hash: format!("{stack_hash:016x}"),
                 count: 0,
                 total_bytes: 0,
@@ -374,6 +400,10 @@ impl ProbeState {
             });
             entry.count = entry.count.saturating_add(1);
             entry.total_bytes = entry.total_bytes.saturating_add(bytes);
+            let inserted = guard.len() > previous_len;
+            if inserted {
+                self.hotspot_count.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -413,6 +443,14 @@ impl ProbeState {
             analytics_calls_total,
             analytics_bytes_total: self.analytics_bytes.load(Ordering::Relaxed),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hotspot_records(&self) -> Vec<HotspotRecord> {
+        self.hotspots
+            .lock()
+            .map(|guard| guard.values().map(HotspotAggregate::to_record).collect())
+            .unwrap_or_default()
     }
 
     pub(crate) fn flush(&self) {
@@ -475,6 +513,7 @@ impl ProbeState {
         self.analytics_bytes.store(0, Ordering::Relaxed);
         if let Ok(mut hotspots) = self.hotspots.lock() {
             hotspots.clear();
+            self.hotspot_count.store(0, Ordering::Relaxed);
         }
         self.flush();
     }
@@ -537,13 +576,27 @@ fn now_unix_ms() -> u64 {
 }
 
 pub(crate) fn load_sample_if_present(path: &Path) -> Option<ProbeSample> {
-    let bytes = fs::read(path).ok()?;
+    let bytes = read_bounded_file(path, MAX_SAMPLE_FILE_BYTES)?;
     serde_json::from_slice(&bytes).ok()
 }
 
 pub(crate) fn load_hotspots_if_present(path: &Path) -> Option<Vec<HotspotRecord>> {
-    let bytes = fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let bytes = read_bounded_file(path, MAX_HOTSPOT_FILE_BYTES)?;
+    let records: Vec<HotspotRecord> = serde_json::from_slice(&bytes).ok()?;
+    (records.len() <= MAX_HOTSPOTS).then_some(records)
+}
+
+fn read_bounded_file(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if u64::try_from(bytes.len()).ok()? > max_bytes {
+        None
+    } else {
+        Some(bytes)
+    }
 }
 
 fn hash_string(value: &str) -> u64 {
@@ -553,7 +606,9 @@ fn hash_string(value: &str) -> u64 {
 }
 
 fn capture_backtrace(max_lines: usize) -> String {
-    let rendered = format!("{:?}", Backtrace::force_capture());
+    let mut bounded = BoundedString::new(MAX_BACKTRACE_BYTES);
+    let _ = write!(&mut bounded, "{:?}", Backtrace::force_capture());
+    let rendered = bounded.into_inner();
     let mut lines = rendered.lines();
     let mut output = String::new();
 
@@ -564,10 +619,132 @@ fn capture_backtrace(max_lines: usize) -> String {
     }
 
     if output.trim().is_empty() {
-        rendered
+        truncate_utf8(&rendered, MAX_BACKTRACE_BYTES)
+    } else {
+        truncate_utf8(&output, MAX_BACKTRACE_BYTES)
+    }
+}
+
+struct BoundedString {
+    value: String,
+    max_bytes: usize,
+}
+
+impl BoundedString {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            value: String::new(),
+            max_bytes,
+        }
+    }
+
+    fn into_inner(self) -> String {
+        self.value
+    }
+}
+
+impl fmt::Write for BoundedString {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        let remaining = self.max_bytes.saturating_sub(self.value.len());
+        if value.len() <= remaining {
+            self.value.push_str(value);
+            return Ok(());
+        }
+
+        let mut end = remaining.min(value.len());
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.value.push_str(&value[..end]);
+        Err(fmt::Error)
+    }
+}
+
+pub(crate) fn sanitize_path_component(value: &str, max_bytes: usize) -> String {
+    let mut output = String::new();
+    for character in value.chars() {
+        let character = if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        {
+            character
+        } else {
+            '_'
+        };
+        if output.len().saturating_add(character.len_utf8()) > max_bytes {
+            break;
+        }
+        output.push(character);
+    }
+
+    if output.is_empty() || output == "." || output == ".." {
+        "unknown".to_string()
     } else {
         output
     }
+}
+
+fn sanitize_diagnostic_label(value: &str, max_bytes: usize) -> String {
+    let mut output = String::new();
+    for character in value.trim().chars() {
+        let character =
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':') {
+                character
+            } else {
+                '_'
+            };
+        if output.len().saturating_add(character.len_utf8()) > max_bytes {
+            break;
+        }
+        output.push(character);
+    }
+    if output.is_empty() {
+        "unknown".to_string()
+    } else {
+        let normalized = output.to_ascii_lowercase();
+        let sensitive_marker = [
+            "api_key",
+            "api-key",
+            "access_key",
+            "access-key",
+            "authorization",
+            "bearer",
+            "cookie",
+            "password",
+            "private_key",
+            "private-key",
+            "secret",
+            "token",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker));
+        if sensitive_marker {
+            "<redacted>".to_string()
+        } else {
+            output
+        }
+    }
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let content_bytes = max_bytes.saturating_sub(3);
+    let mut end = 0;
+    for (index, character) in value.char_indices() {
+        if index.saturating_add(character.len_utf8()) > content_bytes {
+            break;
+        }
+        end = index + character.len_utf8();
+    }
+    if end == 0 {
+        return String::new();
+    }
+
+    let mut truncated = value[..end].to_string();
+    if max_bytes > 3 {
+        truncated.push_str("...");
+    }
+    truncated
 }
 
 fn env_truthy(key: &str) -> bool {
@@ -577,16 +754,26 @@ fn env_truthy(key: &str) -> bool {
     })
 }
 
-fn with_probe_guard<F>(f: F)
+pub(crate) fn with_probe_guard<F>(f: F)
 where F: FnOnce() {
     IN_PROBE.with(|flag| {
         if flag.get() {
             return;
         }
         flag.set(true);
+        let _reset_guard = ProbeFlagGuard { flag };
         f();
-        flag.set(false);
     });
+}
+
+struct ProbeFlagGuard<'a> {
+    flag: &'a Cell<bool>,
+}
+
+impl Drop for ProbeFlagGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.set(false);
+    }
 }
 
 fn state() -> Option<&'static ProbeState> {
@@ -695,6 +882,7 @@ impl Default for ProbeAllocator {
 }
 
 // SAFETY: This allocator delegates all memory operations directly to MiMalloc.
+#[allow(unsafe_code)]
 unsafe impl GlobalAlloc for ProbeAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { self.inner.alloc(layout) };

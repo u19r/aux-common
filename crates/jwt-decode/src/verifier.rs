@@ -36,7 +36,7 @@ impl JwtVerifier {
         compact.reject_duplicate_json_members()?;
 
         let header = decode_header(token).map_err(Self::map_backend_error)?;
-        let algorithm = SignatureAlgorithm::from(header.alg);
+        let algorithm = SignatureAlgorithm::try_from(header.alg)?;
         self.reject_disallowed_algorithm(algorithm)?;
         Self::reject_header(&header, policy)?;
 
@@ -83,7 +83,7 @@ impl JwtVerifier {
         compact.reject_duplicate_header_members()?;
 
         let header = decode_header(token).map_err(Self::map_backend_error)?;
-        let algorithm = SignatureAlgorithm::from(header.alg);
+        let algorithm = SignatureAlgorithm::try_from(header.alg)?;
         self.reject_disallowed_algorithm(algorithm)?;
         Self::reject_header(&header, policy)?;
 
@@ -115,7 +115,7 @@ impl JwtVerifier {
         compact.reject_duplicate_json_members()?;
 
         let header = decode_header(token).map_err(Self::map_backend_error)?;
-        let algorithm = SignatureAlgorithm::from(header.alg);
+        let algorithm = SignatureAlgorithm::try_from(header.alg)?;
         self.reject_disallowed_algorithm(algorithm)?;
         Self::reject_header(&header, policy)?;
 
@@ -160,7 +160,7 @@ impl JwtVerifier {
         compact.reject_duplicate_header_members()?;
 
         let header = decode_header(token).map_err(Self::map_backend_error)?;
-        let algorithm = SignatureAlgorithm::from(header.alg);
+        let algorithm = SignatureAlgorithm::try_from(header.alg)?;
         self.reject_disallowed_algorithm(algorithm)?;
         Self::reject_header(&header, policy)?;
 
@@ -222,6 +222,7 @@ impl JwtVerifier {
             ));
         }
         let key = self.jwks_source.local_symmetric_key_for(kid)?;
+        key.validate_for_algorithm(algorithm)?;
         Ok(key.decoding_key())
     }
 
@@ -238,7 +239,9 @@ impl JwtVerifier {
         {
             document = self.jwks_source.refresh_document_for_issuer(issuer).await?;
         }
-        document.decoding_key_for(kid, algorithm, self.allowed_algorithms.allow_symmetric())
+        let allow_symmetric =
+            self.allowed_algorithms.allow_symmetric() && self.jwks_source.allows_symmetric_jwks();
+        document.decoding_key_for(kid, algorithm, allow_symmetric)
     }
 
     fn static_jwks_decoding_key(
@@ -248,7 +251,9 @@ impl JwtVerifier {
         issuer: &str,
     ) -> Result<DecodingKey> {
         let document = self.jwks_source.static_document_for_issuer(issuer)?;
-        document.decoding_key_for(kid, algorithm, self.allowed_algorithms.allow_symmetric())
+        let allow_symmetric =
+            self.allowed_algorithms.allow_symmetric() && self.jwks_source.allows_symmetric_jwks();
+        document.decoding_key_for(kid, algorithm, allow_symmetric)
     }
 
     fn reject_header(header: &Header, policy: &VerificationPolicy) -> Result<()> {

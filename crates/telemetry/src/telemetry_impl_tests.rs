@@ -4,6 +4,15 @@ use axum::{Extension, http::HeaderMap};
 
 use crate::{MetricsConfig, MetricsState, metrics_handler, setup_metrics};
 
+#[test]
+fn given_bearer_token_when_debugging_metrics_config_then_redacts_secret() {
+    let secret = "metrics-token-that-must-not-leak";
+    let debug = format!("{:?}", MetricsConfig::enabled(secret));
+
+    assert!(!debug.contains(secret));
+    assert!(debug.contains("[REDACTED]"));
+}
+
 fn metrics_state() -> Arc<MetricsState> {
     static STATE: OnceLock<Arc<MetricsState>> = OnceLock::new();
     STATE

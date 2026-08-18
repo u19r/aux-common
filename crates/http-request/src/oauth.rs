@@ -10,7 +10,7 @@ pub struct OAuthTokenEndpoint {
     headers: Vec<(String, String)>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct OAuthUserinfoEndpoint {
     url: String,
 }
@@ -61,8 +61,17 @@ impl fmt::Debug for OAuthTokenEndpoint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OAuthTokenEndpoint")
-            .field("url", &self.url)
+            .field("url", &"[REDACTED]")
             .field("header_names", &header_names(&self.headers))
+            .finish()
+    }
+}
+
+impl fmt::Debug for OAuthUserinfoEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OAuthUserinfoEndpoint")
+            .field("url", &"[REDACTED]")
             .finish()
     }
 }
@@ -71,7 +80,7 @@ impl fmt::Debug for OAuthRevocationEndpoint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OAuthRevocationEndpoint")
-            .field("url", &self.url)
+            .field("url", &"[REDACTED]")
             .field("header_names", &header_names(&self.headers))
             .finish()
     }

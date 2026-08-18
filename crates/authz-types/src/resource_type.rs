@@ -1,10 +1,10 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 
 use crate::ValidationError;
 
 /// Validated resource type identifier (lowercase alphanumeric + underscore).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[schema(
     value_type = String,
     pattern = "^[a-z0-9_]+$",
@@ -43,6 +43,14 @@ impl ResourceTypeId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ResourceTypeId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: Deserializer<'de> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 

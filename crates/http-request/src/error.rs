@@ -1,14 +1,16 @@
+use std::fmt;
+
 use http::StatusCode;
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum HttpRequestError {
-    #[error("request build failed: {source}")]
+    #[error("request build failed")]
     Build {
         #[source]
         source: reqwest::Error,
     },
-    #[error("request failed: {source}")]
+    #[error("request failed: {kind:?}")]
     Transport {
         kind: HttpRequestErrorKind,
         #[source]
@@ -22,6 +24,8 @@ pub enum HttpRequestError {
     RequestNotCloneable,
     #[error("response body too large: {size} > {max}")]
     ResponseTooLarge { size: usize, max: usize },
+    #[error("response cache lifetime is too large: {seconds} seconds")]
+    CacheTtlOverflow { seconds: u64 },
     #[error("http status {status}")]
     HttpStatus {
         status: StatusCode,
@@ -49,7 +53,38 @@ pub enum HttpRequestErrorKind {
     Ssrf,
     InvalidUrl,
     Decode,
+    InvalidCacheTtl,
     Unknown,
+}
+
+impl fmt::Debug for HttpRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Build { .. } => formatter
+                .debug_struct("Build")
+                .field("source", &"[REDACTED]")
+                .finish(),
+            Self::Transport { kind, .. } => formatter
+                .debug_struct("Transport")
+                .field("kind", kind)
+                .field("source", &"[REDACTED]")
+                .finish(),
+            Self::HttpStatus { status, body } => formatter
+                .debug_struct("HttpStatus")
+                .field("status", status)
+                .field("body", &body.as_ref().map(|_| "[REDACTED]"))
+                .finish(),
+            Self::InvalidUrl { .. } => formatter
+                .debug_struct("InvalidUrl")
+                .field("message", &"[REDACTED]")
+                .finish(),
+            Self::Decode { message } => formatter
+                .debug_struct("Decode")
+                .field("message", message)
+                .finish(),
+            other => write!(formatter, "{other}"),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, HttpRequestError>;
@@ -64,6 +99,7 @@ impl HttpRequestError {
             | HttpRequestError::RequestSizeUnknown { .. }
             | HttpRequestError::RequestNotCloneable
             | HttpRequestError::ResponseTooLarge { .. } => HttpRequestErrorKind::Body,
+            HttpRequestError::CacheTtlOverflow { .. } => HttpRequestErrorKind::InvalidCacheTtl,
             HttpRequestError::HttpStatus { .. } => HttpRequestErrorKind::Status,
             HttpRequestError::RedirectBlocked { .. } => HttpRequestErrorKind::Redirect,
             HttpRequestError::SsrfBlocked { .. } => HttpRequestErrorKind::Ssrf,
@@ -90,7 +126,7 @@ impl From<reqwest::Error> for HttpRequestError {
         };
         HttpRequestError::Transport {
             kind,
-            source: error,
+            source: error.without_url(),
         }
     }
 }

@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    fmt::Debug,
     hash::Hash,
     sync::{
         Arc, Mutex,
@@ -34,6 +33,14 @@ struct FetchFlight {
     missing: AtomicBool,
 }
 
+struct RefreshGuard<V>(CacheEntry<V>);
+
+impl<V> Drop for RefreshGuard<V> {
+    fn drop(&mut self) {
+        self.0.finish_refresh();
+    }
+}
+
 struct FetchLeader<K: Eq + Hash> {
     key: K,
     flight: Arc<FetchFlight>,
@@ -57,6 +64,7 @@ where K: Eq + Hash
 enum FetchRole<K: Eq + Hash> {
     Leader(FetchLeader<K>),
     Follower(Arc<FetchFlight>),
+    Uncoordinated,
 }
 
 impl<K, V> Clone for LruTtlCache<K, V>
@@ -75,7 +83,7 @@ impl<K, V, E> Clone for FetchingLruTtlCache<K, V, E>
 where
     K: Eq + Hash + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
-    E: Debug + Send + 'static,
+    E: Send + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -124,6 +132,11 @@ where
         }
     }
 
+    /// Read a fresh entry without triggering any refresh side effect.
+    pub fn peek(&self, key: &K) -> Option<V> {
+        self.cached(key)
+    }
+
     pub fn get(&self, key: &K) -> Option<V> {
         self.cached(key)
     }
@@ -138,7 +151,7 @@ impl<K, V, E> FetchingLruTtlCache<K, V, E>
 where
     K: Eq + Hash + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
-    E: Debug + Send + 'static,
+    E: Send + 'static,
 {
     #[must_use]
     pub fn new(config: FetchingCacheConfig<K, V, E>) -> Self {
@@ -174,6 +187,17 @@ where
         }
     }
 
+    /// Read a fresh entry without triggering a background refresh.
+    ///
+    /// This is useful for callers which must prove that the fast path performs
+    /// no provider work before deciding whether to acquire a provider permit.
+    pub fn peek(&self, key: &K) -> Option<V> {
+        match self.core.inspect_entry(key) {
+            EntryState::Fresh(entry) => Some(entry.value().clone()),
+            EntryState::Expired | EntryState::Missing | EntryState::Stale(_) => None,
+        }
+    }
+
     pub async fn get_or_fetch(&self, key: &K) -> Result<Option<V>, E> {
         match self.core.inspect_entry(key) {
             EntryState::Fresh(entry) => {
@@ -200,11 +224,13 @@ where
             }
             EntryState::Stale(entry) => match self.fetch_and_store(key).await {
                 Ok(value) => Ok(value),
-                Err(err) => {
+                Err(_) if entry.is_stale_at(std::time::Instant::now(), stale_ttl) => {
+                    self.core.restore_entry_if_missing(key, &entry);
                     self.core.refresh_errors().fetch_add(1, Ordering::Relaxed);
-                    warn!(error = ?err, "cache_fetch_failed_serving_stale");
+                    warn!("cache_fetch_failed_serving_stale");
                     Ok(Some(entry.value().clone()))
                 }
+                Err(error) => Err(error),
             },
             EntryState::Expired | EntryState::Missing => self.fetch_and_store(key).await,
         }
@@ -258,6 +284,7 @@ where
                     }
                     drop(gate);
                 }
+                FetchRole::Uncoordinated => return self.fetch_and_store_uncoordinated(key).await,
             }
         }
     }
@@ -282,6 +309,9 @@ where
         let mut in_flight = lock_unpoisoned(&self.in_flight);
         if let Some(flight) = in_flight.get(key) {
             return FetchRole::Follower(Arc::clone(flight));
+        }
+        if in_flight.len() >= self.core.coordination_capacity() {
+            return FetchRole::Uncoordinated;
         }
 
         let flight = Arc::new(FetchFlight {
@@ -309,6 +339,9 @@ where
         if !entry.should_refresh(refresh_ttl) {
             return;
         }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
         if !entry.begin_refresh() {
             return;
         }
@@ -318,22 +351,25 @@ where
         let refresh_errors = self.core.refresh_errors();
         let fetcher = self.fetch_clone();
         let refresh_key = key.clone();
-        tokio::spawn(async move {
+        let refresh_guard = RefreshGuard(entry.clone());
+        let refresh_entry = entry.clone();
+        let task = runtime.spawn(async move {
             let result = fetcher(refresh_key.clone()).await;
             match result {
                 Ok(Some(value)) => {
-                    cache_core.apply_refresh_if_current(&refresh_key, &entry, Some(value));
+                    cache_core.apply_refresh_if_current(&refresh_key, &refresh_entry, Some(value));
                 }
                 Ok(None) => {
-                    cache_core.apply_refresh_if_current(&refresh_key, &entry, None);
+                    cache_core.apply_refresh_if_current(&refresh_key, &refresh_entry, None);
                 }
-                Err(err) => {
+                Err(_) => {
                     refresh_errors.fetch_add(1, Ordering::Relaxed);
-                    warn!(error = ?err, "cache_refresh_failed");
+                    warn!("cache_refresh_failed");
                 }
             }
-            entry.finish_refresh();
+            drop(refresh_guard);
         });
+        entry.install_refresh_handle(task.abort_handle());
     }
 }
 

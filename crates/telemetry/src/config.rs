@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 const DEFAULT_LOG_DESTINATION: &str = "stdout";
 const DEFAULT_LOG_FILTER: &str = "warn";
@@ -34,9 +34,18 @@ const DEFAULT_SENSITIVE_FIELD_BLOCKLIST: &[&str] = &[
     "api-key",
     "api_key",
     "access_token",
+    "accessToken",
     "refresh_token",
+    "refreshToken",
     "id_token",
+    "idToken",
     "client_secret",
+    "clientSecret",
+    "apiKey",
+    "privateKey",
+    "secretKey",
+    "signingKey",
+    "bearerToken",
     "password",
     "secret",
     "token",
@@ -266,11 +275,25 @@ impl Default for SlowOperationThresholds {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MetricsConfig {
     pub enabled: bool,
     pub bearer_token: Option<String>,
     pub metrics_path: String,
+}
+
+impl fmt::Debug for MetricsConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetricsConfig")
+            .field("enabled", &self.enabled)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("metrics_path", &self.metrics_path)
+            .finish()
+    }
 }
 
 impl MetricsConfig {

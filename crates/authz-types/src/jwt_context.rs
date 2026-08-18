@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::IgnoredAny};
 #[allow(unused_imports)]
 use serde_json::json;
 use utoipa::ToSchema;
@@ -16,15 +16,15 @@ use utoipa::ToSchema;
 }))]
 pub struct JwtContext {
     /// Organizations the user belongs to.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bounded_orgs")]
     #[schema(max_items = 500)]
     pub orgs: Vec<OrgMembership>,
     /// Groups the user belongs to.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bounded_groups")]
     #[schema(max_items = 1000)]
     pub groups: Vec<GroupMembership>,
     /// Role assignments for the user.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bounded_roles")]
     #[schema(max_items = 500)]
     pub roles: Vec<RoleAssignment>,
     /// Whether organization memberships are complete (not omitted or
@@ -147,4 +147,70 @@ impl JwtContext {
 
 fn default_true() -> bool {
     true
+}
+
+fn deserialize_bounded_orgs<'de, D>(deserializer: D) -> Result<Vec<OrgMembership>, D::Error>
+where D: serde::Deserializer<'de> {
+    deserialize_bounded_vec(deserializer, 500, "orgs")
+}
+
+fn deserialize_bounded_groups<'de, D>(deserializer: D) -> Result<Vec<GroupMembership>, D::Error>
+where D: serde::Deserializer<'de> {
+    deserialize_bounded_vec(deserializer, 1_000, "groups")
+}
+
+fn deserialize_bounded_roles<'de, D>(deserializer: D) -> Result<Vec<RoleAssignment>, D::Error>
+where D: serde::Deserializer<'de> {
+    deserialize_bounded_vec(deserializer, 500, "roles")
+}
+
+fn deserialize_bounded_vec<'de, D, T>(
+    deserializer: D,
+    max: usize,
+    field: &'static str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T> {
+        max: usize,
+        field: &'static str,
+        marker: std::marker::PhantomData<T>,
+    }
+
+    impl<'de, T> serde::de::Visitor<'de> for BoundedVecVisitor<T>
+    where T: serde::Deserialize<'de>
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded sequence")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where A: serde::de::SeqAccess<'de> {
+            let mut values = Vec::new();
+            while values.len() < self.max {
+                let Some(value) = sequence.next_element()? else {
+                    return Ok(values);
+                };
+                values.push(value);
+            }
+
+            if sequence.next_element::<IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom(format!(
+                    "{} exceeds maximum of {} entries",
+                    self.field, self.max
+                )));
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor {
+        max,
+        field,
+        marker: std::marker::PhantomData,
+    })
 }

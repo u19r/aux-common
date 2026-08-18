@@ -10,43 +10,10 @@ use syn::{
 #[proc_macro_attribute]
 pub fn count_allocations(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args with Punctuated::<Meta, Token![,]>::parse_terminated);
-    let mut label: Option<LitStr> = None;
-
-    for arg in args {
-        match arg {
-            Meta::NameValue(MetaNameValue { path, value, .. }) if path.is_ident("label") => {
-                if label.is_some() {
-                    return syn::Error::new_spanned(path, "duplicate `label` argument")
-                        .into_compile_error()
-                        .into();
-                }
-                match value {
-                    Expr::Lit(ExprLit {
-                        lit: Lit::Str(label_lit),
-                        ..
-                    }) => {
-                        label = Some(label_lit);
-                    }
-                    _ => {
-                        return syn::Error::new_spanned(
-                            value,
-                            "`label` must be a string literal, for example: label = \"baseline\"",
-                        )
-                        .into_compile_error()
-                        .into();
-                    }
-                }
-            }
-            other => {
-                return syn::Error::new_spanned(
-                    other,
-                    "unsupported argument, expected `label = \"...\"`",
-                )
-                .into_compile_error()
-                .into();
-            }
-        }
-    }
+    let label = match parse_label(args) {
+        Ok(label) => label,
+        Err(error) => return error.into_compile_error().into(),
+    };
 
     let mut test_fn = parse_macro_input!(input as ItemFn);
     let fn_ident = test_fn.sig.ident.clone();
@@ -95,3 +62,43 @@ pub fn count_allocations(args: TokenStream, input: TokenStream) -> TokenStream {
 
     TokenStream::from(quote! { #test_fn })
 }
+
+fn parse_label(args: Punctuated<Meta, Token![,]>) -> syn::Result<Option<LitStr>> {
+    let mut label = None;
+
+    for arg in args {
+        match arg {
+            Meta::NameValue(MetaNameValue { path, value, .. }) if path.is_ident("label") => {
+                if label.is_some() {
+                    return Err(syn::Error::new_spanned(path, "duplicate `label` argument"));
+                }
+
+                match value {
+                    Expr::Lit(ExprLit {
+                        lit: Lit::Str(label_lit),
+                        ..
+                    }) => {
+                        label = Some(label_lit);
+                    }
+                    _ => {
+                        return Err(syn::Error::new_spanned(
+                            value,
+                            "`label` must be a string literal, for example: label = \"baseline\"",
+                        ));
+                    }
+                }
+            }
+            other => {
+                return Err(syn::Error::new_spanned(
+                    other,
+                    "unsupported argument, expected `label = \"...\"`",
+                ));
+            }
+        }
+    }
+
+    Ok(label)
+}
+
+#[cfg(test)]
+mod lib_tests;

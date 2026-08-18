@@ -29,7 +29,7 @@ impl CacheTemplate {
     where
         K: Eq + Hash + Clone + Send + Sync + 'static,
         V: Clone + Send + Sync + 'static,
-        E: fmt::Debug + Send + 'static,
+        E: Send + 'static,
     {
         let mut config = CacheConfig::new()
             .with_capacity(self.capacity)

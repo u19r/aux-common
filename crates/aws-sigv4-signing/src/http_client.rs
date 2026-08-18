@@ -1,16 +1,34 @@
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
 use http::{HeaderMap, HeaderValue, Method, Uri, header::CONTENT_TYPE};
 use http_request::{HttpClient, HttpResponse, StatusCode};
+use url::Url;
 
 use crate::{AwsRequestSigner, CredentialSource, SignableBody, SigningError};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AwsSigv4TextResponse {
     status: StatusCode,
     headers: HeaderMap,
     body: String,
     url: String,
+}
+
+impl fmt::Debug for AwsSigv4TextResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let header_names = self
+            .headers
+            .keys()
+            .map(http::HeaderName::as_str)
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("AwsSigv4TextResponse")
+            .field("status", &self.status)
+            .field("header_names", &header_names)
+            .field("body_len", &self.body.len())
+            .field("url", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl AwsSigv4TextResponse {
@@ -60,10 +78,25 @@ impl AwsSigv4HttpClient {
         if !client.redirects_disabled() {
             return Err(SigningError::RedirectPolicyRequired);
         }
+        let endpoint = endpoint.trim_end_matches('/');
+        let endpoint_url =
+            Url::parse(endpoint).map_err(|err| SigningError::InvalidUrl(err.to_string()))?;
+        if endpoint_url.scheme() != "https" {
+            return Err(SigningError::InsecureTransport);
+        }
+        if endpoint_url.username() != ""
+            || endpoint_url.password().is_some()
+            || endpoint_url.query().is_some()
+            || endpoint_url.fragment().is_some()
+        {
+            return Err(SigningError::InvalidUrl(
+                "endpoint must not contain userinfo, query, or fragment".to_string(),
+            ));
+        }
         let signer = AwsRequestSigner::new(region, credentials, service_name)?;
         Ok(Self {
             client,
-            endpoint: endpoint.trim_end_matches('/').to_string(),
+            endpoint: endpoint.to_string(),
             signer,
         })
     }
@@ -76,7 +109,27 @@ impl AwsSigv4HttpClient {
         mut extra_headers: HeaderMap,
         default_content_type: Option<&'static str>,
     ) -> Result<HttpResponse, SigningError> {
+        if extra_headers.contains_key(http::header::HOST) {
+            return Err(SigningError::HostHeaderOverride);
+        }
+        if !path.starts_with('/') || path.starts_with("//") || path.contains('\\') {
+            return Err(SigningError::InvalidUrl(
+                "request path must be an origin-form path".to_string(),
+            ));
+        }
         let url = format!("{}{}", self.endpoint, path);
+        let endpoint_url =
+            Url::parse(&self.endpoint).map_err(|err| SigningError::InvalidUrl(err.to_string()))?;
+        let request_url =
+            Url::parse(&url).map_err(|err| SigningError::InvalidUrl(err.to_string()))?;
+        if request_url.scheme() != endpoint_url.scheme()
+            || request_url.host() != endpoint_url.host()
+            || request_url.port() != endpoint_url.port()
+        {
+            return Err(SigningError::InvalidUrl(
+                "request path changed the configured endpoint authority".to_string(),
+            ));
+        }
         let uri =
             Uri::from_str(url.as_str()).map_err(|err| SigningError::InvalidUri(err.to_string()))?;
         if let Some(content_type) = default_content_type
@@ -105,7 +158,7 @@ impl AwsSigv4HttpClient {
         request
             .send()
             .await
-            .map_err(|err| SigningError::HttpRequest(err.to_string()))
+            .map_err(|err| SigningError::HttpRequest(err.kind()))
     }
 
     pub async fn send_text(
@@ -143,7 +196,7 @@ async fn signed_text_response(
     let body = response
         .text()
         .await
-        .map_err(|err| SigningError::HttpRequest(err.to_string()))?;
+        .map_err(|err| SigningError::HttpRequest(err.kind()))?;
 
     Ok(AwsSigv4TextResponse {
         status,

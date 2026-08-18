@@ -1,7 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 
-use crate::Scope;
+use crate::{RoleActionLimit, Scope};
 
 fn deserialize_optional_string_non_null<'de, D>(
     deserializer: D,
@@ -159,6 +159,9 @@ pub struct RoleActionByNameInput {
     pub action_name: String,
     #[schema(max_items = 100, example = json!(["tenant"]))]
     pub scopes: Vec<Scope>,
+    /// Optional typed default capacity policy for this direct action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<RoleActionLimit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]

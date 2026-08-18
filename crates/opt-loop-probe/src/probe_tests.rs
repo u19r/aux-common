@@ -1,17 +1,24 @@
 use std::{
     collections::HashMap,
     fs,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::{
         Mutex,
-        atomic::{AtomicI64, AtomicU64},
+        atomic::{AtomicI64, AtomicU64, AtomicUsize},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::probe::{
-    ProbeConfig, ProbeSample, ProbeState, estimate_json_bytes, load_hotspots_if_present,
-    load_sample_if_present,
+use crate::{
+    constants::{
+        MAX_BACKTRACE_BYTES, MAX_HOTSPOT_FILE_BYTES, MAX_HOTSPOTS, MAX_OPERATION_BYTES,
+        MAX_SAMPLE_FILE_BYTES,
+    },
+    probe::{
+        ProbeConfig, ProbeSample, ProbeState, estimate_json_bytes, load_hotspots_if_present,
+        load_sample_if_present, sanitize_path_component, with_probe_guard,
+    },
 };
 
 fn unique_path(name: &str) -> PathBuf {
@@ -49,6 +56,7 @@ fn probe_state(sample_file: PathBuf, hotspot_file: PathBuf) -> ProbeState {
         bg_job_bytes: AtomicU64::new(0),
         analytics_calls: AtomicU64::new(0),
         analytics_bytes: AtomicU64::new(0),
+        hotspot_count: AtomicUsize::new(0),
         hotspots: Mutex::new(HashMap::new()),
         flush_lock: Mutex::new(()),
     }
@@ -143,6 +151,116 @@ fn given_hotspots_when_flushing_then_writes_records_by_count_then_bytes() {
     assert_eq!(records[0].operation.as_deref(), Some("put_item"));
     assert_eq!(records[0].count, 2);
     assert_eq!(records[0].total_bytes, 12);
+}
+
+#[test]
+fn component_calls_defer_file_io_until_explicit_flush() {
+    let sample_file = unique_path("deferred-sample");
+    let hotspot_file = unique_path("deferred-hotspots");
+    let state = probe_state(sample_file.clone(), hotspot_file.clone());
+
+    state.record_storage_call("put_item", 5);
+
+    assert!(!sample_file.exists());
+    assert!(!hotspot_file.exists());
+
+    state.flush();
+
+    assert!(sample_file.exists());
+    assert!(hotspot_file.exists());
+}
+
+#[test]
+fn dynamic_hotspot_operations_do_not_grow_the_thread_local_cache_without_bound() {
+    let sample_file = unique_path("bounded-sample");
+    let hotspot_file = unique_path("bounded-hotspots");
+    let state = probe_state(sample_file, hotspot_file);
+
+    for index in 0..=MAX_HOTSPOTS {
+        let operation = format!("operation-{index}");
+        state.record_hotspot("storage", Some(&operation), 1);
+    }
+
+    let hotspot_count = state.hotspots.lock().expect("hotspots").len();
+    assert!(
+        hotspot_count <= MAX_HOTSPOTS,
+        "dynamic label cache retained {hotspot_count} entries"
+    );
+}
+
+#[test]
+fn diagnostic_hotspot_metadata_is_bounded_and_sensitive_labels_are_redacted() {
+    let sample_file = unique_path("metadata-sample");
+    let hotspot_file = unique_path("metadata-hotspots");
+    let state = probe_state(sample_file, hotspot_file);
+    let oversized_operation = "x".repeat(MAX_OPERATION_BYTES + 32);
+
+    state.record_hotspot("storage", Some(&oversized_operation), 1);
+    state.record_hotspot("storage", Some("authorization=Bearer secret"), 1);
+
+    let hotspots = state.hotspot_records();
+    assert!(hotspots.iter().all(|entry| {
+        entry
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.len() <= MAX_OPERATION_BYTES)
+            && entry.sample_backtrace.len() <= MAX_BACKTRACE_BYTES
+    }));
+    assert!(
+        hotspots
+            .iter()
+            .any(|entry| entry.operation.as_deref() == Some("<redacted>"))
+    );
+    assert!(hotspots.iter().all(|entry| {
+        entry
+            .operation
+            .as_deref()
+            .is_none_or(|operation| !operation.contains("topsecret"))
+    }));
+}
+
+#[test]
+fn oversized_diagnostic_files_are_not_loaded() {
+    let sample_file = unique_path("oversized-sample");
+    let hotspot_file = unique_path("oversized-hotspots");
+    fs::write(
+        &sample_file,
+        vec![0_u8; usize::try_from(MAX_SAMPLE_FILE_BYTES).expect("sample limit") + 1],
+    )
+    .expect("write oversized sample");
+    fs::write(
+        &hotspot_file,
+        vec![0_u8; usize::try_from(MAX_HOTSPOT_FILE_BYTES).expect("hotspot limit") + 1],
+    )
+    .expect("write oversized hotspots");
+
+    assert!(load_sample_if_present(&sample_file).is_none());
+    assert!(load_hotspots_if_present(&hotspot_file).is_none());
+}
+
+#[test]
+fn default_path_components_reject_traversal_and_are_bounded() {
+    assert_eq!(sanitize_path_component("../secret", 32), ".._secret");
+    assert_eq!(sanitize_path_component(".", 32), "unknown");
+    assert_eq!(sanitize_path_component("..", 32), "unknown");
+    assert!(
+        sanitize_path_component("a/b\\c", 32)
+            .chars()
+            .all(|character| !matches!(character, '/' | '\\'))
+    );
+    assert!(sanitize_path_component(&"x".repeat(256), 8).len() <= 8);
+}
+
+#[test]
+fn probe_guard_clears_thread_local_state_after_panic() {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        with_probe_guard(|| panic!("probe callback panic"));
+    }));
+    assert!(result.is_err());
+
+    let mut entered = false;
+    with_probe_guard(|| entered = true);
+    assert!(entered);
 }
 
 #[test]

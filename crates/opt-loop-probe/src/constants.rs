@@ -1,6 +1,14 @@
 pub(crate) const DEFAULT_ALLOC_SAMPLE_RATE: u64 = 256;
 pub(crate) const DEFAULT_STACK_DEPTH: usize = 24;
 pub(crate) const FLUSH_EVERY_ALLOC_EVENTS: u64 = 1024;
+pub(crate) const MAX_TARGET_ID_BYTES: usize = 128;
+pub(crate) const MAX_PHASE_BYTES: usize = 64;
+pub(crate) const MAX_OPERATION_BYTES: usize = 128;
+pub(crate) const MAX_HOTSPOTS: usize = 1024;
+pub(crate) const MAX_STACK_DEPTH: usize = 64;
+pub(crate) const MAX_BACKTRACE_BYTES: usize = 4096;
+pub(crate) const MAX_SAMPLE_FILE_BYTES: u64 = 64 * 1024;
+pub(crate) const MAX_HOTSPOT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 pub(crate) const ENV_ENABLED: &str = "AUX_OPT_LOOP_ENABLED";
 pub(crate) const ENV_TARGET_ID: &str = "AUX_OPT_LOOP_TARGET_ID";

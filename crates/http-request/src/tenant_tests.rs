@@ -12,18 +12,20 @@ use futures_util::stream;
 use reqwest::{
     Client, Method, Url,
     dns::{Addrs, Name, Resolve, Resolving},
+    header::HeaderValue,
 };
 
 use crate::{
     HttpRequestError,
     constants::{
         REDIRECT_BLOCKED_HOST_MISMATCH, REDIRECT_BLOCKED_METHOD_CHANGE, REDIRECT_BLOCKED_TOO_MANY,
-        SSRF_BLOCKED_DOMAIN_NOT_ALLOWLISTED, SSRF_BLOCKED_FRAGMENT, SSRF_BLOCKED_IP_LITERAL,
-        SSRF_BLOCKED_PORT, SSRF_BLOCKED_SCHEME, SSRF_BLOCKED_USERINFO,
+        SSRF_BLOCKED_DNS_TIMEOUT, SSRF_BLOCKED_DOMAIN_NOT_ALLOWLISTED, SSRF_BLOCKED_FRAGMENT,
+        SSRF_BLOCKED_HOST_HEADER, SSRF_BLOCKED_IP_LITERAL, SSRF_BLOCKED_PORT, SSRF_BLOCKED_SCHEME,
+        SSRF_BLOCKED_USERINFO,
     },
     tenant::{
-        AllowedDomain, SsrfDnsResolver, SsrfProtectionConfig, TenantHttpClient, is_blocked_ip,
-        match_allowlisted_domain, request_body_len, same_host,
+        AllowedDomain, SsrfDnsResolver, SsrfProtectionConfig, SsrfProtector, TenantHttpClient,
+        is_blocked_ip, match_allowlisted_domain, request_body_len, same_origin,
     },
 };
 
@@ -51,6 +53,7 @@ async fn ssrf_dns_resolver_validates_every_connector_resolution() {
             allowed_ports: vec![443],
             max_dns_addresses: 8,
             allow_loopback_ips: false,
+            dns_timeout: Duration::from_secs(1),
         },
         Arc::new(SequenceDnsResolver {
             responses: Mutex::new(VecDeque::from([
@@ -73,6 +76,29 @@ async fn ssrf_dns_resolver_validates_every_connector_resolution() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("reserved_ip"), "{error}");
+}
+
+#[tokio::test]
+async fn ssrf_preflight_dns_resolution_honors_configured_timeout() {
+    let protector = SsrfProtector::new(SsrfProtectionConfig {
+        allowed_schemes: vec!["https".to_string()],
+        allowed_ports: vec![443],
+        max_dns_addresses: 8,
+        allow_loopback_ips: true,
+        dns_timeout: Duration::ZERO,
+    });
+    let url = Url::parse("https://localhost/credentials").expect("URL");
+
+    let error = protector
+        .resolve_and_validate(&url)
+        .await
+        .expect_err("zero DNS budget must fail closed");
+    assert!(matches!(
+        error,
+        HttpRequestError::SsrfBlocked {
+            reason: SSRF_BLOCKED_DNS_TIMEOUT
+        }
+    ));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,13 +319,21 @@ fn match_allowlisted_domain_prefers_most_specific_rule() {
 }
 
 #[test]
-fn same_host_matches_equivalent_default_ports() {
+fn given_equivalent_default_ports_when_comparing_origins_then_matches() {
     let https_default = Url::parse("https://example.com/path").expect("url");
     let https_explicit = Url::parse("https://example.com:443/other").expect("url");
     let different_port = Url::parse("https://example.com:8443/other").expect("url");
 
-    assert!(same_host(&https_default, &https_explicit));
-    assert!(!same_host(&https_default, &different_port));
+    assert!(same_origin(&https_default, &https_explicit));
+    assert!(!same_origin(&https_default, &different_port));
+}
+
+#[test]
+fn given_scheme_change_when_comparing_redirect_origins_then_rejects() {
+    let https = Url::parse("https://example.com:443/path").expect("https URL");
+    let http = Url::parse("http://example.com:443/path").expect("http URL");
+
+    assert!(!same_origin(&https, &http));
 }
 
 #[test]
@@ -321,6 +355,50 @@ fn is_blocked_ip_allows_loopback_only_when_explicitly_enabled() {
     assert!(is_blocked_ip(loopback, false));
     assert!(!is_blocked_ip(loopback, true));
     assert!(is_blocked_ip(private, true));
+}
+
+#[test]
+fn is_blocked_ip_rejects_ipv4_mapped_reserved_addresses() {
+    let metadata = "::ffff:169.254.169.254"
+        .parse::<IpAddr>()
+        .expect("mapped metadata address");
+    let private = "::ffff:10.0.0.7"
+        .parse::<IpAddr>()
+        .expect("mapped private address");
+
+    assert!(is_blocked_ip(metadata, false));
+    assert!(is_blocked_ip(private, false));
+}
+
+#[test]
+fn is_blocked_ip_rejects_reserved_addresses_through_well_known_nat64_prefix() {
+    let metadata = "64:ff9b::a9fe:a9fe"
+        .parse::<IpAddr>()
+        .expect("NAT64 metadata address");
+    let public = "64:ff9b::0808:0808"
+        .parse::<IpAddr>()
+        .expect("NAT64 public address");
+
+    assert!(is_blocked_ip(metadata, false));
+    assert!(!is_blocked_ip(public, false));
+}
+
+#[test]
+fn given_teredo_ipv6_address_when_classifying_ssrf_destination_then_blocks_it() {
+    let teredo = "2001:0000:4136:e378:8000:63bf:3fff:fdd2"
+        .parse::<IpAddr>()
+        .expect("Teredo IPv6 address");
+
+    assert!(is_blocked_ip(teredo, false));
+}
+
+#[test]
+fn given_six_to_four_ipv6_address_when_classifying_ssrf_destination_then_blocks_it() {
+    let six_to_four = "2002:c000:0204::1"
+        .parse::<IpAddr>()
+        .expect("6to4 IPv6 address");
+
+    assert!(is_blocked_ip(six_to_four, false));
 }
 
 #[test]
@@ -400,7 +478,7 @@ async fn tenant_http_client_when_request_helpers_used_then_send_expected_http_me
 }
 
 #[tokio::test]
-async fn tenant_http_client_when_same_host_temporary_redirect_then_replays_request() {
+async fn tenant_http_client_when_same_origin_temporary_redirect_then_replays_request() {
     let server = TestServer::spawn(2, |request_index, _request| match request_index {
         0 => TestResponse::redirect(
             "HTTP/1.1 307 Temporary Redirect",
@@ -539,30 +617,27 @@ async fn tenant_http_client_when_redirect_changes_host_then_blocks_redirect() {
 }
 
 #[tokio::test]
-async fn tenant_http_client_when_redirect_request_body_is_not_cloneable_then_errors() {
-    let server = TestServer::spawn(1, |_request_index, _request| {
-        TestResponse::redirect(
-            "HTTP/1.1 307 Temporary Redirect",
-            Some("/final".to_string()),
-        )
-    });
-    let client = tenant_client_for_server(&server);
+async fn tenant_http_client_when_stream_body_declares_small_content_length_then_rejects() {
     let body = reqwest::Body::wrap_stream(stream::once(async {
         Ok::<Bytes, std::io::Error>(Bytes::from_static(b"hello"))
     }));
 
     let error = expect_http_error(
-        client
-            .post(server.url("/start"))
-            .header(reqwest::header::CONTENT_LENGTH, "5")
+        TenantHttpClient::builder("tenant")
+            .allowlist(vec![AllowedDomain::exact("example.com")])
+            .max_content_length(4)
+            .build()
+            .expect("build tenant client")
+            .post("https://example.com")
+            .header(reqwest::header::CONTENT_LENGTH, "1")
             .body(body)
             .send()
             .await,
-        "streaming redirect body should not be cloneable",
+        "streaming body with a forged small content length should be rejected",
     );
 
     assert!(
-        matches!(error, HttpRequestError::RequestNotCloneable),
+        matches!(error, HttpRequestError::RequestSizeUnknown { max: 4 }),
         "unexpected error: {error:?}"
     );
 }
@@ -732,6 +807,33 @@ async fn tenant_http_client_when_host_is_ip_literal_without_loopback_override_th
         error,
         HttpRequestError::SsrfBlocked {
             reason: SSRF_BLOCKED_IP_LITERAL
+        }
+    ));
+}
+
+#[tokio::test]
+async fn tenant_http_client_rejects_host_header_overrides() {
+    let client = TenantHttpClient::builder("tenant")
+        .allowlist(vec![AllowedDomain::exact("example.com")])
+        .build()
+        .expect("build tenant client");
+    let mut request = reqwest::Request::new(
+        Method::GET,
+        Url::parse("https://example.com/endpoint").expect("request url"),
+    );
+    request.headers_mut().insert(
+        reqwest::header::HOST,
+        HeaderValue::from_static("privileged.example.com"),
+    );
+
+    let error = expect_http_error(
+        client.execute(request).await,
+        "Host override should be blocked",
+    );
+    assert!(matches!(
+        error,
+        HttpRequestError::SsrfBlocked {
+            reason: SSRF_BLOCKED_HOST_HEADER
         }
     ));
 }

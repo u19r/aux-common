@@ -8,6 +8,7 @@ description = "Reusable signed JWT verification utilities"
 
 [dependencies]
 base64 = { workspace = true }
+curve25519-dalek = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -18,10 +19,12 @@ jsonwebtoken = { workspace = true, default-features = false, features = ["aws_lc
 lru-ttl-cache = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { workspace = true, features = ["js"] }
+getrandom = { workspace = true, features = ["wasm_js"] }
+# jsonwebtoken 11 declares getrandom 0.2 for wasm without enabling its js backend.
+getrandom-02 = { workspace = true }
 jsonwebtoken = { workspace = true, default-features = false, features = ["rust_crypto"] }
 
-[dev-dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 alloc-counter = { workspace = true }
 jsonwebtoken = { workspace = true, default-features = false, features = ["aws_lc_rs", "use_pem"] }
 opt-loop-probe = { workspace = true }

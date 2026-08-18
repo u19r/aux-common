@@ -4,12 +4,14 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use http_request::HttpRequestError;
-use jsonwebtoken::{Algorithm, Header};
+use http_request::{HttpClientBuilder, HttpRequestError, Transport, TransportFuture};
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use serde_json::Value;
+use tokio::sync::Notify;
 
 use crate::{
     AllowedAlgorithms, JwksCachePolicy, JwksDocument, JwksSource, JwksUrl, JwtDecodeErrorKind,
-    JwtVerifier, SignatureAlgorithm, TokenKind, VerificationPolicy,
+    JwtVerifier, RemoteJwksSource, SignatureAlgorithm, TokenKind, VerificationPolicy,
     test_support::{
         Claims, CountingTransport, FixedClock, build_remote_verifier,
         build_remote_verifier_with_policy, build_verifier, id_header, jwk, jwks,
@@ -17,6 +19,30 @@ use crate::{
         signed_token, signed_value_token, token, token_without_iat, valid_claims,
     },
 };
+
+#[derive(Debug)]
+struct InvalidationRaceTransport {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    first_started: Arc<Notify>,
+    release_first: Arc<Notify>,
+}
+
+impl Transport for InvalidationRaceTransport {
+    fn send(&self, _request: http_request::reqwest::Request) -> TransportFuture {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let first_started = Arc::clone(&self.first_started);
+        let release_first = Arc::clone(&self.release_first);
+        Box::pin(async move {
+            if call == 0 {
+                first_started.notify_one();
+                release_first.notified().await;
+                Ok(mock_response(jwks_without_test_key()))
+            } else {
+                Ok(mock_response(jwks()))
+            }
+        })
+    }
+}
 
 #[tokio::test]
 async fn given_valid_static_jwks_when_verifying_access_token_then_returns_typed_claims() {
@@ -208,6 +234,33 @@ async fn given_expired_token_when_verifying_then_rejects_expiration() {
         .verify::<Claims>(&token, &policy)
         .await
         .unwrap_err();
+
+    assert_eq!(error.kind(), &JwtDecodeErrorKind::Expired);
+}
+
+#[tokio::test]
+async fn given_token_expiring_at_current_second_when_verifying_then_rejects_expiration() {
+    let verifier = build_verifier();
+    let token = token(Claims {
+        registered: registered_claims(1_700_000_000, 1_699_999_990),
+        token_type: TokenKind::Access,
+        client_id: "client-123".to_owned(),
+    });
+
+    let boundary_policy = VerificationPolicy::access_token()
+        .issuer("https://issuer.example")
+        .unwrap()
+        .audience("aux-api")
+        .unwrap()
+        .client_id("client-123")
+        .unwrap()
+        .leeway(Duration::ZERO)
+        .build()
+        .unwrap();
+    let error = verifier
+        .verify::<Claims>(&token, &boundary_policy)
+        .await
+        .expect_err("the expiration boundary must be exclusive");
 
     assert_eq!(error.kind(), &JwtDecodeErrorKind::Expired);
 }
@@ -511,6 +564,26 @@ async fn given_remote_jwks_rotation_when_kid_unknown_then_forced_refresh_accepts
 }
 
 #[tokio::test]
+async fn given_repeated_unknown_kids_when_verifying_then_refreshes_are_bounded() {
+    let transport = CountingTransport::from_bodies(vec![jwks(), jwks_without_test_key()]);
+    let attempts = Arc::clone(&transport.attempts);
+    let verifier = build_remote_verifier(transport);
+    let claims = serde_json::to_vec(&valid_claims()).expect("claims");
+
+    for kid in ["unknown-one", "unknown-two", "unknown-three"] {
+        let header = format!("{{\"alg\":\"RS256\",\"kid\":\"{kid}\",\"typ\":\"at+jwt\"}}");
+        let token = signed_raw_token(header.as_bytes(), &claims);
+        let error = verifier
+            .verify::<Claims>(&token, &policy())
+            .await
+            .expect_err("unknown key id must remain invalid");
+        assert_eq!(error.kind(), &JwtDecodeErrorKind::KeyNotFound);
+    }
+
+    assert_eq!(2, attempts.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn given_stale_remote_jwks_when_refresh_fails_then_stale_value_is_used() {
     let transport = CountingTransport::from_results(vec![
         Ok(mock_response(jwks())),
@@ -524,6 +597,7 @@ async fn given_stale_remote_jwks_when_refresh_fails_then_stale_value_is_used() {
         JwksCachePolicy {
             fallback_ttl: Duration::from_millis(5),
             stale_ttl: Duration::from_secs(5),
+            stale_on_fetch_error: true,
             ..JwksCachePolicy::default()
         },
     );
@@ -541,9 +615,186 @@ async fn given_stale_remote_jwks_when_refresh_fails_then_stale_value_is_used() {
     assert_eq!(2, attempts.load(Ordering::SeqCst));
 }
 
+#[tokio::test]
+async fn given_default_remote_jwks_policy_when_refresh_fails_then_rejects_stale_value() {
+    let transport = CountingTransport::from_results(vec![
+        Ok(mock_response(jwks())),
+        Err(HttpRequestError::Decode {
+            message: "refresh failed".to_owned(),
+        }),
+    ]);
+    let attempts = Arc::clone(&transport.attempts);
+    let verifier = build_remote_verifier_with_policy(
+        transport,
+        JwksCachePolicy {
+            fallback_ttl: Duration::from_millis(5),
+            ..JwksCachePolicy::default()
+        },
+    );
+
+    verifier
+        .verify::<Claims>(&token(valid_claims()), &policy())
+        .await
+        .expect("initial JWKS fetch should succeed");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let error = verifier
+        .verify::<Claims>(&token(valid_claims()), &policy())
+        .await
+        .expect_err("default policy must fail closed when refresh fails");
+
+    assert_eq!(error.kind(), &JwtDecodeErrorKind::JwksFetch);
+    assert_eq!(2, attempts.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn given_invalidation_during_a_jwks_fetch_when_fetch_completes_then_old_document_is_not_reused()
+ {
+    let transport = InvalidationRaceTransport {
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        first_started: Arc::new(Notify::new()),
+        release_first: Arc::new(Notify::new()),
+    };
+    let first_started = Arc::clone(&transport.first_started);
+    let release_first = Arc::clone(&transport.release_first);
+    let client = HttpClientBuilder::new()
+        .with_transport(transport)
+        .build()
+        .expect("build test HTTP client");
+    let source = JwksSource::Url(Box::new(RemoteJwksSource::new(
+        JwksUrl::parse_https("https://issuer.example/jwks.json").expect("JWKS URL"),
+        JwksCachePolicy::default(),
+        client,
+    )));
+
+    let first_source = source.clone();
+    let first = tokio::spawn(async move {
+        first_source
+            .document_for_issuer("https://issuer.example")
+            .await
+            .expect("first fetch")
+    });
+    first_started.notified().await;
+    source.invalidate_issuer("https://issuer.example");
+
+    let second = tokio::time::timeout(
+        Duration::from_secs(1),
+        source.document_for_issuer("https://issuer.example"),
+    )
+    .await
+    .expect("generation change must not wait for the invalidated fetch")
+    .expect("second fetch");
+    release_first.notify_one();
+    let first = first.await.expect("first fetch task");
+
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "an invalidated in-flight document must not be reused"
+    );
+}
+
+#[test]
+fn given_oversized_or_key_flooded_jwks_when_parsing_then_rejects_document() {
+    let oversized = " ".repeat(crate::jwks::MAX_JWKS_DOCUMENT_BYTES + 1);
+    assert_eq!(
+        JwksDocument::from_json_str(&oversized)
+            .expect_err("oversized JWKS must be rejected")
+            .kind(),
+        &JwtDecodeErrorKind::JwksParse
+    );
+
+    let template = serde_json::to_value(jwk()).expect("JWK JSON");
+    let keys = (0..=crate::jwks::MAX_JWKS_KEYS)
+        .map(|index| {
+            let mut key = template.clone();
+            key["kid"] = Value::String(format!("key-{index}"));
+            key
+        })
+        .collect::<Vec<_>>();
+    let document = serde_json::json!({ "keys": keys }).to_string();
+    assert_eq!(
+        JwksDocument::from_json_str(&document)
+            .expect_err("JWKS key floods must be rejected")
+            .kind(),
+        &JwtDecodeErrorKind::JwksParse
+    );
+}
+
 #[test]
 fn given_http_remote_jwks_url_when_using_secure_constructor_then_rejects_insecure_url() {
     let error = JwksUrl::parse_https("http://issuer.example/jwks.json").unwrap_err();
 
     assert_eq!(error.kind(), &JwtDecodeErrorKind::JwksFetch);
+}
+
+#[test]
+fn given_secret_bearing_jwks_url_when_debugging_or_parsing_then_redacts_and_rejects() {
+    let value = "https://user:password@issuer.example/jwks.json?secret=query-sentinel#fragment";
+    let parsed = JwksUrl::parse_https(value);
+    assert!(
+        parsed.is_err(),
+        "secure JWKS URLs must not accept secret components"
+    );
+
+    let parsed_for_debug = JwksUrl::parse_for_tests(value).expect("test URL should parse");
+    let debug = format!("{parsed_for_debug:?}");
+    assert!(!debug.contains("password"));
+    assert!(!debug.contains("query-sentinel"));
+}
+
+#[test]
+fn given_static_symmetric_jwks_when_debugging_then_hmac_material_is_redacted() {
+    let secret = "bG9jYWwgdGVzdCBobWFjIHNlY3JldCB3aXRoIGVub3VnaCBlbnRyb3B5";
+    let source = JwksSource::json_string(
+        serde_json::json!({
+            "keys": [{
+                "kty": "oct",
+                "kid": "hmac-key",
+                "alg": "HS256",
+                "k": secret
+            }]
+        })
+        .to_string(),
+    )
+    .expect("static HMAC JWK");
+
+    let debug = format!("{source:?}");
+    assert!(!debug.contains(secret));
+    assert!(!debug.contains("local test hmac secret"));
+}
+
+#[test]
+fn given_short_local_hmac_secret_when_constructing_source_then_rejects_and_keeps_strong_secret() {
+    assert!(
+        JwksSource::local_symmetric_key("weak", b"short".to_vec()).is_err(),
+        "a guessable HMAC secret must not be accepted"
+    );
+    assert!(
+        JwksSource::local_symmetric_key("strong", [0x42; 32].to_vec()).is_ok(),
+        "a 256-bit HMAC secret remains supported"
+    );
+}
+
+#[tokio::test]
+async fn given_hs512_with_a_256_bit_local_secret_when_verifying_then_rejects_key() {
+    let secret = [0x42; 32];
+    let source = JwksSource::local_symmetric_key("hs512", secret.to_vec())
+        .expect("the baseline local secret is valid for HS256");
+    let verifier = JwtVerifier::builder()
+        .jwks_source(source)
+        .allowed_algorithms(AllowedAlgorithms::symmetric([SignatureAlgorithm::HS512]).unwrap())
+        .clock(Arc::new(FixedClock))
+        .build()
+        .unwrap();
+    let mut header = Header::new(Algorithm::HS512);
+    header.kid = Some("hs512".to_owned());
+    header.typ = Some("at+jwt".to_owned());
+    let token = jsonwebtoken::encode(&header, &valid_claims(), &EncodingKey::from_secret(&secret))
+        .expect("test token");
+
+    let error = verifier
+        .verify::<Claims>(&token, &policy())
+        .await
+        .expect_err("HS512 must require a 512-bit local secret");
+
+    assert_eq!(error.kind(), &JwtDecodeErrorKind::InvalidKey);
 }

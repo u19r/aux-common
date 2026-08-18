@@ -6,14 +6,25 @@ use std::{
 
 use authz_types::{
     BatchEvaluationRequest, BatchEvaluationResponse, CONTEXT_INTERNAL_KEY, EvaluationRequest,
-    EvaluationResponse, ValidatedConfigurationModel,
+    EvaluationResponse, MAX_BATCH_EVALUATIONS, ValidatedConfigurationModel,
 };
 use cedar_policy::{
     AuthorizationError, Authorizer, Context, Decision, Entities, Entity, EntityId, EntityTypeName,
     EntityUid, EvaluationError, PolicySet, Request, RestrictedExpression,
 };
 
-use crate::{CedarError, CompiledBundle};
+use crate::{
+    BundleManifest, CedarError, CompiledBundle,
+    slices::{
+        BUNDLE_MANIFEST_MAX_BYTES, BUNDLE_POLICY_MAX_BYTES, BUNDLE_SCHEMA_MAX_BYTES,
+        MAX_POLICY_SLICES, MAX_SCHEMA_SLICES, SLICE_SOFT_MAX_BYTES, SchemaSlice, SliceMeta,
+        sha256_hex,
+    },
+};
+
+const MAX_CONTEXT_NESTING: usize = 16;
+const MAX_CONTEXT_COLLECTION_ITEMS: usize = 1_024;
+const MAX_CONTEXT_STRING_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ParsedPolicySets {
@@ -283,6 +294,11 @@ impl PreparedCedarEvaluation {
     pub fn resource_type(&self) -> &str {
         self.resource_type.as_str()
     }
+
+    #[cfg(test)]
+    pub(crate) fn context(&self) -> Option<&Context> {
+        self.request.context()
+    }
 }
 
 /// Evaluate a single request against the compiled bundle.
@@ -298,6 +314,7 @@ pub fn evaluate_with_policy_sets(
     policy_sets: &ParsedPolicySets,
     request: &EvaluationRequest,
 ) -> Result<EvaluationResponse, CedarError> {
+    validate_untrusted_request(request)?;
     let uids = prepare_request_uids(request)?;
     let (entities, context) = build_entities_and_context_ref_with_parents(request, &[], &[])
         .map_err(CedarError::evaluation)?;
@@ -309,19 +326,20 @@ pub fn evaluate_owned_with_policy_sets(
     policy_sets: &ParsedPolicySets,
     request: EvaluationRequest,
 ) -> Result<EvaluationResponse, CedarError> {
+    validate_untrusted_request(&request)?;
     let prepared = prepare_evaluation_owned(request)?;
     evaluate_prepared_with_policy_sets(policy_sets, prepared)
 }
 
 /// Evaluate with parent relationships supplied through the trusted boundary.
-pub fn evaluate_owned_with_policy_sets_with_parents(
+pub fn evaluate_owned_with_trusted_parents_and_policy_sets(
     policy_sets: &ParsedPolicySets,
     request: EvaluationRequest,
     subject_parents: &[EntityParentRef],
     resource_parents: &[EntityParentRef],
 ) -> Result<EvaluationResponse, CedarError> {
     let prepared =
-        prepare_evaluation_owned_with_parents(request, subject_parents, resource_parents)?;
+        prepare_evaluation_owned_with_trusted_parents(request, subject_parents, resource_parents)?;
     evaluate_prepared_with_policy_sets(policy_sets, prepared)
 }
 
@@ -330,6 +348,7 @@ pub fn evaluate_batch(
     bundle: &CompiledBundle,
     request: &BatchEvaluationRequest,
 ) -> Result<BatchEvaluationResponse, CedarError> {
+    validate_batch_length(request)?;
     let parsed = parse_policy_sets(bundle)?;
     evaluate_batch_with_policy_sets(&parsed, request)
 }
@@ -338,6 +357,7 @@ pub fn evaluate_batch_with_policy_sets(
     policy_sets: &ParsedPolicySets,
     request: &BatchEvaluationRequest,
 ) -> Result<BatchEvaluationResponse, CedarError> {
+    validate_batch_length(request)?;
     let evaluations = request
         .evaluations
         .iter()
@@ -350,6 +370,7 @@ pub fn evaluate_batch_owned_with_policy_sets(
     policy_sets: &ParsedPolicySets,
     request: BatchEvaluationRequest,
 ) -> Result<BatchEvaluationResponse, CedarError> {
+    validate_batch_length(&request)?;
     let evaluations = request
         .evaluations
         .into_iter()
@@ -359,8 +380,37 @@ pub fn evaluate_batch_owned_with_policy_sets(
 }
 
 pub fn parse_policy_sets(bundle: &CompiledBundle) -> Result<ParsedPolicySets, CedarError> {
+    if bundle.policy_slices.len() > MAX_POLICY_SLICES {
+        return Err(CedarError::evaluation(format!(
+            "policy slice count exceeds maximum of {MAX_POLICY_SLICES}"
+        )));
+    }
+    // Check cheap resource limits before hashing any payload. This keeps the
+    // rejection deterministic for oversized attacker-controlled input.
+    for policy_slice in &bundle.policy_slices {
+        if policy_slice.policies_json.len() > SLICE_SOFT_MAX_BYTES {
+            return Err(CedarError::evaluation(format!(
+                "policy slice exceeds maximum of {SLICE_SOFT_MAX_BYTES} bytes"
+            )));
+        }
+    }
+    validate_bundle_integrity(bundle)?;
+    let mut total_bytes = 0usize;
     let mut policy_sets_by_resource: HashMap<&str, PolicySet> = HashMap::new();
     for policy_slice in &bundle.policy_slices {
+        if policy_slice.policies_json.len() > SLICE_SOFT_MAX_BYTES {
+            return Err(CedarError::evaluation(format!(
+                "policy slice exceeds maximum of {SLICE_SOFT_MAX_BYTES} bytes"
+            )));
+        }
+        total_bytes = total_bytes
+            .checked_add(policy_slice.policies_json.len())
+            .ok_or_else(|| CedarError::evaluation("policy bundle size overflow"))?;
+        if total_bytes > BUNDLE_POLICY_MAX_BYTES {
+            return Err(CedarError::evaluation(format!(
+                "policy bundle exceeds maximum of {BUNDLE_POLICY_MAX_BYTES} bytes"
+            )));
+        }
         let slice_policy_set = PolicySet::from_json_str(&policy_slice.policies_json)
             .map_err(|e| CedarError::evaluation(format!("invalid policies json: {e}")))?;
         let entry = policy_sets_by_resource
@@ -377,6 +427,287 @@ pub fn parse_policy_sets(bundle: &CompiledBundle) -> Result<ParsedPolicySets, Ce
     }
 
     Ok(ParsedPolicySets { by_resource_type })
+}
+
+fn validate_batch_length(request: &BatchEvaluationRequest) -> Result<(), CedarError> {
+    if request.evaluations.len() > MAX_BATCH_EVALUATIONS {
+        return Err(CedarError::evaluation(format!(
+            "batch exceeds maximum of {MAX_BATCH_EVALUATIONS} evaluations"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the self-describing integrity metadata on an untrusted bundle.
+///
+/// This check is intentionally independent from configuration validation: it
+/// detects payload/manifest mismatches before Cedar parses attacker-controlled
+/// JSON, while [`validate_bundle_for_config`] binds the same bundle to the
+/// configuration that the runtime is about to use.
+pub fn validate_bundle_integrity(bundle: &CompiledBundle) -> Result<(), CedarError> {
+    let manifest = &bundle.manifest;
+    if bundle.schema_slices.len() > MAX_SCHEMA_SLICES {
+        return Err(bundle_integrity_error(format!(
+            "schema slice count exceeds maximum of {MAX_SCHEMA_SLICES}"
+        )));
+    }
+    if bundle.policy_slices.len() > MAX_POLICY_SLICES {
+        return Err(bundle_integrity_error(format!(
+            "policy slice count exceeds maximum of {MAX_POLICY_SLICES}"
+        )));
+    }
+    if manifest.schema_slices.len() > MAX_SCHEMA_SLICES {
+        return Err(bundle_integrity_error(format!(
+            "schema manifest count exceeds maximum of {MAX_SCHEMA_SLICES}"
+        )));
+    }
+    if manifest.policy_slices.len() > MAX_POLICY_SLICES {
+        return Err(bundle_integrity_error(format!(
+            "policy manifest count exceeds maximum of {MAX_POLICY_SLICES}"
+        )));
+    }
+
+    let schema_bytes = bundle
+        .schema_slices
+        .iter()
+        .try_fold(0usize, |total, slice| {
+            if slice.schema_json.len() > SLICE_SOFT_MAX_BYTES {
+                return Err(bundle_integrity_error("schema slice exceeds size limit"));
+            }
+            total
+                .checked_add(slice.schema_json.len())
+                .ok_or_else(|| bundle_integrity_error("schema bundle size overflow"))
+        })?;
+    if schema_bytes > BUNDLE_SCHEMA_MAX_BYTES {
+        return Err(bundle_integrity_error("schema bundle exceeds size limit"));
+    }
+
+    let manifest_bytes = manifest
+        .schema_slices
+        .iter()
+        .chain(manifest.policy_slices.iter())
+        .try_fold(0usize, |total, meta| {
+            let digest_bytes = meta.sha256.as_ref().map_or(0, String::len);
+            total
+                .checked_add(meta.key.len())
+                .and_then(|value| value.checked_add(digest_bytes))
+                .and_then(|value| value.checked_add(std::mem::size_of::<SliceMeta>()))
+                .ok_or_else(|| bundle_integrity_error("bundle manifest size overflow"))
+        })?;
+    if manifest_bytes > BUNDLE_MANIFEST_MAX_BYTES {
+        return Err(bundle_integrity_error("bundle manifest exceeds size limit"));
+    }
+
+    if manifest.version != bundle.version {
+        return Err(bundle_integrity_error(
+            "manifest version does not match bundle version",
+        ));
+    }
+
+    let config_fingerprint = required_digest(
+        manifest.config_fingerprint.as_ref(),
+        "configuration fingerprint",
+    )?;
+    if config_fingerprint.len() != 64 || !is_lower_hex(config_fingerprint) {
+        return Err(bundle_integrity_error(
+            "configuration fingerprint is not a SHA-256 hex digest",
+        ));
+    }
+
+    if bundle.base_schema_json.len() > SLICE_SOFT_MAX_BYTES {
+        return Err(bundle_integrity_error("base schema exceeds size limit"));
+    }
+    let base_schema_digest =
+        required_digest(manifest.base_schema_sha256.as_ref(), "base schema digest")?;
+    if base_schema_digest != sha256_hex(bundle.base_schema_json.as_bytes()) {
+        return Err(bundle_integrity_error("base schema digest mismatch"));
+    }
+
+    let schema_actual = bundle
+        .schema_slices
+        .iter()
+        .map(schema_integrity_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    let schema_declared = manifest
+        .schema_slices
+        .iter()
+        .map(declared_integrity_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    if sorted_records(schema_actual) != sorted_records(schema_declared) {
+        return Err(bundle_integrity_error("schema slice manifest mismatch"));
+    }
+
+    let policy_actual = bundle
+        .policy_slices
+        .iter()
+        .map(|slice| {
+            if slice.resource_type.trim().is_empty() {
+                return Err(bundle_integrity_error(
+                    "policy slice has empty resource type",
+                ));
+            }
+            if slice.policies_json.len() > SLICE_SOFT_MAX_BYTES
+                || slice.size_bytes != slice.policies_json.len()
+            {
+                return Err(bundle_integrity_error(
+                    "policy slice size metadata mismatch",
+                ));
+            }
+            Ok((
+                slice.resource_type.clone(),
+                slice.size_bytes,
+                sha256_hex(slice.policies_json.as_bytes()),
+            ))
+        })
+        .collect::<Result<Vec<_>, CedarError>>()?;
+    let policy_declared = manifest
+        .policy_slices
+        .iter()
+        .map(|meta| {
+            let resource_type = policy_manifest_resource_type(&meta.key)?;
+            let (_, size_bytes, digest) = declared_integrity_record(meta)?;
+            Ok((resource_type, size_bytes, digest))
+        })
+        .collect::<Result<Vec<_>, CedarError>>()?;
+    if sorted_records(policy_actual) != sorted_records(policy_declared) {
+        return Err(bundle_integrity_error("policy slice manifest mismatch"));
+    }
+
+    validate_policy_manifest_keys(manifest)?;
+    Ok(())
+}
+
+/// Bind a compiled bundle to the exact validated configuration used by the
+/// runtime. The generated payload and integrity metadata are compared as well
+/// as the fingerprint so a forged manifest cannot authorize a different
+/// policy set.
+pub fn validate_bundle_for_config(
+    config: &ValidatedConfigurationModel,
+    bundle: &CompiledBundle,
+) -> Result<(), CedarError> {
+    validate_bundle_integrity(bundle)?;
+    let expected_fingerprint = crate::configuration_fingerprint(config)?;
+    if bundle.manifest.config_fingerprint.as_deref() != Some(expected_fingerprint.as_str()) {
+        return Err(bundle_integrity_error(
+            "bundle configuration fingerprint does not match runtime configuration",
+        ));
+    }
+
+    let expected = crate::compile_policy_bundle(config, bundle.version).map_err(|error| {
+        bundle_integrity_error(format!("cannot compile expected bundle: {error}"))
+    })?;
+    let mut actual_manifest = bundle.manifest.clone();
+    actual_manifest.compiled_at_ms = None;
+    let mut expected_manifest = expected.manifest.clone();
+    expected_manifest.compiled_at_ms = None;
+    if bundle.base_schema_json != expected.base_schema_json
+        || bundle.schema_slices != expected.schema_slices
+        || bundle.policy_slices != expected.policy_slices
+        || actual_manifest != expected_manifest
+    {
+        return Err(bundle_integrity_error(
+            "bundle payload does not match runtime configuration",
+        ));
+    }
+    Ok(())
+}
+
+fn bundle_integrity_error(message: impl Into<String>) -> CedarError {
+    CedarError::evaluation(format!("bundle integrity check failed: {}", message.into()))
+}
+
+fn required_digest<'a>(digest: Option<&'a String>, label: &str) -> Result<&'a str, CedarError> {
+    let Some(digest) = digest else {
+        return Err(bundle_integrity_error(format!("{label} is missing")));
+    };
+    if digest.is_empty() {
+        return Err(bundle_integrity_error(format!("{label} is empty")));
+    }
+    Ok(digest)
+}
+
+fn is_lower_hex(value: &str) -> bool {
+    value
+        .as_bytes()
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+fn schema_integrity_record(slice: &SchemaSlice) -> Result<(String, usize, String), CedarError> {
+    if slice.resource_type.trim().is_empty() {
+        return Err(bundle_integrity_error(
+            "schema slice has empty resource type",
+        ));
+    }
+    if slice.schema_json.len() > SLICE_SOFT_MAX_BYTES || slice.size_bytes != slice.schema_json.len()
+    {
+        return Err(bundle_integrity_error(
+            "schema slice size metadata mismatch",
+        ));
+    }
+    Ok((
+        slice.resource_type.clone(),
+        slice.size_bytes,
+        sha256_hex(slice.schema_json.as_bytes()),
+    ))
+}
+
+fn declared_integrity_record(meta: &SliceMeta) -> Result<(String, usize, String), CedarError> {
+    if meta.key.trim().is_empty() {
+        return Err(bundle_integrity_error("slice manifest key is empty"));
+    }
+    let digest = required_digest(meta.sha256.as_ref(), "slice digest")?;
+    if digest.len() != 64 || !is_lower_hex(digest) {
+        return Err(bundle_integrity_error(
+            "slice digest is not a SHA-256 hex digest",
+        ));
+    }
+    Ok((meta.key.clone(), meta.size_bytes, digest.to_string()))
+}
+
+fn sorted_records(mut records: Vec<(String, usize, String)>) -> Vec<(String, usize, String)> {
+    records.sort();
+    records
+}
+
+fn policy_manifest_resource_type(key: &str) -> Result<String, CedarError> {
+    let Some((resource_type, suffix)) = key.split_once('#') else {
+        return Ok(key.to_string());
+    };
+    if resource_type.is_empty() || suffix.parse::<usize>().is_err() {
+        return Err(bundle_integrity_error("invalid policy slice manifest key"));
+    }
+    Ok(resource_type.to_string())
+}
+
+fn validate_policy_manifest_keys(manifest: &BundleManifest) -> Result<(), CedarError> {
+    let mut by_resource: HashMap<String, Vec<Option<usize>>> = HashMap::new();
+    for meta in &manifest.policy_slices {
+        let Some((resource_type, suffix)) = meta.key.split_once('#') else {
+            by_resource.entry(meta.key.clone()).or_default().push(None);
+            continue;
+        };
+        let index = suffix
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| bundle_integrity_error("invalid policy slice manifest key"))?;
+        by_resource
+            .entry(resource_type.to_string())
+            .or_default()
+            .push(index);
+    }
+    for (resource_type, mut indexes) in by_resource {
+        indexes.sort();
+        let expected = (0..indexes.len())
+            .map(|index| if index == 0 { None } else { Some(index) })
+            .collect::<Vec<_>>();
+        if indexes != expected {
+            return Err(bundle_integrity_error(format!(
+                "policy slice manifest keys are not contiguous for {resource_type}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn prepare_request_uids(request: &EvaluationRequest) -> Result<CedarRequestUids, CedarError> {
@@ -405,10 +736,11 @@ pub fn prepare_request_uids(request: &EvaluationRequest) -> Result<CedarRequestU
 pub fn prepare_entities_and_context_owned(
     request: EvaluationRequest,
 ) -> Result<CedarEntitiesContext, CedarError> {
-    prepare_entities_and_context_owned_with_parents(request, &[], &[])
+    validate_untrusted_request(&request)?;
+    prepare_entities_and_context_owned_with_trusted_parents(request, &[], &[])
 }
 
-pub fn prepare_entities_and_context_owned_with_parents(
+pub fn prepare_entities_and_context_owned_with_trusted_parents(
     request: EvaluationRequest,
     subject_parents: &[EntityParentRef],
     resource_parents: &[EntityParentRef],
@@ -449,6 +781,7 @@ pub fn prepare_request_from_parts(
 pub fn prepare_evaluation_owned(
     request: EvaluationRequest,
 ) -> Result<PreparedCedarEvaluation, CedarError> {
+    validate_untrusted_request(&request)?;
     let uids = prepare_request_uids(&request)?;
     let (entities, context) =
         build_entities_and_context_owned_with_parents(request, &[], &[], None, Some(&uids))
@@ -458,7 +791,7 @@ pub fn prepare_evaluation_owned(
 
 /// Prepare an evaluation with parent relationships supplied by trusted
 /// authorization enrichment.
-pub fn prepare_evaluation_owned_with_parents(
+pub fn prepare_evaluation_owned_with_trusted_parents(
     request: EvaluationRequest,
     subject_parents: &[EntityParentRef],
     resource_parents: &[EntityParentRef],
@@ -475,7 +808,7 @@ pub fn prepare_evaluation_owned_with_parents(
     prepare_request_from_parts(uids, CedarEntitiesContext { entities, context })
 }
 
-pub fn prepare_evaluation_owned_with_parents_and_internal_context(
+pub fn prepare_evaluation_owned_with_trusted_parents_and_internal_context(
     request: EvaluationRequest,
     subject_parents: &[EntityParentRef],
     resource_parents: &[EntityParentRef],
@@ -493,7 +826,7 @@ pub fn prepare_evaluation_owned_with_parents_and_internal_context(
     prepare_request_from_parts(uids, CedarEntitiesContext { entities, context })
 }
 
-pub fn prepare_evaluation_owned_with_registry_and_internal_context(
+pub fn prepare_evaluation_owned_with_registry_and_trusted_internal_context(
     uid_registry: &CedarUidRegistry,
     request: EvaluationRequest,
     subject_parents: &[EntityParentRef],
@@ -512,7 +845,7 @@ pub fn prepare_evaluation_owned_with_registry_and_internal_context(
     prepare_request_from_parts(uids, CedarEntitiesContext { entities, context })
 }
 
-pub fn prepare_batch_frame_owned_with_registry_and_internal_context(
+pub fn prepare_batch_frame_owned_with_registry_and_trusted_internal_context(
     uid_registry: &CedarUidRegistry,
     request: EvaluationRequest,
     subject_parents: &[EntityParentRef],
@@ -656,7 +989,8 @@ fn evaluate_authorizer(
     entities: &Entities,
 ) -> EvaluationResponse {
     let response = Authorizer::new().is_authorized(request, policy_set, entities);
-    response_from_decision(response.decision())
+    let has_evaluation_errors = response.diagnostics().errors().next().is_some();
+    response_from_decision_and_errors(response.decision(), has_evaluation_errors)
 }
 
 fn evaluate_authorizer_with_error_diagnostics(
@@ -676,7 +1010,10 @@ fn evaluate_authorizer_with_error_diagnostics(
         response.diagnostics().reason().count()
     };
     CedarErrorDiagnostics {
-        response: response_from_decision(response.decision()),
+        response: response_from_decision_and_errors(
+            response.decision(),
+            !evaluation_errors.is_empty(),
+        ),
         determining_policy_count,
         evaluation_errors,
     }
@@ -698,9 +1035,12 @@ pub(crate) fn evaluate_authorizer_with_diagnostics(
         .diagnostics()
         .errors()
         .map(error_category)
-        .collect();
+        .collect::<Vec<_>>();
     InternalEvaluationResult {
-        response: response_from_decision(response.decision()),
+        response: response_from_decision_and_errors(
+            response.decision(),
+            !evaluation_errors.is_empty(),
+        ),
         determining_policy_ids,
         evaluation_errors,
     }
@@ -730,11 +1070,41 @@ fn error_category(error: &AuthorizationError) -> CedarEvaluationErrorCategory {
     }
 }
 
-fn response_from_decision(decision: Decision) -> EvaluationResponse {
+fn response_from_decision_and_errors(
+    decision: Decision,
+    has_evaluation_errors: bool,
+) -> EvaluationResponse {
+    if has_evaluation_errors {
+        return EvaluationResponse::deny_with_reason("policy evaluation error");
+    }
     match decision {
         Decision::Allow => EvaluationResponse::allow(),
         Decision::Deny => EvaluationResponse::deny_with_reason("denied"),
     }
+}
+
+/// Reject request fields whose provenance the Cedar crate cannot establish.
+///
+/// `EvaluationRequest` is also the wire/API model, so its properties and
+/// context are caller-owned by construction.  Feeding those values directly
+/// into a policy would let a caller manufacture ownership, tenancy, public
+/// visibility, or authentication state.  The runtime path must first replace
+/// them with snapshots and typed internal context, then use one of the
+/// explicitly trusted preparation functions below.
+fn validate_untrusted_request(request: &EvaluationRequest) -> Result<(), CedarError> {
+    if request.subject.properties.is_some()
+        || request.resource.properties.is_some()
+        || request.context.is_some()
+        || request.jwt_context.is_some()
+        || request.session_context.is_some()
+        || request.token_context.is_some()
+    {
+        return Err(CedarError::evaluation(
+            "caller-owned authorization properties or context require trusted authorization \
+             enrichment",
+        ));
+    }
+    Ok(())
 }
 
 fn build_entities_and_context_ref_with_parents(
@@ -799,6 +1169,22 @@ fn build_entities_and_context_owned_with_parents(
         .map(|ctx| ctx.attributes)
         .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
     remove_parent_keys_from_context(&mut context_attrs);
+    if internal_context.is_some() {
+        // The wire/API request is not an authority for arbitrary Cedar
+        // context.  Typed internal context is the only context shape emitted
+        // by generated authorization actions, so discard generic caller
+        // attributes when the trusted runtime path is used.  A future
+        // environmental context must arrive through an explicit typed
+        // argument rather than being smuggled through `EvaluationRequest`.
+        // Run the normal conversion once so null and unsupported object
+        // values still fail closed even though valid generic fields are
+        // discarded. Non-object wire context is intentionally normalized by
+        // `context_from_value` when typed internal context is present.
+        if matches!(&context_attrs, serde_json::Value::Object(_)) {
+            let _ = context_from_value(context_attrs.clone(), None)?;
+        }
+        context_attrs = serde_json::Value::Object(Default::default());
+    }
     let context = context_from_value(context_attrs, internal_context)?;
 
     let principal_uid = match request_uids {
@@ -884,14 +1270,15 @@ fn context_from_value(
     context: serde_json::Value,
     internal_context: Option<CedarInternalContext>,
 ) -> Result<Context, String> {
+    validate_json_value(&context, 0)?;
     let mut map = match context {
         serde_json::Value::Object(map) => map,
         _ if internal_context.is_some() => serde_json::Map::new(),
         _ => return Err("context must be an object".to_string()),
     };
-    if internal_context.is_some() {
-        map.remove(CONTEXT_INTERNAL_KEY);
-    }
+    // `_authz` is reserved for the typed internal context below. Never let an
+    // untyped request context manufacture token or step-up state.
+    map.remove(CONTEXT_INTERNAL_KEY);
     if map.is_empty() && internal_context.is_none() {
         return Ok(Context::empty());
     }
@@ -1012,13 +1399,14 @@ fn context_from_attrs_ref(context_attrs: Option<&serde_json::Value>) -> Result<C
     let Some(map) = context_attrs.as_object() else {
         return Err("context must be an object".to_string());
     };
+    validate_json_value(context_attrs, 0)?;
     if map.is_empty() {
         return Ok(Context::empty());
     }
 
     let mut pairs = Vec::with_capacity(map.len());
     for (key, value) in map {
-        if key == "subject_parents" || key == "resource_parents" {
+        if key == "subject_parents" || key == "resource_parents" || key == CONTEXT_INTERNAL_KEY {
             continue;
         }
         pairs.push((key.clone(), restricted_expr_from_value_ref(value)?));
@@ -1033,6 +1421,7 @@ fn context_from_attrs_ref(context_attrs: Option<&serde_json::Value>) -> Result<C
 fn restricted_attrs_from_map(
     map: serde_json::Map<String, serde_json::Value>,
 ) -> Result<Vec<(String, RestrictedExpression)>, String> {
+    validate_json_object(&map, 0)?;
     let mut attrs = Vec::with_capacity(map.len());
     for (key, value) in map {
         attrs.push((key, restricted_expr_from_value(value)?));
@@ -1043,11 +1432,54 @@ fn restricted_attrs_from_map(
 fn restricted_attrs_from_map_ref(
     map: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Vec<(String, RestrictedExpression)>, String> {
+    validate_json_object(map, 0)?;
     let mut attrs = Vec::with_capacity(map.len());
     for (key, value) in map {
         attrs.push((key.clone(), restricted_expr_from_value_ref(value)?));
     }
     Ok(attrs)
+}
+
+fn validate_json_value(value: &serde_json::Value, depth: usize) -> Result<(), String> {
+    if depth > MAX_CONTEXT_NESTING {
+        return Err(format!(
+            "JSON context nesting exceeds maximum of {MAX_CONTEXT_NESTING}"
+        ));
+    }
+    match value {
+        serde_json::Value::String(value) if value.len() > MAX_CONTEXT_STRING_BYTES => Err(format!(
+            "JSON context string exceeds maximum of {MAX_CONTEXT_STRING_BYTES} bytes"
+        )),
+        serde_json::Value::Array(values) => {
+            if values.len() > MAX_CONTEXT_COLLECTION_ITEMS {
+                return Err(format!(
+                    "JSON context collection exceeds maximum of {MAX_CONTEXT_COLLECTION_ITEMS} \
+                     items"
+                ));
+            }
+            for value in values {
+                validate_json_value(value, depth + 1)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(map) => validate_json_object(map, depth),
+        _ => Ok(()),
+    }
+}
+
+fn validate_json_object(
+    map: &serde_json::Map<String, serde_json::Value>,
+    depth: usize,
+) -> Result<(), String> {
+    if map.len() > MAX_CONTEXT_COLLECTION_ITEMS {
+        return Err(format!(
+            "JSON context object exceeds maximum of {MAX_CONTEXT_COLLECTION_ITEMS} fields"
+        ));
+    }
+    for value in map.values() {
+        validate_json_value(value, depth + 1)?;
+    }
+    Ok(())
 }
 
 fn restricted_expr_from_value(value: serde_json::Value) -> Result<RestrictedExpression, String> {

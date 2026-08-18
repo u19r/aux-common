@@ -1,6 +1,6 @@
 use std::{
     io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -20,8 +20,9 @@ use crate::{
         DEFAULT_MAX_CONTENT_LENGTH_BYTES, DEFAULT_MAX_DNS_ADDRESSES, DEFAULT_MAX_REDIRECTS,
         DEFAULT_MAX_RESPONSE_LENGTH_BYTES, DEFAULT_TENANT_CONNECT_TIMEOUT,
         DEFAULT_TENANT_REQUEST_TIMEOUT, REDIRECT_BLOCKED_HOST_MISMATCH,
-        REDIRECT_BLOCKED_METHOD_CHANGE, REDIRECT_BLOCKED_TOO_MANY, SSRF_BLOCKED_DNS_EMPTY,
-        SSRF_BLOCKED_DNS_FAILURE, SSRF_BLOCKED_DOMAIN_NOT_ALLOWLISTED, SSRF_BLOCKED_FRAGMENT,
+        REDIRECT_BLOCKED_METHOD_CHANGE, REDIRECT_BLOCKED_SCHEME_CHANGE, REDIRECT_BLOCKED_TOO_MANY,
+        SSRF_BLOCKED_DNS_EMPTY, SSRF_BLOCKED_DNS_FAILURE, SSRF_BLOCKED_DNS_TIMEOUT,
+        SSRF_BLOCKED_DOMAIN_NOT_ALLOWLISTED, SSRF_BLOCKED_FRAGMENT, SSRF_BLOCKED_HOST_HEADER,
         SSRF_BLOCKED_IP_LITERAL, SSRF_BLOCKED_MISSING_HOST, SSRF_BLOCKED_PORT,
         SSRF_BLOCKED_RESERVED_IP, SSRF_BLOCKED_SCHEME, SSRF_BLOCKED_USERINFO,
     },
@@ -198,6 +199,7 @@ impl TenantHttpClientBuilder {
             allowed_ports: self.config.allowed_ports.clone(),
             max_dns_addresses: self.config.max_dns_addresses,
             allow_loopback_ips: self.config.allow_loopback_ips,
+            dns_timeout: self.config.timeout,
         };
         let client = reqwest::Client::builder()
             .timeout(self.config.timeout)
@@ -205,7 +207,9 @@ impl TenantHttpClientBuilder {
             .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(SsrfDnsResolver::new(ssrf_config.clone()))
             .build()
-            .map_err(|err| HttpRequestError::Build { source: err })?;
+            .map_err(|err| HttpRequestError::Build {
+                source: err.without_url(),
+            })?;
 
         let http = HttpClient::with_client(client, self.retry);
         let ssrf = SsrfProtector::new(ssrf_config);
@@ -260,13 +264,18 @@ impl TenantHttpClient {
     }
 
     pub async fn execute_request(&self, builder: RequestBuilder) -> Result<HttpResponse> {
-        let request = builder
-            .build()
-            .map_err(|err| HttpRequestError::Build { source: err })?;
+        let request = builder.build().map_err(|err| HttpRequestError::Build {
+            source: err.without_url(),
+        })?;
         self.execute(request).await
     }
 
     pub async fn execute(&self, request: Request) -> Result<HttpResponse> {
+        if request.headers().contains_key(reqwest::header::HOST) {
+            return Err(HttpRequestError::SsrfBlocked {
+                reason: SSRF_BLOCKED_HOST_HEADER,
+            });
+        }
         validate_request_size(&request, self.config.max_content_length)?;
         let mut current = request;
         let mut redirects = 0usize;
@@ -325,10 +334,13 @@ impl TenantHttpClient {
                 .ok_or(HttpRequestError::RequestNotCloneable)?;
             *next_request.url_mut() = next_url.clone();
 
-            if !same_host(&url, &next_url) {
-                return Err(HttpRequestError::RedirectBlocked {
-                    reason: REDIRECT_BLOCKED_HOST_MISMATCH,
-                });
+            if !same_origin(&url, &next_url) {
+                let reason = if !same_host_and_port(&url, &next_url) {
+                    REDIRECT_BLOCKED_HOST_MISMATCH
+                } else {
+                    REDIRECT_BLOCKED_SCHEME_CHANGE
+                };
+                return Err(HttpRequestError::RedirectBlocked { reason });
             }
 
             current = next_request;
@@ -452,6 +464,7 @@ pub(crate) struct SsrfProtectionConfig {
     pub(crate) allowed_ports: Vec<u16>,
     pub(crate) max_dns_addresses: usize,
     pub(crate) allow_loopback_ips: bool,
+    pub(crate) dns_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -497,12 +510,12 @@ impl Resolve for TokioDnsResolver {
 }
 
 #[derive(Clone)]
-struct SsrfProtector {
+pub(crate) struct SsrfProtector {
     config: SsrfProtectionConfig,
 }
 
 impl SsrfProtector {
-    fn new(config: SsrfProtectionConfig) -> Self {
+    pub(crate) fn new(config: SsrfProtectionConfig) -> Self {
         Self { config }
     }
 
@@ -540,15 +553,28 @@ impl SsrfProtector {
         Ok(())
     }
 
-    async fn resolve_and_validate(&self, url: &Url) -> Result<()> {
+    pub(crate) async fn resolve_and_validate(&self, url: &Url) -> Result<()> {
         self.validate_url_syntax(url)?;
         let host = url.host_str().ok_or(HttpRequestError::SsrfBlocked {
             reason: SSRF_BLOCKED_MISSING_HOST,
         })?;
         let port = url.port_or_known_default().unwrap_or(DEFAULT_HTTPS_PORT);
 
-        let mut addrs = lookup_host((host, port))
+        // Tokio's zero-duration timeout is allowed to poll an immediately
+        // ready future once before observing the deadline.  Treat a zero DNS
+        // budget as an explicit fail-closed configuration so a local cache or
+        // resolver cannot bypass the caller's safety boundary.
+        if self.config.dns_timeout.is_zero() {
+            return Err(HttpRequestError::SsrfBlocked {
+                reason: SSRF_BLOCKED_DNS_TIMEOUT,
+            });
+        }
+
+        let mut addrs = tokio::time::timeout(self.config.dns_timeout, lookup_host((host, port)))
             .await
+            .map_err(|_| HttpRequestError::SsrfBlocked {
+                reason: SSRF_BLOCKED_DNS_TIMEOUT,
+            })?
             .map_err(|_| HttpRequestError::SsrfBlocked {
                 reason: SSRF_BLOCKED_DNS_FAILURE,
             })?
@@ -608,18 +634,36 @@ pub(crate) fn request_body_len(request: &Request) -> Option<usize> {
     {
         return Some(bytes.len());
     }
-    request
-        .headers()
-        .get(reqwest::header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok())
+
+    // A streaming body has no inspectable byte length at this boundary.  Do
+    // not trust a caller-supplied Content-Length: reqwest/hyper will enforce
+    // framing only after this preflight has already decided whether dispatch
+    // is allowed, so a forged smaller header would otherwise bypass the
+    // tenant's configured request budget.
+    None
 }
 
 pub(crate) fn is_blocked_ip(ip: IpAddr, allow_loopback_ips: bool) -> bool {
+    if let IpAddr::V6(ipv6) = ip {
+        if let Some(ipv4) = ipv6.to_ipv4_mapped() {
+            return is_blocked_ip(IpAddr::V4(ipv4), allow_loopback_ips);
+        }
+        if let Some(ipv4) = well_known_nat64_ipv4(ipv6) {
+            return is_blocked_ip(IpAddr::V4(ipv4), allow_loopback_ips);
+        }
+    }
     if allow_loopback_ips && ip.is_loopback() {
         return false;
     }
     reserved_ip_ranges().iter().any(|range| range.contains(&ip))
+}
+
+fn well_known_nat64_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let segments = ip.segments();
+    (segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0]).then(|| {
+        let octets = ip.octets();
+        Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15])
+    })
 }
 
 pub(crate) fn match_allowlisted_domain<'a>(
@@ -654,9 +698,13 @@ pub(crate) fn match_allowlisted_domain<'a>(
     best
 }
 
-pub(crate) fn same_host(left: &Url, right: &Url) -> bool {
+fn same_host_and_port(left: &Url, right: &Url) -> bool {
     left.host_str() == right.host_str()
         && left.port_or_known_default() == right.port_or_known_default()
+}
+
+pub(crate) fn same_origin(left: &Url, right: &Url) -> bool {
+    same_host_and_port(left, right) && left.scheme() == right.scheme()
 }
 
 fn reserved_ip_ranges() -> &'static [IpNet] {
@@ -689,6 +737,11 @@ const RESERVED_IP_RANGES: &[&str] = &[
     "::1/128",
     "100::/64",
     "2001:db8::/32",
+    // 6to4 and Teredo tunnel IPv4 addresses through globally routable IPv6.
+    // Treat their embedded private/reserved destinations as untrusted rather
+    // than relying on the platform's tunnel configuration.
+    "2001::/32",
+    "2002::/16",
     "fc00::/7",
     "fe80::/10",
     "ff00::/8",

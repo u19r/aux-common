@@ -5,6 +5,8 @@ use std::{
     sync::{Arc, RwLock},
     time::Duration,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use std::{sync::Mutex, time::Instant};
 
 #[cfg(not(target_arch = "wasm32"))]
 use http_request::{HttpClient, Url};
@@ -16,18 +18,33 @@ use jsonwebtoken::{
 use lru_ttl_cache::{CacheConfig, FetchingLruTtlCache, arc_fetch_fn};
 
 use crate::{
-    JwtDecodeError, JwtDecodeErrorKind, Result, SignatureAlgorithm, json::JsonDocument,
-    key_policy::KeyPolicy,
+    JwtDecodeError, JwtDecodeErrorKind, Result, SignatureAlgorithm,
+    json::JsonDocument,
+    key_policy::{KeyPolicy, MIN_HMAC_KEY_BYTES},
 };
 
-#[derive(Debug, Clone)]
+pub(crate) const MAX_JWKS_DOCUMENT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_JWKS_KEYS: usize = 1024;
+
+#[derive(Clone)]
 pub struct JwksDocument {
     keys: Arc<JwkSet>,
     decoding_keys: Arc<RwLock<HashMap<String, DecodingKey>>>,
 }
 
+impl std::fmt::Debug for JwksDocument {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwksDocument")
+            .field("key_count", &self.keys.keys.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl JwksDocument {
     pub fn from_json_str(json: &str) -> Result<Self> {
+        if json.len() > MAX_JWKS_DOCUMENT_BYTES {
+            return Err(JwtDecodeError::new(JwtDecodeErrorKind::JwksParse));
+        }
         JsonDocument::reject_duplicate_members(json.as_bytes())
             .map_err(|_| JwtDecodeError::new(JwtDecodeErrorKind::JwksParse))?;
         let keys = serde_json::from_str::<JwkSet>(json)
@@ -96,6 +113,9 @@ impl JwksDocument {
         if jwks.keys.is_empty() {
             return Err(JwtDecodeError::new(JwtDecodeErrorKind::JwksParse));
         }
+        if jwks.keys.len() > MAX_JWKS_KEYS {
+            return Err(JwtDecodeError::new(JwtDecodeErrorKind::JwksParse));
+        }
 
         for key in &jwks.keys {
             if key.common.key_id.as_deref().is_some_and(str::is_empty) {
@@ -107,12 +127,26 @@ impl JwksDocument {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum JwksSource {
     Jwks(Arc<JwksDocument>),
     LocalSymmetric(LocalSymmetricKey),
     #[cfg(not(target_arch = "wasm32"))]
     Url(Box<RemoteJwksSource>),
+}
+
+impl std::fmt::Debug for JwksSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            Self::Jwks(_) => "static_jwks",
+            Self::LocalSymmetric(_) => "local_symmetric",
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Url(_) => "remote_url",
+        };
+        f.debug_struct("JwksSource")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
 }
 
 impl JwksSource {
@@ -126,15 +160,6 @@ impl JwksSource {
     pub fn url(url: impl AsRef<str>) -> Result<Self> {
         Ok(Self::Url(Box::new(RemoteJwksSource::new(
             JwksUrl::parse_https(url.as_ref())?,
-            JwksCachePolicy::default(),
-            HttpClient::new().map_err(|_| JwtDecodeError::new(JwtDecodeErrorKind::JwksFetch))?,
-        ))))
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn insecure_test_url(url: impl AsRef<str>) -> Result<Self> {
-        Ok(Self::Url(Box::new(RemoteJwksSource::new(
-            JwksUrl::parse_for_tests(url.as_ref())?,
             JwksCachePolicy::default(),
             HttpClient::new().map_err(|_| JwtDecodeError::new(JwtDecodeErrorKind::JwksFetch))?,
         ))))
@@ -191,6 +216,14 @@ impl JwksSource {
         Ok(key)
     }
 
+    pub(crate) fn allows_symmetric_jwks(&self) -> bool {
+        match self {
+            Self::Jwks(_) | Self::LocalSymmetric(_) => true,
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Url(_) => false,
+        }
+    }
+
     pub fn invalidate_issuer(&self, issuer: &str) {
         #[cfg(not(target_arch = "wasm32"))]
         if let Self::Url(source) = self {
@@ -205,18 +238,33 @@ impl JwksSource {
 pub struct LocalSymmetricKey {
     key_id: String,
     decoding_key: DecodingKey,
+    secret_len: usize,
 }
 
 impl LocalSymmetricKey {
     fn new(key_id: String, secret: Vec<u8>) -> Result<Self> {
-        if key_id.is_empty() || secret.is_empty() {
+        if key_id.is_empty() || secret.len() < MIN_HMAC_KEY_BYTES {
             return Err(JwtDecodeError::new(JwtDecodeErrorKind::InvalidKey));
         }
         let decoding_key = DecodingKey::from_secret(&secret);
         Ok(Self {
             key_id,
             decoding_key,
+            secret_len: secret.len(),
         })
+    }
+
+    pub(crate) fn validate_for_algorithm(&self, algorithm: SignatureAlgorithm) -> Result<()> {
+        let minimum = match algorithm {
+            SignatureAlgorithm::HS256 => MIN_HMAC_KEY_BYTES,
+            SignatureAlgorithm::HS384 => 48,
+            SignatureAlgorithm::HS512 => 64,
+            _ => return Err(JwtDecodeError::new(JwtDecodeErrorKind::InvalidKey)),
+        };
+        if self.secret_len < minimum {
+            return Err(JwtDecodeError::new(JwtDecodeErrorKind::InvalidKey));
+        }
+        Ok(())
     }
 
     pub(crate) fn key_id(&self) -> &str {
@@ -236,7 +284,7 @@ impl std::fmt::Debug for LocalSymmetricKey {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[cfg(not(target_arch = "wasm32"))]
 pub struct JwksUrl {
     url: Url,
@@ -247,13 +295,19 @@ impl JwksUrl {
     pub fn parse_https(value: &str) -> Result<Self> {
         let url =
             Url::parse(value).map_err(|_| JwtDecodeError::new(JwtDecodeErrorKind::JwksFetch))?;
-        if url.scheme() == "https" {
+        if url.scheme() == "https"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+        {
             return Ok(Self { url });
         }
         Err(JwtDecodeError::new(JwtDecodeErrorKind::JwksFetch))
     }
 
-    pub fn parse_for_tests(value: &str) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn parse_for_tests(value: &str) -> Result<Self> {
         let url =
             Url::parse(value).map_err(|_| JwtDecodeError::new(JwtDecodeErrorKind::JwksFetch))?;
         Ok(Self { url })
@@ -261,6 +315,16 @@ impl JwksUrl {
 
     fn as_str(&self) -> &str {
         self.url.as_str()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for JwksUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JwksUrl")
+            .field("url", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -282,7 +346,10 @@ impl Default for JwksCachePolicy {
             refresh_ttl: Duration::from_secs(240),
             stale_ttl: Duration::from_secs(60),
             max_body_size: 1024 * 1024,
-            stale_on_fetch_error: true,
+            // Fail closed when the issuer cannot be refreshed. Callers that
+            // have an explicit bounded availability policy must opt in to
+            // stale-on-error and set a finite stale_ttl.
+            stale_on_fetch_error: false,
         }
     }
 }
@@ -293,6 +360,23 @@ pub struct RemoteJwksSource {
     url: JwksUrl,
     cache: FetchingLruTtlCache<JwksCacheKey, Arc<JwksDocument>, JwtDecodeError>,
     policy: JwksCachePolicy,
+    unknown_kid_refreshes: Arc<Mutex<HashMap<String, Instant>>>,
+    invalidation_generations: Arc<Mutex<InvalidationGenerations>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const UNKNOWN_KID_REFRESH_COOLDOWN: Duration = Duration::from_secs(1);
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_UNKNOWN_KID_REFRESH_COOLDOWNS: usize = 256;
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_INVALIDATION_GENERATIONS: usize = 256;
+
+#[derive(Default)]
+#[cfg(not(target_arch = "wasm32"))]
+struct InvalidationGenerations {
+    per_issuer: HashMap<String, u64>,
+    default_generation: u64,
+    next_generation: u64,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -326,7 +410,13 @@ impl RemoteJwksSource {
                 .with_fetch(fetch)
                 .with_refresh_ttl(policy.refresh_ttl),
         );
-        Self { url, cache, policy }
+        Self {
+            url,
+            cache,
+            policy,
+            unknown_kid_refreshes: Arc::new(Mutex::new(HashMap::new())),
+            invalidation_generations: Arc::new(Mutex::new(InvalidationGenerations::default())),
+        }
     }
 
     async fn document_for_issuer(&self, issuer: &str) -> Result<Arc<JwksDocument>> {
@@ -342,6 +432,9 @@ impl RemoteJwksSource {
     }
 
     async fn refresh_document_for_issuer(&self, issuer: &str) -> Result<Arc<JwksDocument>> {
+        if !self.allow_unknown_kid_refresh(issuer) {
+            return self.document_for_issuer(issuer).await;
+        }
         let key = self.cache_key(issuer);
         self.cache.remove(&key);
         self.cache
@@ -351,13 +444,57 @@ impl RemoteJwksSource {
     }
 
     pub fn invalidate_issuer(&self, issuer: &str) {
-        self.cache.remove(&self.cache_key(issuer));
+        let previous_key = self.cache_key(issuer);
+        if let Ok(mut generations) = self.invalidation_generations.lock() {
+            generations.next_generation = generations.next_generation.saturating_add(1);
+            let generation = generations.next_generation;
+            if generations.per_issuer.len() >= MAX_INVALIDATION_GENERATIONS
+                && !generations.per_issuer.contains_key(issuer)
+            {
+                generations.per_issuer.clear();
+                generations.default_generation = generation;
+            }
+            generations.per_issuer.insert(issuer.to_owned(), generation);
+        }
+        self.cache.remove(&previous_key);
+        if let Ok(mut refreshes) = self.unknown_kid_refreshes.lock() {
+            refreshes.remove(issuer);
+        }
+    }
+
+    fn allow_unknown_kid_refresh(&self, issuer: &str) -> bool {
+        let Ok(mut refreshes) = self.unknown_kid_refreshes.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        if refreshes.get(issuer).is_some_and(|until| *until > now) {
+            return false;
+        }
+        if refreshes.len() >= MAX_UNKNOWN_KID_REFRESH_COOLDOWNS {
+            refreshes.clear();
+        }
+        let refresh_until = now.checked_add(UNKNOWN_KID_REFRESH_COOLDOWN).unwrap_or(now);
+        refreshes.insert(issuer.to_owned(), refresh_until);
+        true
     }
 
     fn cache_key(&self, issuer: &str) -> JwksCacheKey {
+        let generation = self
+            .invalidation_generations
+            .lock()
+            .ok()
+            .map(|generations| {
+                generations
+                    .per_issuer
+                    .get(issuer)
+                    .copied()
+                    .unwrap_or(generations.default_generation)
+            })
+            .unwrap_or_default();
         JwksCacheKey {
             url: self.url.as_str().to_owned(),
             issuer: issuer.to_owned(),
+            generation,
         }
     }
 }
@@ -367,12 +504,13 @@ impl RemoteJwksSource {
 struct JwksCacheKey {
     url: String,
     issuer: String,
+    generation: u64,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl PartialEq for JwksCacheKey {
     fn eq(&self, other: &Self) -> bool {
-        self.url == other.url && self.issuer == other.issuer
+        self.url == other.url && self.issuer == other.issuer && self.generation == other.generation
     }
 }
 
@@ -381,6 +519,7 @@ impl Hash for JwksCacheKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.url.hash(state);
         self.issuer.hash(state);
+        self.generation.hash(state);
     }
 }
 

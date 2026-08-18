@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use authz_types::{EvaluationRequest, JwtContext, RoleScope, Subject};
 use chrono::{DateTime, Utc};
@@ -6,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
-    AuthzRuntimeError, AuthzRuntimeResult, EffectiveRoleAssignment, ScopeKind, classify_scope,
+    AuthzRuntimeError, AuthzRuntimeResult, EffectiveRoleAssignment, ScopeKind,
+    TrustedAuthorizationContext, classify_scope,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,6 +21,10 @@ pub struct ParentRef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubjectAccessSnapshot {
+    /// Tenant that owns every identity, assignment, relationship, and scope in
+    /// this snapshot.
+    pub tenant_id: String,
+    /// Trusted subject identity and attributes loaded with the access snapshot.
     pub subject: Subject,
     pub assignments: Vec<EffectiveRoleAssignment>,
     pub subject_parents: Vec<ParentRef>,
@@ -36,10 +44,83 @@ impl SubjectAccessSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceAccessSnapshot {
+    /// Tenant that owns this resource and its relationship snapshot.
+    pub tenant_id: String,
     pub resource_type: String,
     pub resource_id: String,
+    /// Trusted resource attributes used for authorization and policy
+    /// evaluation.
+    ///
+    /// Request-supplied resource properties are discarded during enrichment.
+    /// Callers must put every resource attribute needed by a policy in this
+    /// snapshot rather than relying on the lower-trust evaluation request.
+    pub properties: Value,
     pub resource_parents: Vec<ParentRef>,
     pub fetched_at_ms: i64,
+}
+
+/// Bounds the age and clock skew accepted for authorization snapshots.
+///
+/// Snapshots contain identity, relationship, and resource attributes that are
+/// security decisions. A caller must not be able to replay an old snapshot
+/// indefinitely, nor make a future-dated snapshot look fresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotFreshnessPolicy {
+    max_age: Duration,
+    max_future_skew: Duration,
+}
+
+impl SnapshotFreshnessPolicy {
+    #[must_use]
+    pub const fn new(max_age: Duration, max_future_skew: Duration) -> Self {
+        Self {
+            max_age,
+            max_future_skew,
+        }
+    }
+
+    #[must_use]
+    pub const fn max_age(self) -> Duration {
+        self.max_age
+    }
+
+    #[must_use]
+    pub const fn max_future_skew(self) -> Duration {
+        self.max_future_skew
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_tests() -> Self {
+        Self::new(Duration::from_secs(u64::MAX), Duration::from_secs(u64::MAX))
+    }
+
+    fn validate(
+        self,
+        snapshot: &'static str,
+        fetched_at_ms: i64,
+        now_ms: i64,
+    ) -> AuthzRuntimeResult<()> {
+        if fetched_at_ms <= 0 {
+            return Err(AuthzRuntimeError::SnapshotTimestampInvalid { snapshot });
+        }
+        let now_ms = u128::try_from(now_ms).unwrap_or_default();
+        let fetched_at_ms = u128::try_from(fetched_at_ms).unwrap_or_default();
+        let future_skew_ms = self.max_future_skew.as_millis();
+        if fetched_at_ms > now_ms.saturating_add(future_skew_ms) {
+            return Err(AuthzRuntimeError::SnapshotTimestampInvalid { snapshot });
+        }
+        let age_ms = now_ms.saturating_sub(fetched_at_ms);
+        if age_ms > self.max_age.as_millis() {
+            return Err(AuthzRuntimeError::SnapshotStale { snapshot });
+        }
+        Ok(())
+    }
+}
+
+impl Default for SnapshotFreshnessPolicy {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(300), Duration::from_secs(30))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -125,10 +206,45 @@ pub fn build_subject_parent_template(
 
 pub fn enrich_request_with_snapshots(
     tenant_id: &str,
-    mut request: EvaluationRequest,
+    request: EvaluationRequest,
+    trusted_context: &TrustedAuthorizationContext,
     subject_access: &SubjectAccessSnapshot,
     resource_access: &ResourceAccessSnapshot,
 ) -> AuthzRuntimeResult<EnrichedCedarRequest> {
+    enrich_request_with_snapshots_at(
+        tenant_id,
+        request,
+        trusted_context,
+        subject_access,
+        resource_access,
+        Utc::now(),
+        SnapshotFreshnessPolicy::default(),
+    )
+}
+
+pub fn enrich_request_with_snapshots_at(
+    tenant_id: &str,
+    mut request: EvaluationRequest,
+    trusted_context: &TrustedAuthorizationContext,
+    subject_access: &SubjectAccessSnapshot,
+    resource_access: &ResourceAccessSnapshot,
+    now: DateTime<Utc>,
+    freshness: SnapshotFreshnessPolicy,
+) -> AuthzRuntimeResult<EnrichedCedarRequest> {
+    if !trusted_context.matches_subject(&request.subject) {
+        return Err(AuthzRuntimeError::TrustedContextSubjectMismatch);
+    }
+    // The wire-shaped request is not an authentication boundary. Replace all
+    // credential-bearing fields before any role, session, or token-derived
+    // enrichment so this helper is safe for direct callers as well as the
+    // local evaluator.
+    request.jwt_context = trusted_context.jwt_context().cloned();
+    request.session_context = trusted_context.session_context().cloned();
+    request.token_context = trusted_context.token_context().cloned();
+
+    if subject_access.tenant_id != tenant_id || resource_access.tenant_id != tenant_id {
+        return Err(AuthzRuntimeError::TenantSnapshotMismatch);
+    }
     if request.subject.subject_type != subject_access.subject.subject_type
         || request.subject.id != subject_access.subject.id
     {
@@ -139,6 +255,9 @@ pub fn enrich_request_with_snapshots(
     {
         return Err(AuthzRuntimeError::ResourceSnapshotMismatch);
     }
+    let now_ms = now.timestamp_millis();
+    freshness.validate("subject", subject_access.fetched_at_ms, now_ms)?;
+    freshness.validate("resource", resource_access.fetched_at_ms, now_ms)?;
 
     let mut subject_parents = subject_access.subject_parents.clone();
     let mut resource_parents = resource_access.resource_parents.clone();
@@ -147,10 +266,13 @@ pub fn enrich_request_with_snapshots(
         .get(request.resource.resource_type.as_str())
         .is_some_and(|resource_ids| resource_ids.contains(request.resource.id.as_str()));
 
-    if let Some(jwt_ctx) = request.jwt_context.as_ref() {
+    if let Some(jwt_ctx) = request.jwt_context.as_ref()
+        && jwt_ctx.is_complete()
+    {
         add_jwt_role_parents(
             jwt_ctx,
             &request,
+            &resource_access.properties,
             tenant_id,
             &mut subject_parents,
             &mut has_resource_scoped_assignment,
@@ -165,16 +287,16 @@ pub fn enrich_request_with_snapshots(
         .take()
         .map(|context| context.attributes)
         .unwrap_or_else(|| Value::Object(Map::new()));
-    let mut subject_props = request
+    // The request carries the caller's presentation of the subject/resource.
+    // Snapshot attributes are the authority for policy and scope decisions;
+    // retaining request properties here would let a caller forge org,
+    // ownership, sharing, group, or public-read state.
+    let mut subject_props = subject_access
         .subject
         .properties
-        .take()
+        .clone()
         .unwrap_or_else(|| Value::Object(Map::new()));
-    let mut resource_props = request
-        .resource
-        .properties
-        .take()
-        .unwrap_or_else(|| Value::Object(Map::new()));
+    let mut resource_props = resource_access.properties.clone();
 
     inject_org_parent_property(&subject_parents, &mut subject_props);
     inject_org_parent_property(&resource_parents, &mut resource_props);
@@ -204,11 +326,15 @@ pub fn enrich_request_with_snapshots(
 fn add_jwt_role_parents(
     jwt_ctx: &JwtContext,
     request: &EvaluationRequest,
+    resource_properties: &Value,
     tenant_id: &str,
     subject_parents: &mut Vec<ParentRef>,
     has_resource_scoped_assignment: &mut bool,
 ) {
     for role in &jwt_ctx.roles {
+        if !jwt_role_scope_applies(&role.scope, request, resource_properties) {
+            continue;
+        }
         subject_parents.push(ParentRef {
             ref_type: "role".to_string(),
             id: role.role_id.clone(),
@@ -242,6 +368,30 @@ fn add_jwt_role_parents(
     }
 }
 
+fn jwt_role_scope_applies(
+    scope: &RoleScope,
+    request: &EvaluationRequest,
+    resource_properties: &Value,
+) -> bool {
+    match scope {
+        RoleScope::Global => true,
+        RoleScope::Org { org_id } => {
+            resource_properties
+                .as_object()
+                .and_then(|properties| properties.get("org_id"))
+                .and_then(Value::as_str)
+                == Some(org_id.as_str())
+        }
+        RoleScope::Resource {
+            resource_type,
+            resource_id,
+        } => {
+            resource_type == &request.resource.resource_type && resource_id == &request.resource.id
+        }
+        RoleScope::Group { .. } => false,
+    }
+}
+
 fn inject_org_parent_property(parents: &[ParentRef], properties: &mut Value) {
     let Some(org_parent) = parents
         .iter()
@@ -250,8 +400,7 @@ fn inject_org_parent_property(parents: &[ParentRef], properties: &mut Value) {
         return;
     };
     if let Value::Object(map) = properties {
-        map.entry("org_id".to_string())
-            .or_insert(Value::String(org_parent.id.clone()));
+        map.insert("org_id".to_string(), Value::String(org_parent.id.clone()));
     }
 }
 

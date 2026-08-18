@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -12,10 +13,10 @@ use tracing::{debug, warn};
 
 use crate::{
     constants::{
-        DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_ERROR_BODY_LENGTH_BYTES, DEFAULT_REQUEST_TIMEOUT,
-        LABEL_METHOD, LABEL_OUTCOME, LABEL_STATUS_CLASS, OUTCOME_ERROR, OUTCOME_RETRY,
-        OUTCOME_SUCCESS, STATUS_CLASS_2XX, STATUS_CLASS_3XX, STATUS_CLASS_4XX, STATUS_CLASS_5XX,
-        STATUS_CLASS_ERROR,
+        DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_ERROR_BODY_LENGTH_BYTES,
+        DEFAULT_MAX_RESPONSE_LENGTH_BYTES, DEFAULT_REQUEST_TIMEOUT, LABEL_METHOD, LABEL_OUTCOME,
+        LABEL_STATUS_CLASS, OUTCOME_ERROR, OUTCOME_RETRY, OUTCOME_SUCCESS, STATUS_CLASS_2XX,
+        STATUS_CLASS_3XX, STATUS_CLASS_4XX, STATUS_CLASS_5XX, STATUS_CLASS_ERROR,
     },
     error::{HttpRequestError, HttpRequestErrorKind, Result},
     retry::RetryConfig,
@@ -25,6 +26,16 @@ pub type TransportFuture = BoxFuture<'static, Result<HttpResponse>>;
 
 pub trait Transport: Send + Sync + std::fmt::Debug {
     fn send(&self, request: Request) -> TransportFuture;
+
+    /// Reports whether this transport guarantees that it will not follow
+    /// HTTP redirects.
+    ///
+    /// Custom transports default to `false`; callers must opt in only when
+    /// the implementation enforces the same no-redirect boundary as the
+    /// built-in reqwest transport.
+    fn redirects_disabled(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,9 +60,13 @@ impl Transport for ReqwestTransport {
             Ok(HttpResponse::from_reqwest(response))
         })
     }
+
+    fn redirects_disabled(&self) -> bool {
+        true
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpClient {
     client: Client,
     retry: RetryConfig,
@@ -59,11 +74,48 @@ pub struct HttpClient {
     redirects_disabled: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct RequestAttemptDiagnostics<'a> {
+    host: &'a str,
+    path_length: usize,
+    query_present: bool,
+}
+
+pub(crate) fn request_attempt_diagnostics(url: &Url) -> RequestAttemptDiagnostics<'_> {
+    RequestAttemptDiagnostics {
+        host: url.host_str().unwrap_or_default(),
+        path_length: url.path().len(),
+        query_present: url.query().is_some(),
+    }
+}
+
 pub struct HttpClientBuilder {
     builder: reqwest::ClientBuilder,
     retry: RetryConfig,
     transport: Option<Arc<dyn Transport>>,
+}
+
+impl fmt::Debug for HttpClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpClient")
+            .field("client", &"[REDACTED]")
+            .field("retry", &self.retry)
+            .field("transport", &"[REDACTED]")
+            .field("redirects_disabled", &self.redirects_disabled)
+            .finish()
+    }
+}
+
+impl fmt::Debug for HttpClientBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpClientBuilder")
+            .field("builder", &"[REDACTED]")
+            .field("retry", &self.retry)
+            .field("transport_configured", &self.transport.is_some())
+            .finish()
+    }
 }
 
 impl HttpClientBuilder {
@@ -103,15 +155,18 @@ impl HttpClientBuilder {
             .builder
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|err| HttpRequestError::Build { source: err })?;
+            .map_err(|err| HttpRequestError::Build {
+                source: err.without_url(),
+            })?;
         let transport = self
             .transport
             .unwrap_or_else(|| Arc::new(ReqwestTransport::new(client.clone())));
+        let redirects_disabled = transport.redirects_disabled();
         Ok(HttpClient {
             client,
             retry: self.retry,
             transport,
-            redirects_disabled: true,
+            redirects_disabled,
         })
     }
 }
@@ -205,7 +260,12 @@ impl HttpClient {
         let response = self.get(url).send().await?;
         let response = response.error_for_status_with_body().await?;
         let ttl = cache_ttl_from_headers(response.headers(), fallback_ttl);
-        let expires_at = Instant::now() + ttl;
+        let expires_at =
+            Instant::now()
+                .checked_add(ttl)
+                .ok_or(HttpRequestError::CacheTtlOverflow {
+                    seconds: ttl.as_secs(),
+                })?;
         let value = response.json().await?;
         Ok(CachedResponse { value, expires_at })
     }
@@ -231,9 +291,9 @@ impl HttpClient {
     }
 
     pub async fn execute_request(&self, builder: RequestBuilder) -> Result<HttpResponse> {
-        let request = builder
-            .build()
-            .map_err(|err| HttpRequestError::Build { source: err })?;
+        let request = builder.build().map_err(|err| HttpRequestError::Build {
+            source: err.without_url(),
+        })?;
         self.execute(request).await
     }
 
@@ -242,8 +302,7 @@ impl HttpClient {
         let method = request.method().clone();
         let method_label = method.as_str().to_string();
         let url = request.url().clone();
-        let host = url.host_str().unwrap_or_default().to_string();
-        let path = url.path().to_string();
+        let diagnostics = request_attempt_diagnostics(&url);
 
         let can_retry_method = self.retry.should_retry_method(&method);
         let mut attempt: u32 = 0;
@@ -277,8 +336,9 @@ impl HttpClient {
             debug!(
                 attempt,
                 method = %method,
-                host = host.as_str(),
-                path = path.as_str(),
+                host = diagnostics.host,
+                path_length = diagnostics.path_length,
+                query_present = diagnostics.query_present,
                 "http request attempt"
             );
 
@@ -349,7 +409,7 @@ impl HttpClient {
                         warn!(
                             attempt,
                             method = %method,
-                            error = %error,
+                            error_kind = ?error.kind(),
                             delay_ms = delay.as_millis(),
                             "http request retrying after error"
                         );
@@ -369,10 +429,19 @@ impl HttpClient {
     }
 }
 
-#[derive(Debug)]
 pub struct HttpRequestBuilder {
     client: HttpClient,
     inner: RequestBuilder,
+}
+
+impl fmt::Debug for HttpRequestBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpRequestBuilder")
+            .field("client", &"[REDACTED]")
+            .field("request", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl HttpRequestBuilder {
@@ -445,9 +514,9 @@ impl HttpRequestBuilder {
     }
 
     pub fn build(self) -> Result<Request> {
-        self.inner
-            .build()
-            .map_err(|err| HttpRequestError::Build { source: err })
+        self.inner.build().map_err(|err| HttpRequestError::Build {
+            source: err.without_url(),
+        })
     }
 
     pub fn try_clone(&self) -> Option<Self> {
@@ -488,7 +557,7 @@ impl HttpResponse {
     pub fn from_reqwest(inner: Response) -> Self {
         Self {
             inner: HttpResponseInner::Reqwest(inner),
-            max_body_size: None,
+            max_body_size: Some(DEFAULT_MAX_RESPONSE_LENGTH_BYTES),
         }
     }
 
@@ -501,7 +570,7 @@ impl HttpResponse {
                 url,
                 body: Bytes::from(body),
             }),
-            max_body_size: None,
+            max_body_size: Some(DEFAULT_MAX_RESPONSE_LENGTH_BYTES),
         }
     }
 
@@ -569,7 +638,15 @@ impl HttpResponse {
         Err(HttpRequestError::HttpStatus { status, body })
     }
 
+    /// Extract the underlying response only when no buffered-body limit is set.
+    ///
+    /// A capped response cannot be converted without discarding its safety
+    /// invariant, so callers must stay on `bytes`, `text`, or `json` (or
+    /// explicitly opt out with `with_max_body_size(None)`).
     pub fn into_reqwest(self) -> Option<Response> {
+        if self.max_body_size.is_some() {
+            return None;
+        }
         match self.inner {
             HttpResponseInner::Reqwest(inner) => Some(inner),
             HttpResponseInner::Mock(_) => None,
