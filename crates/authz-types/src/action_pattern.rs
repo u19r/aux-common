@@ -27,9 +27,9 @@ impl std::fmt::Display for ActionPatternParseError {
             Self::TooLong { field, max_len } => {
                 write!(f, "{field} exceeds max length {max_len}")
             }
-            Self::InvalidCharacter { field, character } => write!(
+            Self::InvalidCharacter { field, .. } => write!(
                 f,
-                "{field} must use lowercase letters, digits, '-', '_' or '.', found '{character}'"
+                "{field} must use lowercase letters, digits, '-', '_' or '.'"
             ),
             Self::InvalidWildcardShape { field } => write!(
                 f,

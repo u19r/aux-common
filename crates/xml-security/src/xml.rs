@@ -374,8 +374,8 @@ pub(crate) fn parse_with_limits(xml: &str, limits: XmlLimits) -> Result<Element,
     let mut root = None;
     let mut element_count = 0;
     for event in reader {
-        let event = event.map_err(|error| XmlSecurityError::Parse {
-            message: error.to_string(),
+        let event = event.map_err(|_| XmlSecurityError::Parse {
+            message: "XML parser rejected the document".to_string(),
         })?;
         match event {
             XmlEvent::StartDocument {

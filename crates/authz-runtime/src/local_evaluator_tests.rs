@@ -1857,7 +1857,7 @@ fn oversized_local_batches_are_rejected_before_evaluation() {
         )
         .expect_err("oversized batches must be bounded");
 
-    assert!(error.to_string().contains("maximum"));
+    assert!(matches!(error, crate::AuthzRuntimeError::Cedar));
 }
 
 #[test]
@@ -2940,7 +2940,7 @@ fn runtime_rejects_bundle_compiled_from_a_different_configuration() {
 
     let error = EvaluationRuntime::build(config_a, &bundle_b)
         .expect_err("a bundle from another configuration must be rejected");
-    assert!(error.to_string().contains("bundle"));
+    assert!(matches!(error, crate::AuthzRuntimeError::Build));
 }
 
 fn assignment(

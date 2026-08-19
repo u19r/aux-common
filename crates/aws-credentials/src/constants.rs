@@ -39,7 +39,6 @@ pub(crate) const AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE: &str =
     "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE";
 pub(crate) const AWS_EC2_METADATA_DISABLED: &str = "AWS_EC2_METADATA_DISABLED";
 
-pub(crate) const AWS_CLI_PROFILE_DEFAULT: &str = "default";
 pub(crate) const HOME: &str = "HOME";
 pub(crate) const AWS_CONFIG_RELATIVE_PATH: &str = ".aws/config";
 pub(crate) const AWS_CREDENTIALS_RELATIVE_PATH: &str = ".aws/credentials";

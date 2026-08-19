@@ -587,9 +587,7 @@ async fn given_repeated_unknown_kids_when_verifying_then_refreshes_are_bounded()
 async fn given_stale_remote_jwks_when_refresh_fails_then_stale_value_is_used() {
     let transport = CountingTransport::from_results(vec![
         Ok(mock_response(jwks())),
-        Err(HttpRequestError::Decode {
-            message: "refresh failed".to_owned(),
-        }),
+        Err(HttpRequestError::Decode),
     ]);
     let attempts = Arc::clone(&transport.attempts);
     let verifier = build_remote_verifier_with_policy(
@@ -619,9 +617,7 @@ async fn given_stale_remote_jwks_when_refresh_fails_then_stale_value_is_used() {
 async fn given_default_remote_jwks_policy_when_refresh_fails_then_rejects_stale_value() {
     let transport = CountingTransport::from_results(vec![
         Ok(mock_response(jwks())),
-        Err(HttpRequestError::Decode {
-            message: "refresh failed".to_owned(),
-        }),
+        Err(HttpRequestError::Decode),
     ]);
     let attempts = Arc::clone(&transport.attempts);
     let verifier = build_remote_verifier_with_policy(

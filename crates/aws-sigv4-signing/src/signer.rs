@@ -108,7 +108,7 @@ impl AwsRequestSigner {
                 .map(|(name, value)| (name.as_str(), value.as_str())),
             body,
         )
-        .map_err(|err| SigningError::PrepareRequest(err.to_string()))?;
+        .map_err(|_| SigningError::PrepareRequest)?;
 
         let mut settings = SigningSettings::default();
         settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
@@ -121,11 +121,11 @@ impl AwsRequestSigner {
             .time(signing_time)
             .settings(settings)
             .build()
-            .map_err(|err| SigningError::Signing(err.to_string()))?
+            .map_err(|_| SigningError::Signing)?
             .into();
 
         let (instructions, _) = sign(signable, &signing_params)
-            .map_err(|err| SigningError::Signing(err.to_string()))?
+            .map_err(|_| SigningError::Signing)?
             .into_parts();
 
         for (name, value) in instructions.headers() {
@@ -205,7 +205,7 @@ impl AwsRequestSigner {
                 .map(|(name, value)| (name.as_str(), value.as_str())),
             body,
         )
-        .map_err(|err| SigningError::PrepareRequest(err.to_string()))?;
+        .map_err(|_| SigningError::PrepareRequest)?;
 
         let mut settings = SigningSettings::default();
         settings.payload_checksum_kind = PayloadChecksumKind::NoHeader;
@@ -220,15 +220,14 @@ impl AwsRequestSigner {
             .time(signing_time)
             .settings(settings)
             .build()
-            .map_err(|err| SigningError::Signing(err.to_string()))?
+            .map_err(|_| SigningError::Signing)?
             .into();
 
         let (instructions, _) = sign(signable, &signing_params)
-            .map_err(|err| SigningError::Signing(err.to_string()))?
+            .map_err(|_| SigningError::Signing)?
             .into_parts();
 
-        let mut url = Url::parse(&uri.to_string())
-            .map_err(|err| SigningError::InvalidUrl(err.to_string()))?;
+        let mut url = Url::parse(&uri.to_string()).map_err(|_| SigningError::InvalidUrl)?;
         if !instructions.params().is_empty() {
             let mut pairs = url.query_pairs_mut();
             for (name, value) in instructions.params() {
@@ -238,7 +237,7 @@ impl AwsRequestSigner {
 
         url.as_str()
             .parse::<Uri>()
-            .map_err(|err| SigningError::InvalidUri(err.to_string()))
+            .map_err(|_| SigningError::InvalidUri)
     }
 }
 

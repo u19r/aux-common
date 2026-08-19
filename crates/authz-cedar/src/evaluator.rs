@@ -78,12 +78,12 @@ impl CedarUidRegistry {
             .map(|subject_type| {
                 let cedar_type = format!("Authz::{}", subject_entity_type(subject_type));
                 let entity_type = EntityTypeName::from_str(&cedar_type)
-                    .map_err(|error| CedarError::evaluation(error.to_string()))?;
+                    .map_err(|_| CedarError::evaluation("subject entity type is invalid"))?;
                 Ok((subject_type, entity_type))
             })
             .collect::<Result<HashMap<_, _>, CedarError>>()?;
         let action_type = EntityTypeName::from_str("Authz::Action")
-            .map_err(|error| CedarError::evaluation(error.to_string()))?;
+            .map_err(|_| CedarError::evaluation("action entity type is invalid"))?;
         let resources = config
             .resource_types
             .iter()
@@ -93,7 +93,7 @@ impl CedarUidRegistry {
                     super::schema_generator::to_pascal_case(&resource.id)
                 );
                 let entity_type = EntityTypeName::from_str(&cedar_type)
-                    .map_err(|error| CedarError::evaluation(error.to_string()))?;
+                    .map_err(|_| CedarError::evaluation("resource entity type is invalid"))?;
                 let actions = resource
                     .actions
                     .iter()
@@ -412,13 +412,13 @@ pub fn parse_policy_sets(bundle: &CompiledBundle) -> Result<ParsedPolicySets, Ce
             )));
         }
         let slice_policy_set = PolicySet::from_json_str(&policy_slice.policies_json)
-            .map_err(|e| CedarError::evaluation(format!("invalid policies json: {e}")))?;
+            .map_err(|_| CedarError::evaluation("invalid policies JSON"))?;
         let entry = policy_sets_by_resource
             .entry(policy_slice.resource_type.as_str())
             .or_default();
         entry
             .merge(&slice_policy_set, false)
-            .map_err(|e| CedarError::evaluation(format!("invalid policies json: {e}")))?;
+            .map_err(|_| CedarError::evaluation("invalid policies JSON"))?;
     }
 
     let mut by_resource_type = HashMap::with_capacity(policy_sets_by_resource.len());
@@ -593,9 +593,8 @@ pub fn validate_bundle_for_config(
         ));
     }
 
-    let expected = crate::compile_policy_bundle(config, bundle.version).map_err(|error| {
-        bundle_integrity_error(format!("cannot compile expected bundle: {error}"))
-    })?;
+    let expected = crate::compile_policy_bundle(config, bundle.version)
+        .map_err(|_| bundle_integrity_error("cannot compile expected bundle"))?;
     let mut actual_manifest = bundle.manifest.clone();
     actual_manifest.compiled_at_ms = None;
     let mut expected_manifest = expected.manifest.clone();
@@ -769,7 +768,7 @@ pub fn prepare_request_from_parts(
     let CedarEntitiesContext { entities, context } = entities_context;
 
     let request = Request::new(principal, action, resource, context, None)
-        .map_err(|e| CedarError::evaluation(e.to_string()))?;
+        .map_err(|_| CedarError::evaluation("Cedar request is invalid"))?;
 
     Ok(PreparedCedarEvaluation {
         resource_type,
@@ -892,7 +891,7 @@ pub fn evaluate_batch_frame_action_with_policy_sets_error_diagnostics(
         prepared.context.clone(),
         None,
     )
-    .map_err(|error| CedarError::evaluation(error.to_string()))?;
+    .map_err(|_| CedarError::evaluation("Cedar request is invalid"))?;
     Ok(evaluate_authorizer_with_error_diagnostics(
         &request,
         policy_set,
@@ -1238,14 +1237,14 @@ fn build_entities_from_converted_inputs(
         principal_parent_uids.clone(),
         [],
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|_| "principal entity is invalid".to_owned())?;
     let resource_entity = Entity::new_with_tags(
         resource_uid,
         resource_attrs,
         resource_parent_uids.clone(),
         [],
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|_| "resource entity is invalid".to_owned())?;
 
     let mut entities = Vec::with_capacity(2 + subject_parents.len() + resource_parents.len());
     entities.push(principal_entity);
@@ -1263,7 +1262,7 @@ fn build_entities_from_converted_inputs(
         entities.push(Entity::new_no_attrs(parent_uid, HashSet::new()));
     }
 
-    Entities::from_entities(entities, None).map_err(|e| e.to_string())
+    Entities::from_entities(entities, None).map_err(|_| "entity collection is invalid".to_owned())
 }
 
 fn context_from_value(
@@ -1292,7 +1291,7 @@ fn context_from_value(
             restricted_expr_from_internal_context(internal_context)?,
         ));
     }
-    Context::from_pairs(pairs).map_err(|e| e.to_string())
+    Context::from_pairs(pairs).map_err(|_| "Cedar context is invalid".to_owned())
 }
 
 fn restricted_expr_from_internal_context(
@@ -1322,7 +1321,7 @@ fn restricted_expr_from_internal_context(
                     RestrictedExpression::new_entity_uid(scope.resource.uid),
                 ),
             ])
-            .map_err(|error| error.to_string())
+            .map_err(|_| "resource scope context is invalid".to_owned())
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -1389,7 +1388,7 @@ fn restricted_expr_from_internal_context(
             RestrictedExpression::new_long(context.session_mfa_age_seconds),
         ),
     ])
-    .map_err(|error| error.to_string())
+    .map_err(|_| "internal Cedar context is invalid".to_owned())
 }
 
 fn context_from_attrs_ref(context_attrs: Option<&serde_json::Value>) -> Result<Context, String> {
@@ -1415,7 +1414,7 @@ fn context_from_attrs_ref(context_attrs: Option<&serde_json::Value>) -> Result<C
         return Ok(Context::empty());
     }
 
-    Context::from_pairs(pairs).map_err(|e| e.to_string())
+    Context::from_pairs(pairs).map_err(|_| "Cedar context is invalid".to_owned())
 }
 
 fn restricted_attrs_from_map(
@@ -1518,7 +1517,8 @@ fn restricted_expr_from_value(value: serde_json::Value) -> Result<RestrictedExpr
             for (key, value) in map {
                 fields.push((key, restricted_expr_from_value(value)?));
             }
-            RestrictedExpression::new_record(fields).map_err(|e| e.to_string())
+            RestrictedExpression::new_record(fields)
+                .map_err(|_| "Cedar record is invalid".to_owned())
         }
     }
 }
@@ -1561,7 +1561,8 @@ fn restricted_expr_from_value_ref(
             for (key, value) in map {
                 fields.push((key.clone(), restricted_expr_from_value_ref(value)?));
             }
-            RestrictedExpression::new_record(fields).map_err(|e| e.to_string())
+            RestrictedExpression::new_record(fields)
+                .map_err(|_| "Cedar record is invalid".to_owned())
         }
     }
 }
@@ -1580,13 +1581,15 @@ fn entity_uid_from_escape_ref(value: &serde_json::Value) -> Result<EntityUid, St
 }
 
 fn entity_uid(entity_type: &str, entity_id: &str) -> Result<EntityUid, String> {
-    let type_name = EntityTypeName::from_str(entity_type).map_err(|e| e.to_string())?;
+    let type_name = EntityTypeName::from_str(entity_type)
+        .map_err(|_| "Cedar entity type is invalid".to_owned())?;
     let entity_id = EntityId::new(entity_id);
     Ok(EntityUid::from_type_name_and_id(type_name, entity_id))
 }
 
 fn entity_uid_owned(entity_type: &str, entity_id: String) -> Result<EntityUid, String> {
-    let type_name = EntityTypeName::from_str(entity_type).map_err(|e| e.to_string())?;
+    let type_name = EntityTypeName::from_str(entity_type)
+        .map_err(|_| "Cedar entity type is invalid".to_owned())?;
     Ok(EntityUid::from_type_name_and_id(
         type_name,
         EntityId::new(entity_id),

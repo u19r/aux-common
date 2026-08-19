@@ -19,13 +19,13 @@ use crate::{
 
 const ID_MAX: usize = 128;
 const NAME_MAX: usize = 58;
-const RESOURCE_TYPE_MAX: usize = 58;
-const ACTION_MAX: usize = 58;
+pub(crate) const RESOURCE_TYPE_MAX: usize = 58;
+pub(crate) const ACTION_MAX: usize = 58;
 const AUTHN_URL_MAX: usize = 2048;
 const AUTHN_ALGORITHMS_MAX: usize = 6;
 const AUTHN_AUDIENCES_MAX: usize = 25;
 
-type ActionPatternCache =
+pub(crate) type ActionPatternCache =
     HashMap<(String, String), Result<Vec<ExpandedActionRef>, ActionPatternExpandError>>;
 
 /// Complete authorization configuration model.
@@ -732,21 +732,6 @@ impl ConfigurationModel {
             Err(errors)
         }
     }
-
-    /// Get a permission by ID.
-    pub fn get_permission(&self, id: &str) -> Option<&Permission> {
-        self.permissions.iter().find(|p| p.id == id)
-    }
-
-    /// Get a resource type by ID.
-    pub fn get_resource_type(&self, id: &str) -> Option<&ResourceType> {
-        self.resource_types.iter().find(|rt| rt.id == id)
-    }
-
-    /// Get a role by ID.
-    pub fn get_role(&self, id: &str) -> Option<&Role> {
-        self.roles.iter().find(|r| r.id == id)
-    }
 }
 
 fn validate_resource_scope_types(
@@ -981,7 +966,7 @@ fn validate_action_reference(
     }
 }
 
-fn expand_action_patterns_cached(
+pub(crate) fn expand_action_patterns_cached(
     cache: &mut ActionPatternCache,
     resource_types: &[ResourceType],
     resource_type_pattern: &str,
@@ -1129,10 +1114,10 @@ fn append_expansion_error(
     error: ActionPatternExpandError,
 ) {
     match error {
-        ActionPatternExpandError::InvalidPattern(parse_error) => {
+        ActionPatternExpandError::InvalidPattern(error) => {
             errors.push(ValidationError::InvalidFormat {
                 field,
-                message: parse_error.to_string(),
+                message: error.to_string(),
             });
         }
         ActionPatternExpandError::NoMatches {
@@ -1155,53 +1140,5 @@ fn append_expansion_error(
                 id: format!("{resource_type_pattern}:{action_name_pattern}"),
             });
         }
-    }
-}
-
-#[cfg(test)]
-mod resource_expansion_tests {
-    use super::*;
-
-    #[test]
-    fn repeated_wildcard_expansion_reuses_the_catalog_match() {
-        let resource_types = vec![ResourceType {
-            id: "document".into(),
-            name: "Document".into(),
-            description: None,
-            actions: (0..4)
-                .map(|index| crate::ActionDefinition {
-                    name: format!("read-{index}"),
-                    description: None,
-                })
-                .collect(),
-            context_schema: None,
-        }];
-        let mut cache = ActionPatternCache::new();
-
-        let first = expand_action_patterns_cached(
-            &mut cache,
-            &resource_types,
-            "document",
-            "read-*",
-            RESOURCE_TYPE_MAX,
-            ACTION_MAX,
-        )
-        .expect("first wildcard expansion");
-        let second = expand_action_patterns_cached(
-            &mut cache,
-            &resource_types,
-            "DOCUMENT",
-            "READ-*",
-            RESOURCE_TYPE_MAX,
-            ACTION_MAX,
-        )
-        .expect("cached wildcard expansion");
-
-        assert_eq!(first, second);
-        assert_eq!(
-            cache.len(),
-            1,
-            "duplicate patterns must not rescan the catalog"
-        );
     }
 }

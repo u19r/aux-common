@@ -1152,7 +1152,12 @@ fn public_read_is_declared_for_action(
     if action != "read" {
         return false;
     }
-    let Some(resource_type) = runtime.config.get_resource_type(resource_type) else {
+    let Some(resource_type) = runtime
+        .config
+        .resource_types
+        .iter()
+        .find(|configured| configured.id == resource_type)
+    else {
         return false;
     };
     if !resource_type

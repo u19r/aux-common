@@ -12,14 +12,14 @@ pub enum SigningError {
     InvalidHeaderValue,
     #[error("invalid header name for signing")]
     InvalidHeaderName,
-    #[error("failed to prepare signable request: {0}")]
-    PrepareRequest(String),
-    #[error("SigV4 signing failed: {0}")]
-    Signing(String),
-    #[error("invalid URI for signing: {0}")]
-    InvalidUri(String),
-    #[error("invalid URL for signing: {0}")]
-    InvalidUrl(String),
+    #[error("failed to prepare signable request")]
+    PrepareRequest,
+    #[error("SigV4 signing failed")]
+    Signing,
+    #[error("invalid URI for signing")]
+    InvalidUri,
+    #[error("invalid URL for signing")]
+    InvalidUrl,
     #[error("presigned URL expiry must be between 1 and 604800 seconds")]
     InvalidPresignExpiry,
     #[error("signed HTTP request failed ({0:?})")]
@@ -33,24 +33,22 @@ pub enum SigningError {
 }
 
 impl From<provider::error::CredentialsError> for SigningError {
-    fn from(error: provider::error::CredentialsError) -> Self {
-        Self::Credentials(CredentialErrorKind::Provider(error.to_string()))
+    fn from(_error: provider::error::CredentialsError) -> Self {
+        Self::Credentials(CredentialErrorKind::Provider)
     }
 }
 
 #[derive(Debug)]
 pub enum CredentialErrorKind {
-    HttpClientInit(String),
-    Provider(String),
+    HttpClientInit,
+    Provider,
 }
 
 impl fmt::Display for CredentialErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::HttpClientInit(error) => {
-                write!(f, "failed to initialize credentials HTTP client: {error}")
-            }
-            Self::Provider(error) => f.write_str(error),
+            Self::HttpClientInit => f.write_str("failed to initialize credentials HTTP client"),
+            Self::Provider => f.write_str("credential provider failed"),
         }
     }
 }

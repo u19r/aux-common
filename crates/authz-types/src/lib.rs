@@ -6,22 +6,31 @@
 //! - Evaluation request/response types
 //! - Validation errors
 
+mod access_token_claims;
+mod access_token_type;
 mod action;
 mod action_pattern;
 mod api_evaluation;
 mod authn_provider;
 mod challenge;
+mod claim_bounds;
+mod claim_mapping;
 mod configuration_model;
 mod constants;
 mod context;
 mod control_plane_requests;
+mod custom_claims;
 mod default_scoping;
 mod error;
 mod evaluation_properties;
 mod evaluation_request;
 mod evaluation_response;
 mod jwt_context;
+mod normalized_audience;
+mod oauth_claims;
 mod permission;
+mod permission_set;
+mod principal;
 mod resource;
 mod resource_type;
 mod role;
@@ -32,12 +41,15 @@ mod step_up;
 mod subject;
 mod token_context;
 mod token_scope;
+mod validated_principal;
+mod verified_claim_tree;
 
 pub use action::*;
 pub use action_pattern::*;
 pub use api_evaluation::*;
 pub use authn_provider::*;
 pub use challenge::*;
+pub use claim_mapping::*;
 pub use configuration_model::*;
 pub use constants::*;
 pub use context::*;
@@ -48,7 +60,9 @@ pub use evaluation_properties::*;
 pub use evaluation_request::*;
 pub use evaluation_response::*;
 pub use jwt_context::*;
+pub use oauth_claims::*;
 pub use permission::*;
+pub use permission_set::*;
 pub use resource::*;
 pub use resource_type::*;
 pub use role::*;
@@ -63,12 +77,20 @@ pub use token_scope::*;
 #[cfg(test)]
 mod action_pattern_tests;
 #[cfg(test)]
+mod claim_mapping_tests;
+#[cfg(test)]
 mod configuration_model_tests;
 #[cfg(test)]
 mod control_plane_requests_tests;
 #[cfg(test)]
 mod evaluation_properties_tests;
 #[cfg(test)]
+mod oauth_claims_tests;
+#[cfg(test)]
+mod permission_set_tests;
+#[cfg(test)]
 mod role_tests;
 #[cfg(test)]
 mod security_tests;
+#[cfg(test)]
+mod token_context_tests;

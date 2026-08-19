@@ -10,8 +10,8 @@ use reqwest::{Method, Request, StatusCode, Url};
 use serde_json::json;
 
 use crate::{
-    HttpClientBuilder, HttpRequestError, HttpResponse, RetryConfig, Transport, TransportFuture,
-    client::retry_delay_for_response,
+    HttpClientBuilder, HttpRequestError, HttpRequestErrorKind, HttpResponse, RetryConfig,
+    Transport, TransportFuture, client::retry_delay_for_response,
 };
 
 struct SequenceTransport {
@@ -126,10 +126,9 @@ fn mock_json_response(headers: HeaderMap, body: &serde_json::Value) -> HttpRespo
 }
 
 fn transport_error_with_sensitive_url() -> HttpRequestError {
-    let source = reqwest::Proxy::all("not a valid proxy url")
-        .expect_err("invalid proxy should produce a reqwest error")
-        .with_url(Url::parse("https://example.test/resource?access_token=sentinel").expect("url"));
-    source.into()
+    HttpRequestError::Transport {
+        kind: HttpRequestErrorKind::Request,
+    }
 }
 
 #[test]
@@ -743,7 +742,7 @@ async fn response_helpers_fail_closed_for_invalid_status_and_decode_errors() {
     .text()
     .await
     .expect_err("invalid utf-8 should fail");
-    assert!(matches!(decode_error, HttpRequestError::Decode { .. }));
+    assert!(matches!(decode_error, HttpRequestError::Decode));
 
     let json_error = HttpResponse::from_mock(
         StatusCode::OK,
@@ -754,7 +753,7 @@ async fn response_helpers_fail_closed_for_invalid_status_and_decode_errors() {
     .json::<serde_json::Value>()
     .await
     .expect_err("invalid json should fail");
-    assert!(matches!(json_error, HttpRequestError::Decode { .. }));
+    assert!(matches!(json_error, HttpRequestError::Decode));
 }
 
 #[tokio::test]
@@ -863,23 +862,13 @@ fn returned_transport_error_diagnostics_redact_sensitive_url() {
     let error = transport_error_with_sensitive_url();
     let display = error.to_string();
     let debug = format!("{error:?}");
-    let source = std::error::Error::source(&error).expect("transport source");
-    let source_display = source.to_string();
-    let source_debug = format!("{source:?}");
+    assert!(std::error::Error::source(&error).is_none());
 
     assert!(
         !display.contains("access_token=sentinel"),
         "display leaked URL"
     );
     assert!(!debug.contains("access_token=sentinel"), "debug leaked URL");
-    assert!(
-        !source_display.contains("access_token=sentinel"),
-        "source display leaked URL"
-    );
-    assert!(
-        !source_debug.contains("access_token=sentinel"),
-        "source debug leaked URL"
-    );
 }
 
 #[test]

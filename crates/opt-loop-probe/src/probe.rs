@@ -748,7 +748,7 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 }
 
 fn env_truthy(key: &str) -> bool {
-    env::var(key).ok().is_some_and(|value| {
+    env::var(key).is_ok_and(|value| {
         let normalized = value.trim().to_ascii_lowercase();
         matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
     })

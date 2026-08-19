@@ -108,16 +108,9 @@ impl Transport for UntrustedTransport {
 
 impl Transport for FailingTransport {
     fn send(&self, _request: Request) -> TransportFuture {
-        let source = http_request::reqwest::Proxy::all("not a valid proxy url")
-            .expect_err("invalid proxy should produce a reqwest error")
-            .with_url(
-                http_request::Url::parse("https://service.test/resource?access_token=sentinel")
-                    .expect("url"),
-            );
         Box::pin(async move {
             Err(HttpRequestError::Transport {
                 kind: HttpRequestErrorKind::Request,
-                source,
             })
         })
     }
@@ -215,7 +208,7 @@ async fn signed_client_rejects_paths_that_escape_the_configured_authority() {
         .err()
         .expect("authority-changing paths must be rejected");
 
-    assert!(matches!(error, SigningError::InvalidUrl(_)));
+    assert!(matches!(error, SigningError::InvalidUrl));
 }
 
 #[tokio::test]

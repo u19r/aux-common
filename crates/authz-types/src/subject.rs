@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use utoipa::ToSchema;
 
 /// Evaluation subject, the entity requesting access.
@@ -87,8 +87,7 @@ impl Subject {
 }
 
 /// Subject types accepted by the Authz API.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, ToSchema, PartialEq, Eq, Hash)]
 pub enum SubjectType {
     User,
     Group,
@@ -97,10 +96,14 @@ pub enum SubjectType {
     #[serde(alias = "service_account")]
     Machine,
     Protocol,
+    /// AuthZEN permits arbitrary subject type strings. Unknown values are
+    /// retained so the PDP can return a normal negative decision instead of
+    /// rejecting an otherwise syntactically valid request.
+    Custom(String),
 }
 
 impl SubjectType {
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::User => "user",
             Self::Group => "group",
@@ -108,6 +111,33 @@ impl SubjectType {
             Self::ApiKey => "api_key",
             Self::Machine => "machine",
             Self::Protocol => "protocol",
+            Self::Custom(value) => value,
         }
+    }
+}
+
+impl Serialize for SubjectType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SubjectType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: Deserializer<'de> {
+        let value = String::deserialize(deserializer)?;
+        if value.trim().is_empty() {
+            return Err(de::Error::custom("subject type must not be empty"));
+        }
+        Ok(match value.as_str() {
+            "user" => Self::User,
+            "group" => Self::Group,
+            "role" => Self::Role,
+            "api_key" => Self::ApiKey,
+            "machine" | "service_account" => Self::Machine,
+            "protocol" => Self::Protocol,
+            _ => Self::Custom(value),
+        })
     }
 }

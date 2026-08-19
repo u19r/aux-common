@@ -79,8 +79,7 @@ impl AwsSigv4HttpClient {
             return Err(SigningError::RedirectPolicyRequired);
         }
         let endpoint = endpoint.trim_end_matches('/');
-        let endpoint_url =
-            Url::parse(endpoint).map_err(|err| SigningError::InvalidUrl(err.to_string()))?;
+        let endpoint_url = Url::parse(endpoint).map_err(|_| SigningError::InvalidUrl)?;
         if endpoint_url.scheme() != "https" {
             return Err(SigningError::InsecureTransport);
         }
@@ -89,9 +88,7 @@ impl AwsSigv4HttpClient {
             || endpoint_url.query().is_some()
             || endpoint_url.fragment().is_some()
         {
-            return Err(SigningError::InvalidUrl(
-                "endpoint must not contain userinfo, query, or fragment".to_string(),
-            ));
+            return Err(SigningError::InvalidUrl);
         }
         let signer = AwsRequestSigner::new(region, credentials, service_name)?;
         Ok(Self {
@@ -113,25 +110,18 @@ impl AwsSigv4HttpClient {
             return Err(SigningError::HostHeaderOverride);
         }
         if !path.starts_with('/') || path.starts_with("//") || path.contains('\\') {
-            return Err(SigningError::InvalidUrl(
-                "request path must be an origin-form path".to_string(),
-            ));
+            return Err(SigningError::InvalidUrl);
         }
         let url = format!("{}{}", self.endpoint, path);
-        let endpoint_url =
-            Url::parse(&self.endpoint).map_err(|err| SigningError::InvalidUrl(err.to_string()))?;
-        let request_url =
-            Url::parse(&url).map_err(|err| SigningError::InvalidUrl(err.to_string()))?;
+        let endpoint_url = Url::parse(&self.endpoint).map_err(|_| SigningError::InvalidUrl)?;
+        let request_url = Url::parse(&url).map_err(|_| SigningError::InvalidUrl)?;
         if request_url.scheme() != endpoint_url.scheme()
             || request_url.host() != endpoint_url.host()
             || request_url.port() != endpoint_url.port()
         {
-            return Err(SigningError::InvalidUrl(
-                "request path changed the configured endpoint authority".to_string(),
-            ));
+            return Err(SigningError::InvalidUrl);
         }
-        let uri =
-            Uri::from_str(url.as_str()).map_err(|err| SigningError::InvalidUri(err.to_string()))?;
+        let uri = Uri::from_str(url.as_str()).map_err(|_| SigningError::InvalidUri)?;
         if let Some(content_type) = default_content_type
             && body.is_some()
             && !extra_headers.contains_key(CONTENT_TYPE)

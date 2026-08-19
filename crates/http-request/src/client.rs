@@ -155,9 +155,7 @@ impl HttpClientBuilder {
             .builder
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|err| HttpRequestError::Build {
-                source: err.without_url(),
-            })?;
+            .map_err(|_| HttpRequestError::Build)?;
         let transport = self
             .transport
             .unwrap_or_else(|| Arc::new(ReqwestTransport::new(client.clone())));
@@ -291,9 +289,7 @@ impl HttpClient {
     }
 
     pub async fn execute_request(&self, builder: RequestBuilder) -> Result<HttpResponse> {
-        let request = builder.build().map_err(|err| HttpRequestError::Build {
-            source: err.without_url(),
-        })?;
+        let request = builder.build().map_err(|_| HttpRequestError::Build)?;
         self.execute(request).await
     }
 
@@ -514,9 +510,7 @@ impl HttpRequestBuilder {
     }
 
     pub fn build(self) -> Result<Request> {
-        self.inner.build().map_err(|err| HttpRequestError::Build {
-            source: err.without_url(),
-        })
+        self.inner.build().map_err(|_| HttpRequestError::Build)
     }
 
     pub fn try_clone(&self) -> Option<Self> {
@@ -664,16 +658,12 @@ impl HttpResponse {
 
     pub async fn text(self) -> Result<String> {
         let bytes = self.bytes().await?;
-        String::from_utf8(bytes.to_vec()).map_err(|err| HttpRequestError::Decode {
-            message: err.to_string(),
-        })
+        String::from_utf8(bytes.to_vec()).map_err(|_| HttpRequestError::Decode)
     }
 
     pub async fn json<T: DeserializeOwned>(self) -> Result<T> {
         let bytes = self.bytes().await?;
-        serde_json::from_slice(&bytes).map_err(|err| HttpRequestError::Decode {
-            message: err.to_string(),
-        })
+        serde_json::from_slice(&bytes).map_err(|_| HttpRequestError::Decode)
     }
 }
 

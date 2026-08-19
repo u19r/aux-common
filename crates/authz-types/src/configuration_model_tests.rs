@@ -6,7 +6,53 @@ use crate::{
     PermissionId, ResourceType, Role, RoleActionLimit, RoleActionRef, RoleLimitCountScope,
     RoleLimitCountSource, RoleLimitEnforcementMode, RoleLimitThresholds, RolePermission, Scope,
     ScopeMappingEntry, StepUpConfig, StepUpRule, ValidationError,
+    configuration_model::{
+        ACTION_MAX, ActionPatternCache, RESOURCE_TYPE_MAX, expand_action_patterns_cached,
+    },
 };
+
+#[test]
+fn repeated_wildcard_expansion_reuses_the_catalog_match() {
+    let resource_types = vec![ResourceType {
+        id: "document".into(),
+        name: "Document".into(),
+        description: None,
+        actions: (0..4)
+            .map(|index| crate::ActionDefinition {
+                name: format!("read-{index}"),
+                description: None,
+            })
+            .collect(),
+        context_schema: None,
+    }];
+    let mut cache = ActionPatternCache::new();
+
+    let first = expand_action_patterns_cached(
+        &mut cache,
+        &resource_types,
+        "document",
+        "read-*",
+        RESOURCE_TYPE_MAX,
+        ACTION_MAX,
+    )
+    .expect("first wildcard expansion");
+    let second = expand_action_patterns_cached(
+        &mut cache,
+        &resource_types,
+        "DOCUMENT",
+        "READ-*",
+        RESOURCE_TYPE_MAX,
+        ACTION_MAX,
+    )
+    .expect("cached wildcard expansion");
+
+    assert_eq!(first, second);
+    assert_eq!(
+        cache.len(),
+        1,
+        "duplicate patterns must not rescan the catalog"
+    );
+}
 
 #[test]
 fn detects_duplicate_step_up_rule_ids() {

@@ -60,9 +60,13 @@ pub fn generate_schema_for_resource(
     add_principal_types(&mut schema_json);
     add_org_types(&mut schema_json);
 
-    let rt = config.get_resource_type(resource_type_id).ok_or_else(|| {
-        CedarError::schema_generation(format!("resource type not found: {resource_type_id}"))
-    })?;
+    let rt = config
+        .resource_types
+        .iter()
+        .find(|resource_type| resource_type.id == resource_type_id)
+        .ok_or_else(|| {
+            CedarError::schema_generation(format!("resource type not found: {resource_type_id}"))
+        })?;
 
     add_resource_entity_type(&mut schema_json, rt)?;
     for action in &rt.actions {

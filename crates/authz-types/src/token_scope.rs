@@ -3,7 +3,7 @@
 //! Effective permissions are always the intersection of user claims and
 //! token scopes. Tokens can only restrict, never expand, what the user can do.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use utoipa::ToSchema;
@@ -47,6 +47,15 @@ pub struct TokenScopeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = true, min_length = 1, max_length = 58, example = "org_123")]
     pub org_id: Option<String>,
+
+    /// Permission ids resolved from `scope_strings` when an API key is
+    /// created.  Keeping this derived ceiling on the persisted credential
+    /// prevents a later scope-mapping edit from broadening an existing key;
+    /// the authorization evaluator still intersects it with the owner's
+    /// current authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = true, max_items = 500)]
+    pub resolved_permissions: Option<Vec<String>>,
 }
 
 impl<'de> Deserialize<'de> for TokenScopeConfig {
@@ -62,13 +71,30 @@ impl<'de> Deserialize<'de> for TokenScopeConfig {
             fine_grained: Option<FineGrainedScopes>,
             #[serde(default, deserialize_with = "deserialize_bounded_optional_identifier")]
             org_id: Option<String>,
+            #[serde(default, deserialize_with = "deserialize_resolved_permissions")]
+            resolved_permissions: Option<Vec<String>>,
         }
 
         let wire = WireTokenScopeConfig::deserialize(deserializer)?;
         let has_scope_strings = !wire.scope_strings.is_empty();
         let has_fine_grained = wire.fine_grained.is_some();
+        let has_resolved_permissions = wire.resolved_permissions.is_some();
+        if let Some(permissions) = &wire.resolved_permissions {
+            if permissions.is_empty() {
+                return Err(D::Error::custom(
+                    "resolved_permissions must contain at least one permission",
+                ));
+            }
+            if permissions.iter().collect::<HashSet<_>>().len() != permissions.len() {
+                return Err(D::Error::custom(
+                    "resolved_permissions must not contain duplicates",
+                ));
+            }
+        }
         let scope_type = match wire.scope_type {
-            Some(TokenScopeType::FullAccess) if has_scope_strings || has_fine_grained => {
+            Some(TokenScopeType::FullAccess)
+                if has_scope_strings || has_fine_grained || wire.resolved_permissions.is_some() =>
+            {
                 return Err(D::Error::custom(
                     "full_access token scope cannot include restricted scope fields",
                 ));
@@ -78,13 +104,25 @@ impl<'de> Deserialize<'de> for TokenScopeConfig {
                     "scope_strings token scope cannot include fine_grained fields",
                 ));
             }
+            Some(TokenScopeType::ScopeStrings)
+                if has_resolved_permissions && !has_scope_strings =>
+            {
+                return Err(D::Error::custom(
+                    "resolved_permissions requires non-empty scope_strings",
+                ));
+            }
             Some(TokenScopeType::FineGrained) if has_scope_strings => {
                 return Err(D::Error::custom(
                     "fine_grained token scope cannot include scope_strings fields",
                 ));
             }
+            Some(TokenScopeType::FineGrained) if has_resolved_permissions => {
+                return Err(D::Error::custom(
+                    "fine_grained token scope cannot include resolved_permissions",
+                ));
+            }
             Some(scope_type) => scope_type,
-            None if has_scope_strings || has_fine_grained => {
+            None if has_scope_strings || has_fine_grained || has_resolved_permissions => {
                 return Err(D::Error::custom(
                     "scope_type is required when restricted scope fields are present",
                 ));
@@ -97,6 +135,7 @@ impl<'de> Deserialize<'de> for TokenScopeConfig {
             scope_strings: wire.scope_strings,
             fine_grained: wire.fine_grained,
             org_id: wire.org_id,
+            resolved_permissions: wire.resolved_permissions,
         })
     }
 }
@@ -108,6 +147,7 @@ impl Default for TokenScopeConfig {
             scope_strings: Vec::new(),
             fine_grained: None,
             org_id: None,
+            resolved_permissions: None,
         }
     }
 }
@@ -125,6 +165,7 @@ impl TokenScopeConfig {
             scope_strings: scopes,
             fine_grained: None,
             org_id: None,
+            resolved_permissions: None,
         }
     }
 
@@ -135,6 +176,7 @@ impl TokenScopeConfig {
             scope_strings: Vec::new(),
             fine_grained: Some(config),
             org_id: None,
+            resolved_permissions: None,
         }
     }
 
@@ -142,6 +184,18 @@ impl TokenScopeConfig {
     pub fn with_org(mut self, org_id: String) -> Self {
         self.org_id = Some(org_id);
         self
+    }
+
+    /// Attach the immutable permission ceiling resolved from the requested
+    /// scope strings at credential creation.
+    pub fn with_resolved_permissions(mut self, permissions: Vec<String>) -> Self {
+        self.resolved_permissions = Some(permissions);
+        self
+    }
+
+    #[must_use]
+    pub fn resolved_permissions(&self) -> Option<&[String]> {
+        self.resolved_permissions.as_deref()
     }
 }
 
@@ -342,6 +396,16 @@ impl<
 fn deserialize_scope_strings<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where D: Deserializer<'de> {
     Ok(BoundedStringVec::<MAX_SCOPE_STRINGS, MAX_SCOPE_TEXT_BYTES>::deserialize(deserializer)?.0)
+}
+
+fn deserialize_resolved_permissions<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where D: Deserializer<'de> {
+    let value = Option::<BoundedStringVec<MAX_SCOPE_VALUES, MAX_SCOPE_TEXT_BYTES>>::deserialize(
+        deserializer,
+    )?;
+    Ok(value.map(|permissions| permissions.0))
 }
 
 fn deserialize_selected_resources<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>

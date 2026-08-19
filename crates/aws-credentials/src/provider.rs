@@ -24,18 +24,17 @@ use url::Url;
 
 use crate::constants::{
     AWS_ACCESS_KEY, AWS_ACCESS_KEY_ID, AWS_CLI_COMMAND_TIMEOUT, AWS_CLI_CREDENTIAL_PROVIDER_NAME,
-    AWS_CLI_PROFILE_DEFAULT, AWS_CONFIG_FILE, AWS_CONFIG_RELATIVE_PATH,
-    AWS_CONTAINER_AUTHORIZATION_TOKEN, AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE,
-    AWS_CONTAINER_CREDENTIALS_FULL_URI, AWS_CONTAINER_CREDENTIALS_RELATIVE_URI,
-    AWS_CREDENTIALS_RELATIVE_PATH, AWS_DEFAULT_PROFILE, AWS_EC2_METADATA_DISABLED, AWS_PROFILE,
-    AWS_SECRET_ACCESS_KEY, AWS_SECRET_KEY, AWS_SESSION_TOKEN, AWS_SHARED_CREDENTIALS_FILE,
-    CREDENTIAL_CACHE_CAPACITY, CREDENTIAL_CACHE_STATIC_TTL, CREDENTIAL_REFRESH_FALLBACK,
-    CREDENTIAL_REFRESH_SKEW, DEFAULT_CREDENTIAL_CACHE_KEY, ECS_RELATIVE_CREDENTIALS_BASE,
-    ECS_TASK_METADATA_PROVIDER_NAME, ENVIRONMENT_PROVIDER_NAME, HOME, IMDS_PROVIDER_NAME,
-    IMDS_ROLE_LIST_URL, IMDS_TOKEN_HEADER, IMDS_TOKEN_TTL_HEADER, IMDS_TOKEN_TTL_SECONDS,
-    IMDS_TOKEN_URL, LOCALHOST, MAX_AUTHORIZATION_TOKEN_BYTES, MAX_AWS_CLI_OUTPUT_BYTES,
-    MAX_METADATA_RESPONSE_BYTES, METADATA_CONNECT_TIMEOUT, METADATA_REQUEST_TIMEOUT,
-    STATIC_PROVIDER_NAME,
+    AWS_CONFIG_FILE, AWS_CONFIG_RELATIVE_PATH, AWS_CONTAINER_AUTHORIZATION_TOKEN,
+    AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE, AWS_CONTAINER_CREDENTIALS_FULL_URI,
+    AWS_CONTAINER_CREDENTIALS_RELATIVE_URI, AWS_CREDENTIALS_RELATIVE_PATH, AWS_DEFAULT_PROFILE,
+    AWS_EC2_METADATA_DISABLED, AWS_PROFILE, AWS_SECRET_ACCESS_KEY, AWS_SECRET_KEY,
+    AWS_SESSION_TOKEN, AWS_SHARED_CREDENTIALS_FILE, CREDENTIAL_CACHE_CAPACITY,
+    CREDENTIAL_CACHE_STATIC_TTL, CREDENTIAL_REFRESH_FALLBACK, CREDENTIAL_REFRESH_SKEW,
+    DEFAULT_CREDENTIAL_CACHE_KEY, ECS_RELATIVE_CREDENTIALS_BASE, ECS_TASK_METADATA_PROVIDER_NAME,
+    ENVIRONMENT_PROVIDER_NAME, HOME, IMDS_PROVIDER_NAME, IMDS_ROLE_LIST_URL, IMDS_TOKEN_HEADER,
+    IMDS_TOKEN_TTL_HEADER, IMDS_TOKEN_TTL_SECONDS, IMDS_TOKEN_URL, LOCALHOST,
+    MAX_AUTHORIZATION_TOKEN_BYTES, MAX_AWS_CLI_OUTPUT_BYTES, MAX_METADATA_RESPONSE_BYTES,
+    METADATA_CONNECT_TIMEOUT, METADATA_REQUEST_TIMEOUT, STATIC_PROVIDER_NAME,
 };
 
 pub(crate) type CredentialProviderError = provider::error::CredentialsError;
@@ -182,35 +181,39 @@ enum CredentialProviderErrorKind {
     EmptyImdsToken,
     MissingImdsRoleName,
     PartialEnvironmentCredentials,
-    AwsCliRunFailed(String),
-    AwsCliProfileExportFailed {
-        profile: String,
-        reason: String,
-    },
+    AwsCliRunFailed,
+    AwsCliProfileExportFailed,
     AwsCliOutputTooLarge,
     AwsCliTimedOut,
     AuthorizationTokenFileTooLarge,
-    InvalidAwsCliCredentialJson(String),
+    InvalidAwsCliCredentialJson,
     EcsRelativeUriMustBePath,
     EcsFullUriMissingHost,
     EcsFullUriRequiresHttpsOrLocal,
     EcsFullUriRequiresHttpOrHttps,
-    EmptyAuthorizationTokenFile(String),
+    EmptyAuthorizationTokenFile,
     IncompleteCredentialResponse,
     MetadataRequestFailed,
+    ProviderClientInitFailed,
+    MetadataResponseInvalid,
+    MetadataCredentialsJsonInvalid,
+    MetadataCredentialsTextInvalid,
+    AuthorizationTokenFileReadFailed,
+    AuthorizationTokenFileInvalidUtf8,
+    InvalidEcsCredentialsUri,
 }
 
 #[derive(Debug)]
 struct ProviderFailure {
     source: CredentialProviderSource,
-    error: String,
+    error: &'static str,
 }
 
 impl ProviderFailure {
-    fn new(source: CredentialProviderSource, error: &CredentialProviderError) -> Self {
+    fn new(source: CredentialProviderSource, _error: &CredentialProviderError) -> Self {
         Self {
             source,
-            error: error.to_string(),
+            error: "provider request failed",
         }
     }
 }
@@ -253,12 +256,9 @@ impl fmt::Display for CredentialProviderErrorKind {
             Self::PartialEnvironmentCredentials => {
                 f.write_str("AWS credential environment variables are partially configured")
             }
-            Self::AwsCliRunFailed(error) => write!(f, "failed to run aws cli: {error}"),
-            Self::AwsCliProfileExportFailed { profile, reason } => {
-                write!(
-                    f,
-                    "failed to export credentials for profile `{profile}`: {reason}"
-                )
+            Self::AwsCliRunFailed => f.write_str("failed to run aws cli credential provider"),
+            Self::AwsCliProfileExportFailed => {
+                f.write_str("aws cli credential provider rejected the requested profile")
             }
             Self::AwsCliOutputTooLarge => {
                 write!(f, "aws cli credential output exceeds configured limit")
@@ -267,8 +267,8 @@ impl fmt::Display for CredentialProviderErrorKind {
             Self::AuthorizationTokenFileTooLarge => {
                 write!(f, "authorization token file exceeds configured limit")
             }
-            Self::InvalidAwsCliCredentialJson(error) => {
-                write!(f, "invalid aws cli credential JSON: {error}")
+            Self::InvalidAwsCliCredentialJson => {
+                f.write_str("aws cli credential provider returned invalid JSON")
             }
             Self::EcsRelativeUriMustBePath => {
                 f.write_str("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI must be a path")
@@ -282,13 +282,30 @@ impl fmt::Display for CredentialProviderErrorKind {
             Self::EcsFullUriRequiresHttpOrHttps => {
                 f.write_str("AWS_CONTAINER_CREDENTIALS_FULL_URI must use HTTP or HTTPS")
             }
-            Self::EmptyAuthorizationTokenFile(path) => {
-                write!(f, "authorization token file `{path}` was empty")
-            }
+            Self::EmptyAuthorizationTokenFile => f.write_str("authorization token file was empty"),
             Self::IncompleteCredentialResponse => f.write_str(
                 "credential response did not include access key id and secret access key",
             ),
             Self::MetadataRequestFailed => f.write_str("metadata request failed"),
+            Self::ProviderClientInitFailed => {
+                f.write_str("credential provider client initialization failed")
+            }
+            Self::MetadataResponseInvalid => {
+                f.write_str("credential metadata response was invalid")
+            }
+            Self::MetadataCredentialsJsonInvalid => {
+                f.write_str("credential metadata response was not valid JSON")
+            }
+            Self::MetadataCredentialsTextInvalid => {
+                f.write_str("credential metadata response was not valid UTF-8")
+            }
+            Self::AuthorizationTokenFileReadFailed => {
+                f.write_str("authorization token file could not be read")
+            }
+            Self::AuthorizationTokenFileInvalidUtf8 => {
+                f.write_str("authorization token file was not valid UTF-8")
+            }
+            Self::InvalidEcsCredentialsUri => f.write_str("ECS credentials URI was invalid"),
         }
     }
 }
@@ -365,7 +382,9 @@ impl DefaultChainCredentialsProvider {
             .timeout(METADATA_REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(provider::error::CredentialsError::provider_error)?;
+            .map_err(|_| {
+                provider_error_message(CredentialProviderErrorKind::ProviderClientInitFailed)
+            })?;
 
         Ok(Self {
             client,
@@ -477,11 +496,13 @@ impl DefaultChainCredentialsProvider {
             ));
         }
 
-        let body = bounded_response_body(response)
-            .await
-            .map_err(provider::error::CredentialsError::provider_error)?;
-        let payload = serde_json::from_slice::<MetadataCredentialsResponse>(&body)
-            .map_err(provider::error::CredentialsError::provider_error)?;
+        let body = bounded_response_body(response).await.map_err(|_| {
+            provider_error_message(CredentialProviderErrorKind::MetadataResponseInvalid)
+        })?;
+        let payload =
+            serde_json::from_slice::<MetadataCredentialsResponse>(&body).map_err(|_| {
+                provider_error_message(CredentialProviderErrorKind::MetadataCredentialsJsonInvalid)
+            })?;
 
         metadata_to_credentials(payload, ECS_TASK_METADATA_PROVIDER_NAME).map(Some)
     }
@@ -509,11 +530,13 @@ impl DefaultChainCredentialsProvider {
             ));
         }
 
-        let token_body = bounded_response_body(token_response)
-            .await
-            .map_err(provider::error::CredentialsError::provider_error)?;
+        let token_body = bounded_response_body(token_response).await.map_err(|_| {
+            provider_error_message(CredentialProviderErrorKind::MetadataResponseInvalid)
+        })?;
         let token = std::str::from_utf8(&token_body)
-            .map_err(provider::error::CredentialsError::provider_error)?
+            .map_err(|_| {
+                provider_error_message(CredentialProviderErrorKind::MetadataCredentialsTextInvalid)
+            })?
             .trim()
             .to_owned();
         if token.is_empty() {
@@ -538,11 +561,13 @@ impl DefaultChainCredentialsProvider {
             ));
         }
 
-        let role_body = bounded_response_body(role_response)
-            .await
-            .map_err(provider::error::CredentialsError::provider_error)?;
+        let role_body = bounded_response_body(role_response).await.map_err(|_| {
+            provider_error_message(CredentialProviderErrorKind::MetadataResponseInvalid)
+        })?;
         let role_name = std::str::from_utf8(&role_body)
-            .map_err(provider::error::CredentialsError::provider_error)?
+            .map_err(|_| {
+                provider_error_message(CredentialProviderErrorKind::MetadataCredentialsTextInvalid)
+            })?
             .lines()
             .map(str::trim)
             .find(|line| !line.is_empty())
@@ -570,9 +595,13 @@ impl DefaultChainCredentialsProvider {
 
         let body = bounded_response_body(credentials_response)
             .await
-            .map_err(provider::error::CredentialsError::provider_error)?;
-        let payload = serde_json::from_slice::<MetadataCredentialsResponse>(&body)
-            .map_err(provider::error::CredentialsError::provider_error)?;
+            .map_err(|_| {
+                provider_error_message(CredentialProviderErrorKind::MetadataResponseInvalid)
+            })?;
+        let payload =
+            serde_json::from_slice::<MetadataCredentialsResponse>(&body).map_err(|_| {
+                provider_error_message(CredentialProviderErrorKind::MetadataCredentialsJsonInvalid)
+            })?;
 
         metadata_to_credentials(payload, IMDS_PROVIDER_NAME).map(Some)
     }
@@ -635,11 +664,7 @@ async fn resolve_profile_credentials_async() -> CredentialProviderResult<Option<
 {
     tokio::task::spawn_blocking(resolve_profile_credentials)
         .await
-        .map_err(|error| {
-            provider_error_message(CredentialProviderErrorKind::AwsCliRunFailed(format!(
-                "profile resolver task failed: {error}"
-            )))
-        })?
+        .map_err(|_| provider_error_message(CredentialProviderErrorKind::AwsCliRunFailed))?
 }
 
 fn resolve_environment_credentials() -> CredentialProviderResult<Option<ResolvedCredentials>> {
@@ -752,16 +777,16 @@ fn join_command_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::R
 }
 
 enum BoundedFileReadError {
-    Io(io::Error),
+    Io,
     TooLarge,
 }
 
 fn read_bounded_file(path: &str, limit: usize) -> Result<Vec<u8>, BoundedFileReadError> {
-    let file = std::fs::File::open(path).map_err(BoundedFileReadError::Io)?;
+    let file = std::fs::File::open(path).map_err(|_| BoundedFileReadError::Io)?;
     let mut contents = Vec::with_capacity(limit.saturating_add(1));
     file.take(limit.saturating_add(1) as u64)
         .read_to_end(&mut contents)
-        .map_err(BoundedFileReadError::Io)?;
+        .map_err(|_| BoundedFileReadError::Io)?;
     if contents.len() > limit {
         return Err(BoundedFileReadError::TooLarge);
     }
@@ -784,11 +809,8 @@ fn resolve_profile_credentials() -> CredentialProviderResult<Option<ResolvedCred
         command.arg("--profile").arg(profile_name);
     }
 
-    let output = run_bounded_command(command).map_err(|err| {
-        provider_error_message(CredentialProviderErrorKind::AwsCliRunFailed(
-            err.to_string(),
-        ))
-    })?;
+    let output = run_bounded_command(command)
+        .map_err(|_| provider_error_message(CredentialProviderErrorKind::AwsCliRunFailed))?;
     if output.timed_out {
         return Err(provider_error_message(
             CredentialProviderErrorKind::AwsCliTimedOut,
@@ -796,26 +818,14 @@ fn resolve_profile_credentials() -> CredentialProviderResult<Option<ResolvedCred
     }
     validate_aws_cli_output_size(&output.stdout, &output.stderr)?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let profile_name = profile.as_deref().unwrap_or(AWS_CLI_PROFILE_DEFAULT);
-        let reason = if stderr.is_empty() {
-            format!("exit status {}", output.status)
-        } else {
-            stderr
-        };
         return Err(provider_error_message(
-            CredentialProviderErrorKind::AwsCliProfileExportFailed {
-                profile: profile_name.to_owned(),
-                reason,
-            },
+            CredentialProviderErrorKind::AwsCliProfileExportFailed,
         ));
     }
 
     let parsed: AwsCliCredentialProcessOutput =
-        serde_json::from_slice(&output.stdout).map_err(|err| {
-            provider_error_message(CredentialProviderErrorKind::InvalidAwsCliCredentialJson(
-                err.to_string(),
-            ))
+        serde_json::from_slice(&output.stdout).map_err(|_| {
+            provider_error_message(CredentialProviderErrorKind::InvalidAwsCliCredentialJson)
         })?;
     metadata_to_credentials(
         MetadataCredentialsResponse {
@@ -847,7 +857,7 @@ fn blocking_metadata_http_client() -> CredentialProviderResult<reqwest::blocking
         .timeout(METADATA_REQUEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(provider::error::CredentialsError::provider_error)
+        .map_err(|_| provider_error_message(CredentialProviderErrorKind::ProviderClientInitFailed))
 }
 
 fn resolve_ecs_task_credentials_with_blocking_client(
@@ -872,10 +882,12 @@ fn resolve_ecs_task_credentials_with_blocking_client(
         ));
     }
 
-    let body = bounded_blocking_response_body(response)
-        .map_err(provider::error::CredentialsError::provider_error)?;
-    let payload = serde_json::from_slice::<MetadataCredentialsResponse>(&body)
-        .map_err(provider::error::CredentialsError::provider_error)?;
+    let body = bounded_blocking_response_body(response).map_err(|_| {
+        provider_error_message(CredentialProviderErrorKind::MetadataResponseInvalid)
+    })?;
+    let payload = serde_json::from_slice::<MetadataCredentialsResponse>(&body).map_err(|_| {
+        provider_error_message(CredentialProviderErrorKind::MetadataCredentialsJsonInvalid)
+    })?;
 
     metadata_to_credentials(payload, ECS_TASK_METADATA_PROVIDER_NAME).map(Some)
 }
@@ -901,10 +913,13 @@ fn resolve_imds_credentials_with_blocking_client(
         ));
     }
 
-    let token_body = bounded_blocking_response_body(token_response)
-        .map_err(provider::error::CredentialsError::provider_error)?;
+    let token_body = bounded_blocking_response_body(token_response).map_err(|_| {
+        provider_error_message(CredentialProviderErrorKind::MetadataResponseInvalid)
+    })?;
     let token = std::str::from_utf8(&token_body)
-        .map_err(provider::error::CredentialsError::provider_error)?
+        .map_err(|_| {
+            provider_error_message(CredentialProviderErrorKind::MetadataCredentialsTextInvalid)
+        })?
         .to_owned();
     if token.trim().is_empty() {
         return Err(provider_error_message(
@@ -926,10 +941,13 @@ fn resolve_imds_credentials_with_blocking_client(
         ));
     }
 
-    let role_body = bounded_blocking_response_body(role_list_response)
-        .map_err(provider::error::CredentialsError::provider_error)?;
+    let role_body = bounded_blocking_response_body(role_list_response).map_err(|_| {
+        provider_error_message(CredentialProviderErrorKind::MetadataResponseInvalid)
+    })?;
     let role_name = std::str::from_utf8(&role_body)
-        .map_err(provider::error::CredentialsError::provider_error)?
+        .map_err(|_| {
+            provider_error_message(CredentialProviderErrorKind::MetadataCredentialsTextInvalid)
+        })?
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
@@ -950,10 +968,12 @@ fn resolve_imds_credentials_with_blocking_client(
         ));
     }
 
-    let body = bounded_blocking_response_body(credentials_response)
-        .map_err(provider::error::CredentialsError::provider_error)?;
-    let payload = serde_json::from_slice::<MetadataCredentialsResponse>(&body)
-        .map_err(provider::error::CredentialsError::provider_error)?;
+    let body = bounded_blocking_response_body(credentials_response).map_err(|_| {
+        provider_error_message(CredentialProviderErrorKind::MetadataResponseInvalid)
+    })?;
+    let payload = serde_json::from_slice::<MetadataCredentialsResponse>(&body).map_err(|_| {
+        provider_error_message(CredentialProviderErrorKind::MetadataCredentialsJsonInvalid)
+    })?;
 
     metadata_to_credentials(payload, IMDS_PROVIDER_NAME).map(Some)
 }
@@ -1032,8 +1052,9 @@ fn default_aws_profile_files_exist() -> bool {
 
 pub fn resolve_ecs_task_credentials_uri() -> CredentialProviderResult<Option<Url>> {
     if let Some(full_uri) = non_empty_env_var(AWS_CONTAINER_CREDENTIALS_FULL_URI) {
-        let uri = Url::parse(&full_uri)
-            .map_err(provider::error::CredentialsError::invalid_configuration)?;
+        let uri = Url::parse(&full_uri).map_err(|_| {
+            invalid_configuration_message(CredentialProviderErrorKind::InvalidEcsCredentialsUri)
+        })?;
         validate_ecs_full_uri(&uri)?;
         return Ok(Some(uri));
     }
@@ -1056,7 +1077,9 @@ pub fn resolve_ecs_task_credentials_uri() -> CredentialProviderResult<Option<Url
 
     let uri = Url::parse(ECS_RELATIVE_CREDENTIALS_BASE)
         .and_then(|base| base.join(&normalized))
-        .map_err(provider::error::CredentialsError::invalid_configuration)?;
+        .map_err(|_| {
+            invalid_configuration_message(CredentialProviderErrorKind::InvalidEcsCredentialsUri)
+        })?;
 
     if uri.scheme() != "http" || uri.host_str() != Some("169.254.170.2") {
         return Err(invalid_configuration_message(
@@ -1105,20 +1128,21 @@ pub fn resolve_ecs_authorization_token() -> CredentialProviderResult<Option<Stri
         let token_bytes =
             read_bounded_file(&token_file, MAX_AUTHORIZATION_TOKEN_BYTES).map_err(|error| {
                 match error {
-                    BoundedFileReadError::Io(error) => {
-                        provider::error::CredentialsError::provider_error(error)
-                    }
+                    BoundedFileReadError::Io => provider_error_message(
+                        CredentialProviderErrorKind::AuthorizationTokenFileReadFailed,
+                    ),
                     BoundedFileReadError::TooLarge => provider_error_message(
                         CredentialProviderErrorKind::AuthorizationTokenFileTooLarge,
                     ),
                 }
             })?;
-        let token = std::str::from_utf8(&token_bytes)
-            .map_err(provider::error::CredentialsError::provider_error)?;
+        let token = std::str::from_utf8(&token_bytes).map_err(|_| {
+            provider_error_message(CredentialProviderErrorKind::AuthorizationTokenFileInvalidUtf8)
+        })?;
         let trimmed = token.trim().to_owned();
         if trimmed.is_empty() {
             return Err(provider_error_message(
-                CredentialProviderErrorKind::EmptyAuthorizationTokenFile(token_file),
+                CredentialProviderErrorKind::EmptyAuthorizationTokenFile,
             ));
         }
         return Ok(Some(trimmed));

@@ -4,11 +4,11 @@ pub type AuthzRuntimeResult<T> = Result<T, AuthzRuntimeError>;
 
 #[derive(Debug, Error)]
 pub enum AuthzRuntimeError {
-    #[error("policy runtime build failed: {0}")]
-    Build(String),
+    #[error("policy runtime build failed")]
+    Build,
 
-    #[error("cedar evaluation failed: {0}")]
-    Cedar(String),
+    #[error("cedar evaluation failed")]
+    Cedar,
 
     #[error("snapshot subject does not match evaluation request")]
     SubjectSnapshotMismatch,
@@ -30,11 +30,11 @@ pub enum AuthzRuntimeError {
 }
 
 impl AuthzRuntimeError {
-    pub fn build(error: impl std::fmt::Display) -> Self {
-        Self::Build(error.to_string())
+    pub fn build(_error: impl std::fmt::Display) -> Self {
+        Self::Build
     }
 
-    pub fn cedar(error: impl std::fmt::Display) -> Self {
-        Self::Cedar(error.to_string())
+    pub fn cedar(_error: impl std::fmt::Display) -> Self {
+        Self::Cedar
     }
 }

@@ -15,4 +15,4 @@ pub use header::{JwsAlgorithm, ProtectedHeader};
 pub use key_material::{PreparedVerifier, PublicJwk, PublicJwks, PublicKeyComponents};
 
 #[cfg(test)]
-mod tests;
+mod jose_core_tests;

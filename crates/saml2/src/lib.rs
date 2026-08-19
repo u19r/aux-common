@@ -21,4 +21,4 @@ pub use metadata::{
 pub use xml_security::{VerifiedElement, VerifiedXmlDocument};
 
 #[cfg(test)]
-mod tests;
+mod saml2_tests;

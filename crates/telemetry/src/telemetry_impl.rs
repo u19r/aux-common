@@ -11,11 +11,7 @@ use axum_prometheus::{
 };
 use subtle::ConstantTimeEq;
 use tracing::warn;
-use tracing_subscriber::{
-    EnvFilter,
-    layer::SubscriberExt as _,
-    util::{SubscriberInitExt, TryInitError},
-};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt};
 
 use crate::{
     MetricsConfig, TracingConfig,
@@ -24,10 +20,10 @@ use crate::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum TelemetryError {
-    #[error("failed to initialise tracing subscriber: {0}")]
-    SubscriberInit(#[source] TryInitError),
+    #[error("failed to initialise tracing subscriber")]
+    SubscriberInit,
     #[error("failed to configure tracing log destination: {0}")]
-    WideLogInit(#[source] WideLogInitError),
+    WideLogInit(WideLogInitError),
     #[error("Prometheus metrics enabled but bearer token missing")]
     MetricsTokenMissing,
 }
@@ -53,11 +49,8 @@ pub fn resolve_filter(tracing_cfg: &TracingConfig) -> (EnvFilter, FilterSource) 
     if let Some(spec) = tracing_cfg.log_level.as_deref() {
         match EnvFilter::try_new(spec) {
             Ok(filter) => return (filter, FilterSource::Config),
-            Err(err) => {
-                eprintln!(
-                    "Invalid log level '{}' in tracing config ({}), falling back to default filter",
-                    spec, err
-                );
+            Err(_) => {
+                eprintln!("invalid tracing log filter; falling back to the default filter");
             }
         }
     }
@@ -75,7 +68,7 @@ pub fn init_tracing(
         .with(filter)
         .with(wide_log_layer)
         .try_init()
-        .map_err(TelemetryError::SubscriberInit)?;
+        .map_err(|_| TelemetryError::SubscriberInit)?;
 
     Ok(TelemetryGuards)
 }

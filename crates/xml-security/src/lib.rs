@@ -17,4 +17,4 @@ pub use xml::{
 };
 
 #[cfg(test)]
-mod tests;
+mod xml_security_tests;

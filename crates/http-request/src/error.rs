@@ -6,16 +6,9 @@ use thiserror::Error;
 #[derive(Error)]
 pub enum HttpRequestError {
     #[error("request build failed")]
-    Build {
-        #[source]
-        source: reqwest::Error,
-    },
+    Build,
     #[error("request failed: {kind:?}")]
-    Transport {
-        kind: HttpRequestErrorKind,
-        #[source]
-        source: reqwest::Error,
-    },
+    Transport { kind: HttpRequestErrorKind },
     #[error("request body too large: {size} > {max}")]
     RequestTooLarge { size: usize, max: usize },
     #[error("request body size unknown (max {max})")]
@@ -35,10 +28,10 @@ pub enum HttpRequestError {
     RedirectBlocked { reason: &'static str },
     #[error("ssrf blocked: {reason}")]
     SsrfBlocked { reason: &'static str },
-    #[error("invalid url: {message}")]
-    InvalidUrl { message: String },
-    #[error("response decode failed: {message}")]
-    Decode { message: String },
+    #[error("invalid URL")]
+    InvalidUrl,
+    #[error("response body could not be decoded")]
+    Decode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,27 +53,15 @@ pub enum HttpRequestErrorKind {
 impl fmt::Debug for HttpRequestError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Build { .. } => formatter
-                .debug_struct("Build")
-                .field("source", &"[REDACTED]")
-                .finish(),
-            Self::Transport { kind, .. } => formatter
+            Self::Build => formatter.write_str("Build"),
+            Self::Transport { kind } => formatter
                 .debug_struct("Transport")
                 .field("kind", kind)
-                .field("source", &"[REDACTED]")
                 .finish(),
             Self::HttpStatus { status, body } => formatter
                 .debug_struct("HttpStatus")
                 .field("status", status)
                 .field("body", &body.as_ref().map(|_| "[REDACTED]"))
-                .finish(),
-            Self::InvalidUrl { .. } => formatter
-                .debug_struct("InvalidUrl")
-                .field("message", &"[REDACTED]")
-                .finish(),
-            Self::Decode { message } => formatter
-                .debug_struct("Decode")
-                .field("message", message)
                 .finish(),
             other => write!(formatter, "{other}"),
         }
@@ -93,8 +74,8 @@ impl HttpRequestError {
     #[must_use]
     pub fn kind(&self) -> HttpRequestErrorKind {
         match self {
-            HttpRequestError::Build { .. } => HttpRequestErrorKind::Build,
-            HttpRequestError::Transport { kind, .. } => *kind,
+            HttpRequestError::Build => HttpRequestErrorKind::Build,
+            HttpRequestError::Transport { kind } => *kind,
             HttpRequestError::RequestTooLarge { .. }
             | HttpRequestError::RequestSizeUnknown { .. }
             | HttpRequestError::RequestNotCloneable
@@ -103,8 +84,8 @@ impl HttpRequestError {
             HttpRequestError::HttpStatus { .. } => HttpRequestErrorKind::Status,
             HttpRequestError::RedirectBlocked { .. } => HttpRequestErrorKind::Redirect,
             HttpRequestError::SsrfBlocked { .. } => HttpRequestErrorKind::Ssrf,
-            HttpRequestError::InvalidUrl { .. } => HttpRequestErrorKind::InvalidUrl,
-            HttpRequestError::Decode { .. } => HttpRequestErrorKind::Decode,
+            HttpRequestError::InvalidUrl => HttpRequestErrorKind::InvalidUrl,
+            HttpRequestError::Decode => HttpRequestErrorKind::Decode,
         }
     }
 }
@@ -124,9 +105,7 @@ impl From<reqwest::Error> for HttpRequestError {
         } else {
             HttpRequestErrorKind::Unknown
         };
-        HttpRequestError::Transport {
-            kind,
-            source: error.without_url(),
-        }
+        let _ = error;
+        HttpRequestError::Transport { kind }
     }
 }

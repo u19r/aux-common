@@ -62,6 +62,7 @@ password-hash = { version = "0.6.1", features = ["rand_core"] }
 pem = "4.0.0"
 quote = "1.0.47"
 rand = "0.10.2"
+regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = [
     "blocking",
     "form",
@@ -71,6 +72,7 @@ reqwest = { version = "0.13.4", default-features = false, features = [
     "rustls",
     "stream",
 ] }
+schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
@@ -88,6 +90,7 @@ tracing-subscriber = { version = "0.3.23", features = [
     "fmt",
     "json",
 ] }
+typed-builder = "0.23.2"
 url = "2.5.8"
 utoipa = { version = "5.5.0", features = ["chrono", "uuid"] }
 uuid = "1.24.1"

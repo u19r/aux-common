@@ -60,21 +60,21 @@ impl PolicyDocument {
         for policy in &self.static_policies {
             let policy_id = PolicyId::new(policy.policy_id.clone());
             let parsed = Policy::parse(Some(policy_id), &policy.policy_text)
-                .map_err(|error| CedarError::policy_generation(error.to_string()))?;
+                .map_err(|_| CedarError::policy_generation("policy syntax is invalid"))?;
             policy_set
                 .add(parsed)
-                .map_err(|error| CedarError::policy_generation(error.to_string()))?;
+                .map_err(|_| CedarError::policy_generation("policy set rejected a policy"))?;
         }
 
         let role_type = EntityTypeName::from_str("Authz::Role")
-            .map_err(|error| CedarError::policy_generation(error.to_string()))?;
+            .map_err(|_| CedarError::policy_generation("role entity type is invalid"))?;
         for group in &self.template_groups {
             let template_id = PolicyId::new(group.template_id.clone());
             let template = Template::parse(Some(template_id.clone()), &group.template_text)
-                .map_err(|error| CedarError::policy_generation(error.to_string()))?;
+                .map_err(|_| CedarError::policy_generation("policy template syntax is invalid"))?;
             policy_set
                 .add_template(template)
-                .map_err(|error| CedarError::policy_generation(error.to_string()))?;
+                .map_err(|_| CedarError::policy_generation("policy set rejected a template"))?;
 
             for link in &group.links {
                 let vals = HashMap::from([(
@@ -90,15 +90,17 @@ impl PolicyDocument {
                         PolicyId::new(link.policy_id.clone()),
                         vals,
                     )
-                    .map_err(|error| CedarError::policy_generation(error.to_string()))?;
+                    .map_err(|_| {
+                        CedarError::policy_generation("policy template link is invalid")
+                    })?;
             }
         }
 
         let json = policy_set
             .to_json()
-            .map_err(|error| CedarError::policy_generation(error.to_string()))?;
+            .map_err(|_| CedarError::policy_generation("policy set serialization failed"))?;
         serde_json::to_string(&json)
-            .map_err(|error| CedarError::policy_generation(error.to_string()))
+            .map_err(|_| CedarError::policy_generation("policy JSON serialization failed"))
     }
 }
 
@@ -242,7 +244,9 @@ fn build_policy_document(
     for role in &config.roles {
         for permission_entry in &role.permissions {
             let permission = config
-                .get_permission(permission_entry.permission_id.as_str())
+                .permissions
+                .iter()
+                .find(|permission| permission.id == permission_entry.permission_id.as_str())
                 .ok_or_else(|| {
                     CedarError::policy_generation(format!(
                         "permission not found: {}",

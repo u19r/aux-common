@@ -207,9 +207,7 @@ impl TenantHttpClientBuilder {
             .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(SsrfDnsResolver::new(ssrf_config.clone()))
             .build()
-            .map_err(|err| HttpRequestError::Build {
-                source: err.without_url(),
-            })?;
+            .map_err(|_| HttpRequestError::Build)?;
 
         let http = HttpClient::with_client(client, self.retry);
         let ssrf = SsrfProtector::new(ssrf_config);
@@ -264,9 +262,7 @@ impl TenantHttpClient {
     }
 
     pub async fn execute_request(&self, builder: RequestBuilder) -> Result<HttpResponse> {
-        let request = builder.build().map_err(|err| HttpRequestError::Build {
-            source: err.without_url(),
-        })?;
+        let request = builder.build().map_err(|_| HttpRequestError::Build)?;
         self.execute(request).await
     }
 
@@ -319,15 +315,13 @@ impl TenantHttpClient {
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|value| value.to_str().ok())
-                .ok_or_else(|| HttpRequestError::RedirectBlocked {
+                .ok_or(HttpRequestError::RedirectBlocked {
                     reason: REDIRECT_BLOCKED_METHOD_CHANGE,
                 })?;
 
             let next_url = url
                 .join(location)
-                .map_err(|err| HttpRequestError::InvalidUrl {
-                    message: err.to_string(),
-                })?;
+                .map_err(|_| HttpRequestError::InvalidUrl)?;
 
             let mut next_request = current
                 .try_clone()

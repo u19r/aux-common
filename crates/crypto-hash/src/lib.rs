@@ -20,4 +20,4 @@ pub use password::{
 };
 
 #[cfg(test)]
-mod tests;
+mod crypto_hash_tests;
