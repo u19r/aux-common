@@ -16,9 +16,6 @@ pub enum CedarError {
 
     #[error("Evaluation failed: {message}")]
     Evaluation { message: String },
-
-    #[error("Not implemented: {topic}")]
-    NotImplemented { topic: &'static str },
 }
 
 impl CedarError {
@@ -50,9 +47,5 @@ impl CedarError {
         Self::Evaluation {
             message: message.into(),
         }
-    }
-
-    pub fn not_implemented(topic: &'static str) -> Self {
-        Self::NotImplemented { topic }
     }
 }

@@ -2,7 +2,7 @@ use std::{collections::HashSet, fmt};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{JwtDecodeError, JwtDecodeErrorKind, PolicyErrorKind, Result};
+use crate::{JwtDecodeError, JwtDecodeErrorKind, PolicyErrorKind, error::Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SignatureAlgorithm {
@@ -26,6 +26,28 @@ impl SignatureAlgorithm {
         matches!(self, Self::HS256 | Self::HS384 | Self::HS512)
     }
 
+    /// Map a raw JOSE `alg` header value to the closed algorithm set before
+    /// the backend parses the header, so undecodable values such as `none`
+    /// fail with an algorithm-category error instead of a claims error.
+    pub(crate) fn try_from_name(name: &str) -> Result<Self> {
+        match name {
+            "HS256" => Ok(Self::HS256),
+            "HS384" => Ok(Self::HS384),
+            "HS512" => Ok(Self::HS512),
+            "RS256" => Ok(Self::RS256),
+            "RS384" => Ok(Self::RS384),
+            "RS512" => Ok(Self::RS512),
+            "PS256" => Ok(Self::PS256),
+            "PS384" => Ok(Self::PS384),
+            "PS512" => Ok(Self::PS512),
+            "ES256" => Ok(Self::ES256),
+            "ES384" => Ok(Self::ES384),
+            "EdDSA" => Ok(Self::EdDSA),
+            _ => Err(JwtDecodeError::new(JwtDecodeErrorKind::UnsupportedHeader)),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn to_backend(self) -> jsonwebtoken::Algorithm {
         match self {
             Self::HS256 => jsonwebtoken::Algorithm::HS256,
@@ -122,10 +144,6 @@ impl AllowedAlgorithms {
 
     pub(crate) fn contains(&self, algorithm: SignatureAlgorithm) -> bool {
         self.algorithms.contains(&algorithm)
-    }
-
-    pub(crate) fn iter(&self) -> impl Iterator<Item = SignatureAlgorithm> + '_ {
-        self.algorithms.iter().copied()
     }
 
     pub(crate) fn allow_symmetric(&self) -> bool {

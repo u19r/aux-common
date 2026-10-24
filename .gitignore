@@ -1,4 +1,8 @@
 /target/
+/target8/
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
 /.DS_Store
 
 run-artifacts/

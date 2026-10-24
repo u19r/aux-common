@@ -3,6 +3,8 @@ use thiserror::Error;
 /// Stable categories for malformed or unsupported JOSE material.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum JoseError {
+    #[error("response encryption failed")]
+    EncryptionFailed,
     #[error("compact JWS shape is invalid")]
     InvalidCompactShape,
     #[error("base64url encoding is invalid")]

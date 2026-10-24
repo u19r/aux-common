@@ -1,0 +1,25 @@
+qnt	family	model	action	target	siblings	unsafe_behavior
+QNT-001	lifecycle	quint/mutations/lifecycle-token.qnt	unsafe	inv_authority	inv_mutation_siblings	wrong lease token commits terminal mutation
+QNT-002	store	quint/mutations/store-partial.qnt	unsafe	inv_route_equivalence	inv_mutation_siblings	non-atomic enqueue publication loses due route
+QNT-003	store	quint/mutations/store-contracts.qnt	unsafe_qnt_003	qnt_003_detail_after_delete	qnt_003_siblings	completion detail exposed before record deletion
+QNT-004	lifecycle	quint/mutations/lifecycle-contracts.qnt	unsafe_qnt_004	qnt_004_retry_execution_stable	qnt_004_siblings	retry rotates execution identity
+QNT-005	lifecycle	quint/mutations/lifecycle-contracts.qnt	unsafe_qnt_005	qnt_005_retry_is_bounded	qnt_005_siblings	retry exceeds attempt bound
+QNT-006	lifecycle	quint/mutations/lifecycle-contracts.qnt	unsafe_qnt_006	qnt_006_reconcile_never_executes_handler	qnt_006_siblings	reconciliation executes handler work
+QNT-007	lifecycle	quint/mutations/lifecycle-contracts.qnt	unsafe_qnt_007	qnt_007_redrive_rejects_old_generation	qnt_007_siblings	redrive accepts old generation authority
+QNT-008	lifecycle	quint/mutations/lifecycle-contracts.qnt	unsafe_qnt_008	qnt_008_invalid_records_unclaimable	qnt_008_siblings	corrupt record is claimed
+QNT-009	store	quint/mutations/store-contracts.qnt	unsafe_qnt_009	qnt_009_transactions_are_atomic	qnt_009_siblings	partial transaction publishes incomplete route set
+QNT-010	store	quint/mutations/store-contracts.qnt	unsafe_qnt_010	qnt_010_purge_checks_revision	qnt_010_siblings	dangling purge skips revision check
+QNT-011	fair-dispatch	quint/mutations/fair-contracts.qnt	unsafe_qnt_011	qnt_011_quiet_scope_progress	qnt_011_siblings	noisy scope consumes service without quiet progress
+QNT-012	fair-dispatch	quint/mutations/fair-contracts.qnt	unsafe_qnt_012	qnt_012_secondary_charges_primary	qnt_012_siblings	secondary service is not charged to primary
+QNT-013	fair-dispatch	quint/mutations/fair-priority.qnt	unsafe	inv_weighted_progress	inv_mutation_siblings	critical service bypasses due bulk window
+QNT-014	fair-dispatch	quint/mutations/fair-contracts.qnt	unsafe_qnt_014	qnt_014_blocked_head_does_not_freeze_other_scope	qnt_014_siblings	blocked head freezes unrelated ready scope
+QNT-015	fair-dispatch	quint/mutations/fair-contracts.qnt	unsafe_qnt_015	qnt_015_success_cannot_ack_unresolved_successor	qnt_015_siblings	success acknowledges unresolved ordering successor
+QNT-016	fair-dispatch	quint/mutations/fair-contracts.qnt	unsafe_qnt_016	qnt_016_capacity_never_overdrawn	qnt_016_siblings	selection overdraws capacity budget
+QNT-017	schedule-wake	quint/mutations/schedule-contracts.qnt	unsafe_qnt_017	qnt_017_occurrence_identity_is_global	qnt_017_siblings	node-local occurrence IDs collide globally
+QNT-018	schedule-wake	quint/mutations/schedule-contracts.qnt	unsafe_qnt_018	qnt_018_catchup_is_bounded	qnt_018_siblings	catch-up emits beyond configured bound
+QNT-019	schedule-wake	quint/mutations/schedule-contracts.qnt	unsafe_qnt_019	qnt_019_wake_is_not_durable_authority	qnt_019_siblings	notification fabricates durable work authority
+QNT-020	schedule-wake	quint/mutations/schedule-contracts.qnt	unsafe_qnt_020	qnt_020_one_shot_pulse_exits	qnt_020_siblings	one-shot pulse continues after no-work result
+QNT-021	http-retry	quint/mutations/http-contracts.qnt	unsafe_qnt_021	qnt_021_exactly_one_retry_owner	qnt_021_siblings	transport and engine both own retry
+QNT-022	http-retry	quint/mutations/http-retry.qnt	unsafe	inv_http_safety	inv_mutation_siblings	automatic HTTP attempts lose stable idempotency or expose secret diagnostic material
+QNT-023	fair-dispatch	quint/mutations/fair-contracts.qnt	unsafe_qnt_023	qnt_023_batch_success_is_item_local	qnt_023_siblings	batch-wide success marks missing item successful
+QNT-024	system-authority	quint/mutations/system-contracts.qnt	unsafe_qnt_024	qnt_024_composite_obeys_family_admission	qnt_024_siblings	composite claim bypasses family admission predicate

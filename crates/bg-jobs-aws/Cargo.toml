@@ -1,0 +1,33 @@
+[package]
+publish = false
+name = "bg-jobs-aws"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "AWS SigV4 authorisation and immutable S3 publication for durable background jobs."
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[dependencies]
+aws-credentials = { workspace = true }
+aws-sigv4-signing = { workspace = true }
+bg-jobs-http = { workspace = true }
+http = { workspace = true }
+http-request = { workspace = true }
+
+[dev-dependencies]
+bg-jobs = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+quint-connect = { workspace = true }
+quint-connect-guard = { workspace = true }
+quint-http-connector = { workspace = true }
+
+[lints]
+workspace = true

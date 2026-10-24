@@ -1,0 +1,19 @@
+[package]
+publish = false
+name = "lambda-web-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Native HTTP server lifecycle for experimental Lambda Web Functions."
+
+[dependencies]
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+
+tokio = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,9 +1,13 @@
 [package]
+rust-version.workspace = true
 name = "http-request"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
 publish = false
+
+[features]
+test-support = []
 
 [dependencies]
 bytes = { workspace = true }
@@ -11,7 +15,6 @@ futures-util = { workspace = true }
 http = { workspace = true }
 httpdate = { workspace = true }
 ipnet = { workspace = true }
-metrics-facade = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

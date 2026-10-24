@@ -11,9 +11,6 @@ all-features = true
 yanked = "deny"
 unmaintained = "workspace"
 unsound = "all"
-ignore = [
-    { id = "RUSTSEC-2023-0071", reason = "jwt-decode exposes verification only; the rsa private-key timing operation is unreachable, including in the wasm rust_crypto target" },
-]
 
 [licenses]
 allow = [
@@ -30,6 +27,12 @@ allow = [
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
+]
+# Narrow exceptions for the external Quint test harness and detached fuzz
+# tooling; neither is linked into shipped libraries.
+exceptions = [
+    { name = "colored", version = "3.1.1", allow = ["MPL-2.0"] },
+    { name = "libfuzzer-sys", version = "0.4.13", allow = ["NCSA"] },
 ]
 confidence-threshold = 0.8
 

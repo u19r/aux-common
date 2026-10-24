@@ -22,6 +22,8 @@ use crate::{
 pub enum TelemetryError {
     #[error("failed to initialise tracing subscriber")]
     SubscriberInit,
+    #[error("invalid tracing log filter")]
+    InvalidFilter,
     #[error("failed to configure tracing log destination: {0}")]
     WideLogInit(WideLogInitError),
     #[error("Prometheus metrics enabled but bearer token missing")]
@@ -45,17 +47,15 @@ impl std::fmt::Display for FilterSource {
 
 pub struct TelemetryGuards;
 
-pub fn resolve_filter(tracing_cfg: &TracingConfig) -> (EnvFilter, FilterSource) {
+pub fn resolve_filter(
+    tracing_cfg: &TracingConfig,
+) -> Result<(EnvFilter, FilterSource), TelemetryError> {
     if let Some(spec) = tracing_cfg.log_level.as_deref() {
-        match EnvFilter::try_new(spec) {
-            Ok(filter) => return (filter, FilterSource::Config),
-            Err(_) => {
-                eprintln!("invalid tracing log filter; falling back to the default filter");
-            }
-        }
+        let filter = EnvFilter::try_new(spec).map_err(|_| TelemetryError::InvalidFilter)?;
+        return Ok((filter, FilterSource::Config));
     }
 
-    (EnvFilter::new("warn"), FilterSource::Default)
+    Ok((EnvFilter::new("warn"), FilterSource::Default))
 }
 
 pub fn init_tracing(
@@ -64,6 +64,24 @@ pub fn init_tracing(
 ) -> Result<TelemetryGuards, TelemetryError> {
     let wide_log_layer = WideLogLayer::new(tracing_cfg).map_err(TelemetryError::WideLogInit)?;
 
+    init_tracing_with_layer(filter, wide_log_layer)
+}
+
+pub fn init_tracing_with_sink(
+    filter: EnvFilter,
+    tracing_cfg: &TracingConfig,
+    sink: crate::wide_log::WideLogSink,
+) -> Result<TelemetryGuards, TelemetryError> {
+    let wide_log_layer =
+        WideLogLayer::new_with_sink(tracing_cfg, sink).map_err(TelemetryError::WideLogInit)?;
+
+    init_tracing_with_layer(filter, wide_log_layer)
+}
+
+fn init_tracing_with_layer(
+    filter: EnvFilter,
+    wide_log_layer: WideLogLayer,
+) -> Result<TelemetryGuards, TelemetryError> {
     tracing_subscriber::registry()
         .with(filter)
         .with(wide_log_layer)
@@ -97,6 +115,7 @@ impl MetricsState {
 }
 
 pub fn setup_metrics(cfg: &MetricsConfig) -> Result<Option<MetricsComponents>, TelemetryError> {
+    let _ = metrics_facade::install_http_request_observer();
     if !cfg.enabled {
         return Ok(None);
     }

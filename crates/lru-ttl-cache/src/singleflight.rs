@@ -45,7 +45,7 @@ where K: Clone + Eq + Hash
     }
 
     #[cfg(test)]
-    fn active_key_count(&self) -> usize {
+    pub(crate) fn active_key_count(&self) -> usize {
         lock_unpoisoned(&self.gates).len()
     }
 }
@@ -84,7 +84,3 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         Err(poisoned) => poisoned.into_inner(),
     }
 }
-
-#[cfg(test)]
-#[path = "singleflight_tests.rs"]
-mod singleflight_tests;

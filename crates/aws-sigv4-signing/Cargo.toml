@@ -1,4 +1,5 @@
 [package]
+rust-version.workspace = true
 publish = false
 name = "aws-sigv4-signing"
 version = "0.1.0"
@@ -9,16 +10,21 @@ license.workspace = true
 doctest = false
 
 [dependencies]
-aws-credential-types = { workspace = true }
 aws-credentials = { workspace = true }
-aws-sigv4 = { workspace = true, features = ["sign-http"] }
-aws-smithy-runtime-api = { workspace = true }
+chrono = { workspace = true }
+data-encoding = { workspace = true }
+hmac = { workspace = true }
 http = { workspace = true }
 http-request = { path = "../http-request" }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
+aws-credential-types = { workspace = true }
+aws-sigv4 = { workspace = true, features = ["sign-http"] }
+aws-smithy-runtime-api = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints.rust]

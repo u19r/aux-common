@@ -21,6 +21,7 @@ pub struct RpPolicy {
     expected_rp_id_hash: [u8; 32],
     user_verification: UserVerification,
     cross_origin_policy: CrossOriginPolicy,
+    expected_user_handle: Option<Vec<u8>>,
 }
 
 impl RpPolicy {
@@ -75,7 +76,27 @@ impl RpPolicy {
             expected_rp_id_hash,
             user_verification,
             cross_origin_policy,
+            expected_user_handle: None,
         })
+    }
+
+    /// Bind this ceremony to the expected user handle.
+    ///
+    /// WebAuthn L3 section 7.2 requires the relying party to verify that the
+    /// authenticator's `userHandle` identifies the account being
+    /// authenticated. Callers that bind credentials by `credential_id` alone
+    /// leave this as `None`; callers that require the check provide the
+    /// stored user id here and supply the authenticator's `userHandle` in
+    /// [`AssertionInput::user_handle`].
+    pub fn with_expected_user_handle(
+        mut self,
+        user_handle: &[u8],
+    ) -> Result<Self, crate::WebAuthnError> {
+        if user_handle.is_empty() || user_handle.len() > crate::constants::MAX_USER_HANDLE_BYTES {
+            return Err(crate::WebAuthnError::InvalidPolicy);
+        }
+        self.expected_user_handle = Some(user_handle.to_vec());
+        Ok(self)
     }
 
     #[must_use]
@@ -102,6 +123,11 @@ impl RpPolicy {
     pub fn cross_origin_policy(&self) -> &CrossOriginPolicy {
         &self.cross_origin_policy
     }
+
+    #[must_use]
+    pub fn expected_user_handle(&self) -> Option<&[u8]> {
+        self.expected_user_handle.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,14 +139,39 @@ pub struct AssertionInput<'a> {
     pub credential_id: &'a [u8],
     pub previous_sign_count: u32,
     pub policy: &'a RpPolicy,
+    /// Authenticator-provided `userHandle` from
+    /// `AuthenticatorAssertionResponse`, not from `clientDataJSON`.
+    ///
+    /// `None` means the authenticator reported no user handle. When the
+    /// policy carries an expected handle, `None` or a mismatch fails closed;
+    /// otherwise the provided value (if any) is returned in
+    /// [`AssertionResult::user_handle`] for caller-side binding.
+    pub user_handle: Option<&'a [u8]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignCountStatus {
-    Initial { value: u32 },
-    Increased { previous: u32, current: u32 },
-    Unchanged { value: u32 },
-    Regression { previous: u32, current: u32 },
+    Initial {
+        value: u32,
+    },
+    Increased {
+        previous: u32,
+        current: u32,
+    },
+    Unchanged {
+        value: u32,
+    },
+    Regression {
+        previous: u32,
+        current: u32,
+    },
+    /// Authenticator reports a zero counter with no history to compare.
+    ///
+    /// WebAuthn Level 3 notes authenticators may not implement a counter and
+    /// always return zero. A `ZeroCounter` result carries no replay signal:
+    /// first use and unlimited zero-counter replays are indistinguishable,
+    /// so callers must not use it for replay-detection-sensitive decisions.
+    ZeroCounter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,5 +209,4 @@ pub struct CosePublicKey {
 }
 use base64::Engine as _;
 
-const MIN_CHALLENGE_BYTES: usize = 16;
-const MAX_CHALLENGE_BYTES: usize = 128;
+use crate::constants::{MAX_CHALLENGE_BYTES, MIN_CHALLENGE_BYTES};

@@ -1,4 +1,5 @@
 [package]
+rust-version.workspace = true
 publish = false
 name = "aws-credentials"
 version = "0.1.0"
@@ -9,15 +10,16 @@ license.workspace = true
 doctest = false
 
 [dependencies]
-aws-credential-types = { workspace = true }
-aws-smithy-types = { workspace = true }
+chrono = { workspace = true }
 futures-util = { workspace = true }
 lru-ttl-cache = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
 url = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }

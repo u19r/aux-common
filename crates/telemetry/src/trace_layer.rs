@@ -11,7 +11,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use metrics_facade::{CostResponseHeaders, counter, histogram};
+use metrics_facade::{counter, histogram};
 use tower_http::{
     classify::{ServerErrorsAsFailures, ServerErrorsFailureClass, SharedClassifier},
     trace::{DefaultOnBodyChunk, DefaultOnEos, DefaultOnRequest, TraceLayer},
@@ -19,20 +19,18 @@ use tower_http::{
 use tracing::{Span, field, instrument};
 
 use crate::{
-    ForwardedHeaderConfig, SlowOperationThresholds, TraceContext,
+    ForwardedHeaderConfig, RequestCostCollection, SlowOperationThresholds, TraceContext,
     constants::{
         FIELD_FEATURE, FIELD_OPERATION_NAME, FIELD_REQUEST_ID, FIELD_SOURCE_IP, FIELD_TRACE_ID,
         HEADER_REQUEST_ID, HTTP_REQUEST_BYTES_TOTAL_METRIC, HTTP_RESPONSE_BYTES_TOTAL_METRIC,
-        LABEL_OPERATION, LABEL_STATUS_CODE, REQUEST_LATENCY_METRIC,
+        LABEL_OPERATION, LABEL_STATUS_CODE, REQUEST_LATENCY_METRIC, UNMATCHED_OPERATION,
     },
 };
-
-const UNMATCHED_OPERATION: &str = "_unmatched";
 
 #[derive(Clone, Debug, Default)]
 pub struct SlowOperationLogState {
     pub thresholds: SlowOperationThresholds,
-    pub collect_cost: bool,
+    pub cost_collection: RequestCostCollection,
 }
 
 pub type RequestTraceLayer = TraceLayer<
@@ -62,71 +60,74 @@ pub async fn slow_operation_log(
     next: Next,
 ) -> Response {
     let request_span = tracing::Span::current();
-    let method = request.method().clone();
-    let operation_path = bounded_operation_path(&request).to_string();
-    let operation_name = format!("{method} {operation_path}");
-    let request_bytes = content_length_or_body_size_hint(request.headers(), request.body());
-    let request_id = request
-        .headers()
-        .get(HEADER_REQUEST_ID)
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned);
+    let observation = RequestObservation::new(&request);
     let trace_context = TraceContext::from_headers(request.headers());
-    let started = Instant::now();
-
-    let response = if state.collect_cost {
-        let operation_name = operation_name.clone();
-        let request_id = request_id.clone();
-        metrics_facade::begin_request_cost_collection(request_id.clone(), || async move {
-            metrics_facade::set_request_cost_operation(&operation_name);
-            let mut response = next.run(request).await;
-            finalize_response_metrics(
-                &mut response,
-                &operation_name,
-                request_bytes,
-                request_id.as_deref(),
-                started,
-                true,
-            )
-            .await;
-            trace_context.write_forward_headers(response.headers_mut());
-            response
-        })
-        .await
-    } else {
+    let response = async {
+        if state.cost_collection.is_enabled() {
+            metrics_facade::set_request_cost_operation(&observation.operation_name);
+        }
         let mut response = next.run(request).await;
-        finalize_response_metrics(
-            &mut response,
-            &operation_name,
-            request_bytes,
-            request_id.as_deref(),
-            started,
-            false,
-        )
-        .await;
+        observation
+            .finalize_response(&mut response, state.cost_collection)
+            .await;
         trace_context.write_forward_headers(response.headers_mut());
         response
     };
+    let response = if state.cost_collection.is_enabled() {
+        metrics_facade::begin_request_cost_collection(observation.request_id.clone(), || response)
+            .await
+    } else {
+        response.await
+    };
+    observation.record_slow_operation(&response, &state.thresholds, &request_span);
+    response
+}
 
-    let status_code = response.status().as_u16();
-    let elapsed = started.elapsed();
-    let duration_ms_u64 = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-    let threshold_ms = state.thresholds.threshold_ms_for(&operation_name);
-    if duration_ms_u64 > threshold_ms {
-        let _entered = request_span.enter();
-        tracing::warn!(
-            target = "http.request",
-            operation_name = %operation_name,
-            method = %method,
-            path = %operation_path,
-            status_code,
-            duration_ms = duration_ms_u64,
-            slow_operation_threshold_ms = threshold_ms,
-            "slow API operation"
-        );
+struct RequestObservation {
+    method: http::Method,
+    operation_path: String,
+    operation_name: String,
+    request_id: Option<String>,
+    request_bytes: u64,
+    started: Instant,
+}
+
+impl RequestObservation {
+    fn new(request: &http::Request<Body>) -> Self {
+        let method = request.method().clone();
+        let operation_path = bounded_operation_path(request).to_owned();
+        let operation_name = format!("{method} {operation_path}");
+        Self {
+            method,
+            operation_path,
+            operation_name,
+            request_id: request
+                .headers()
+                .get(HEADER_REQUEST_ID)
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned),
+            request_bytes: content_length_or_body_size_hint(request.headers(), request.body()),
+            started: Instant::now(),
+        }
     }
 
-    response
+    fn record_slow_operation(
+        &self,
+        response: &Response,
+        thresholds: &SlowOperationThresholds,
+        span: &Span,
+    ) {
+        let duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let threshold_ms = thresholds.threshold_ms_for(&self.operation_name);
+        if duration_ms <= threshold_ms {
+            return;
+        }
+        let _entered = span.enter();
+        tracing::warn!(target: "http.request", operation_name = %self.operation_name,
+            method = %self.method, path = %self.operation_path,
+            status_code = response.status().as_u16(), duration_ms,
+            slow_operation_threshold_ms = threshold_ms, "slow API operation");
+    }
 }
 
 pub(crate) fn bounded_operation_path(request: &http::Request<Body>) -> &str {
@@ -137,49 +138,44 @@ pub(crate) fn bounded_operation_path(request: &http::Request<Body>) -> &str {
         .unwrap_or(UNMATCHED_OPERATION)
 }
 
-async fn finalize_response_metrics(
-    response: &mut Response,
-    operation_name: &str,
-    request_bytes: u64,
-    request_id: Option<&str>,
-    started: Instant,
-    collect_cost: bool,
-) {
-    let status_code = response.status().as_u16();
-    let status_code_label = status_code.to_string();
-    let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+impl RequestObservation {
+    async fn finalize_response(
+        &self,
+        response: &mut Response,
+        cost_collection: RequestCostCollection,
+    ) {
+        let status_code = response.status().as_u16();
+        let status_code_label = status_code.to_string();
+        let duration_ms = self.started.elapsed().as_secs_f64() * 1000.0;
 
-    counter!(
-        HTTP_REQUEST_BYTES_TOTAL_METRIC,
-        LABEL_OPERATION => operation_name.to_string(),
-        LABEL_STATUS_CODE => status_code_label.clone()
-    )
-    .increment(request_bytes);
+        counter!(
+            HTTP_REQUEST_BYTES_TOTAL_METRIC,
+            LABEL_OPERATION => self.operation_name.clone(),
+            LABEL_STATUS_CODE => status_code_label.clone()
+        )
+        .increment(self.request_bytes);
 
-    let response_bytes = content_length_or_body_size_hint(response.headers(), response.body());
-    counter!(
-        HTTP_RESPONSE_BYTES_TOTAL_METRIC,
-        LABEL_OPERATION => operation_name.to_string(),
-        LABEL_STATUS_CODE => status_code_label.clone()
-    )
-    .increment(response_bytes);
-    histogram!(
-        REQUEST_LATENCY_METRIC,
-        LABEL_OPERATION => operation_name.to_string(),
-        LABEL_STATUS_CODE => status_code_label
-    )
-    .record(duration_ms);
-
-    if collect_cost {
-        let cost_headers = CostResponseHeaders::from_snapshot(
-            metrics_facade::finish_request_cost_collection(
-                request_id,
+        let response_bytes = content_length_or_body_size_hint(response.headers(), response.body());
+        counter!(
+            HTTP_RESPONSE_BYTES_TOTAL_METRIC,
+            LABEL_OPERATION => self.operation_name.clone(),
+            LABEL_STATUS_CODE => status_code_label.clone()
+        )
+        .increment(response_bytes);
+        cost_collection
+            .finalize_response(
+                response,
+                self.request_id.as_deref(),
                 duration_ms,
-                Some(response_bytes),
+                response_bytes,
             )
-            .await,
-        );
-        cost_headers.write_to_headers(response.headers_mut());
+            .await;
+        histogram!(
+            REQUEST_LATENCY_METRIC,
+            LABEL_OPERATION => self.operation_name.clone(),
+            LABEL_STATUS_CODE => status_code_label
+        )
+        .record(self.started.elapsed().as_secs_f64() * 1000.0);
     }
 }
 

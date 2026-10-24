@@ -1,15 +1,6 @@
-use std::{
-    sync::{Arc, Mutex},
-    vec::Vec,
-};
+use std::collections::HashSet;
 
-use crate::{
-    CounterMetric, GaugeMetric, HistogramMetric, MetricLabel, MetricsCrateFacade, MetricsFacade,
-    counter, gauge, histogram, metrics_crate_facade_cache_snapshot,
-    recorder::MAX_METRIC_LABEL_VALUE_BYTES, set_metrics_facade,
-};
-
-const EXPECTED_CACHE_LIMIT: usize = 256;
+use crate::{CounterMetric, GaugeMetric, HistogramMetric};
 
 #[test]
 fn authz_projection_operation_metric_has_stable_name() {
@@ -18,65 +9,6 @@ fn authz_projection_operation_metric_has_stable_name() {
         "authz.projection.operations_total"
     );
 }
-
-static METRICS_FACADE_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-#[derive(Clone, Debug, Default)]
-struct CapturingMetricsFacade {
-    calls: Arc<Mutex<Vec<String>>>,
-}
-
-impl CapturingMetricsFacade {
-    fn calls(&self) -> Vec<String> {
-        self.calls.lock().unwrap().clone()
-    }
-
-    fn push_call(&self, call: impl Into<String>) {
-        self.calls.lock().unwrap().push(call.into());
-    }
-}
-
-impl MetricsFacade for CapturingMetricsFacade {
-    fn increment_counter(&self, metric: CounterMetric, labels: &[MetricLabel], value: u64) {
-        self.push_call(format!(
-            "counter_increment:{}:{}:{}",
-            metric.name(),
-            labels[0].value(),
-            value
-        ));
-    }
-
-    fn absolute_counter(&self, metric: CounterMetric, _labels: &[MetricLabel], value: u64) {
-        self.push_call(format!("counter_absolute:{}:{}", metric.name(), value));
-    }
-
-    fn increment_gauge(&self, metric: GaugeMetric, labels: &[MetricLabel], value: f64) {
-        self.push_call(format!(
-            "gauge_increment:{}:{}:{}",
-            metric.name(),
-            labels[0].value(),
-            value
-        ));
-    }
-
-    fn decrement_gauge(&self, metric: GaugeMetric, _labels: &[MetricLabel], value: f64) {
-        self.push_call(format!("gauge_decrement:{}:{}", metric.name(), value));
-    }
-
-    fn set_gauge(&self, metric: GaugeMetric, _labels: &[MetricLabel], value: f64) {
-        self.push_call(format!("gauge_set:{}:{}", metric.name(), value));
-    }
-
-    fn record_histogram(&self, metric: HistogramMetric, labels: &[MetricLabel], value: f64) {
-        self.push_call(format!(
-            "histogram_record:{}:{}:{}",
-            metric.name(),
-            labels[0].value(),
-            value
-        ));
-    }
-}
-
 #[test]
 fn storage_cache_metric_names_match_expected_ddb_operation_pattern() {
     assert_eq!(
@@ -136,7 +68,6 @@ fn storage_cache_metric_names_match_expected_ddb_operation_pattern() {
         "authn.federated.provision_enabled_sources"
     );
 }
-
 #[test]
 fn limits_capacity_metric_names_are_stable() {
     assert_eq!(
@@ -168,7 +99,6 @@ fn limits_capacity_metric_names_are_stable() {
         "limits.transition.duration.ms"
     );
 }
-
 #[test]
 fn managed_tenant_metric_names_match_expected_operational_surface() {
     assert_eq!(
@@ -192,7 +122,6 @@ fn managed_tenant_metric_names_match_expected_operational_surface() {
         "managed_tenant_suspensions_total"
     );
 }
-
 #[test]
 fn authn_identity_security_metric_names_match_expected_nist_surface() {
     assert_eq!(
@@ -232,102 +161,547 @@ fn authn_identity_security_metric_names_match_expected_nist_surface() {
         "authn.fraud_resolution_ms"
     );
 }
-
 #[test]
-fn metrics_handles_delegate_to_installed_facade() {
-    let _guard = METRICS_FACADE_TEST_LOCK.lock().unwrap();
-    let facade = CapturingMetricsFacade::default();
-    let previous = set_metrics_facade(Arc::new(facade.clone()));
-
-    counter!(CounterMetric::StorageOperationTotalMetric, "operation" => "get_item").increment(3);
-    gauge!(GaugeMetric::StorageDdbCacheHitRatioMetric, "operation" => "query").set(0.75);
-    histogram!(HistogramMetric::StorageOperationLatencyMsMetric, "operation" => "scan")
-        .record(12.5);
-
-    assert_eq!(
-        facade.calls(),
-        vec![
-            "counter_increment:storage.operation.total:get_item:3",
-            "gauge_set:ddb.cache.hit.ratio:0.75",
-            "histogram_record:storage.operation.latency.ms:scan:12.5",
-        ]
-    );
-
-    set_metrics_facade(previous);
-}
-
-#[test]
-fn metrics_crate_facade_re_registers_against_active_recorder() {
-    let _guard = METRICS_FACADE_TEST_LOCK.lock().unwrap();
-    let threads = (0..8).map(|_| {
-        std::thread::spawn(|| {
-            let facade = MetricsCrateFacade;
-            for _ in 0..10 {
-                facade.record_histogram(
-                    HistogramMetric::StorageOperationLatencyMsMetric,
-                    &[MetricLabel::new("operation", "cache_snapshot_test")],
-                    1.0,
-                );
-            }
-        })
-    });
-
-    for thread in threads {
-        thread.join().expect("metrics thread should not panic");
-    }
-}
-
-#[test]
-fn metrics_crate_facade_reuses_thread_local_handles() {
-    let _guard = METRICS_FACADE_TEST_LOCK.lock().unwrap();
-    let before = metrics_crate_facade_cache_snapshot();
-    let facade = MetricsCrateFacade;
-
-    for _ in 0..10 {
-        facade.record_histogram(
-            HistogramMetric::StorageOperationLatencyMsMetric,
-            &[MetricLabel::new("operation", "thread_local_cache_test")],
-            1.0,
-        );
-    }
-
-    let after = metrics_crate_facade_cache_snapshot();
-    assert_eq!(after.histograms - before.histograms, 1);
-}
-
-#[test]
-fn dynamic_metric_labels_do_not_grow_the_thread_local_cache_without_bound() {
-    let _guard = METRICS_FACADE_TEST_LOCK.lock().unwrap();
-    let facade = MetricsCrateFacade;
-
-    for index in 0..=EXPECTED_CACHE_LIMIT {
-        facade.record_histogram(
-            HistogramMetric::StorageOperationLatencyMsMetric,
-            &[MetricLabel::new("operation", format!("untrusted-{index}"))],
-            1.0,
-        );
-    }
-
-    let (_, _, histogram_cache_size) =
-        crate::recorder::metrics_crate_facade_thread_local_cache_sizes();
-    assert!(
-        histogram_cache_size <= EXPECTED_CACHE_LIMIT,
-        "dynamic label cache retained {histogram_cache_size} entries"
-    );
-}
-
-#[test]
-fn oversized_metric_labels_are_dropped_before_facade_dispatch() {
-    let _guard = METRICS_FACADE_TEST_LOCK.lock().unwrap();
-    let facade = CapturingMetricsFacade::default();
-    let previous = set_metrics_facade(Arc::new(facade.clone()));
-
-    histogram!(
+fn given_all_metric_variants_when_names_are_registered_then_names_are_static_and_unique() {
+    // Given every public metric variant is part of one bounded vocabulary.
+    let counters = [
+        CounterMetric::AnalyticsCompactionObjectsReadTotalMetric,
+        CounterMetric::AnalyticsCompactionObjectsWrittenTotalMetric,
+        CounterMetric::AnalyticsCompactionRunsTotalMetric,
+        CounterMetric::AnalyticsIngestionBytesWrittenTotalMetric,
+        CounterMetric::AnalyticsIngestionCursorStallsTotalMetric,
+        CounterMetric::AnalyticsIngestionFailuresTotalMetric,
+        CounterMetric::AnalyticsIngestionLeaseConflictsTotalMetric,
+        CounterMetric::AnalyticsIngestionLeaseErrorsTotalMetric,
+        CounterMetric::AnalyticsIngestionLeasesAcquiredTotalMetric,
+        CounterMetric::AnalyticsIngestionProcessErrorsTotalMetric,
+        CounterMetric::AnalyticsIngestionRecordsDedupedTotalMetric,
+        CounterMetric::AnalyticsIngestionRecordsDeletedTotalMetric,
+        CounterMetric::AnalyticsIngestionRecordsFetchedTotalMetric,
+        CounterMetric::AnalyticsIngestionRecordsInsertedTotalMetric,
+        CounterMetric::AnalyticsIngestionRecordsUniqueTotalMetric,
+        CounterMetric::AnalyticsIngestionRecordsUpdatedTotalMetric,
+        CounterMetric::AnalyticsIngestionSchemaChangesTotalMetric,
+        CounterMetric::AnalyticsIngestionTableErrorsTotalMetric,
+        CounterMetric::AnalyticsIngestionTablesTotalMetric,
+        CounterMetric::AnalyticsIngestionTransactionsTotalMetric,
+        CounterMetric::AnalyticsQueryRecordsReturnedTotalMetric,
+        CounterMetric::AuditEmitterEventsRecordedTotal,
+        CounterMetric::AuditEmitterWriteFailuresTotal,
+        CounterMetric::AuditEmitterWriteRetriesTotal,
+        CounterMetric::AuditEmitterWriteSuccessTotal,
+        CounterMetric::AuditTransactionalCowriteSuccessTotal,
+        CounterMetric::AuditTransactionalOverflowTotal,
+        CounterMetric::AuthzApiDecisionsTotal,
+        CounterMetric::AuthzCedarEvaluationErrorsTotal,
+        CounterMetric::AuthzApiTokenContextDenyTotal,
+        CounterMetric::AuthzApiTokenContextTotal,
+        CounterMetric::AuthzAxumDecisionTotal,
+        CounterMetric::AuthzAxumErrorTotal,
+        CounterMetric::AuthzJwtVerifyTotal,
+        CounterMetric::AuthzProjectionOperationsTotal,
+        CounterMetric::AuthzTokenContextDenyTotal,
+        CounterMetric::BackfillJobExpiredLockFoundCount,
+        CounterMetric::BackfillJobIdleCount,
+        CounterMetric::BackfillJobsThrottledCount,
+        CounterMetric::BillingRouteMetricCandidatesTotal,
+        CounterMetric::BillingOperationUsageDuplicateRequestsTotal,
+        CounterMetric::BillingProviderPendingReconciliationTotal,
+        CounterMetric::BillingRoutePolicyApiOperationTotal,
+        CounterMetric::BgJobsLockSkipsTotalMetric,
+        CounterMetric::BgJobsRunErrorsTotalMetric,
+        CounterMetric::BgJobsRunsTotalMetric,
+        CounterMetric::BgWorkerItemsProcessedTotalMetric,
+        CounterMetric::BgWorkerLeaseConflictsTotalMetric,
+        CounterMetric::BgWorkerProcessErrorsTotalMetric,
+        CounterMetric::BgWorkerRunErrorsTotalMetric,
+        CounterMetric::CustomDomainBillingTransitionsTotalMetric,
+        CounterMetric::CustomDomainFrontDoorAttemptsTotalMetric,
+        CounterMetric::CustomDomainFrontDoorOutcomesTotalMetric,
+        CounterMetric::CustomDomainReconcileAttemptsTotalMetric,
+        CounterMetric::CustomDomainReconcileOutcomesTotalMetric,
+        CounterMetric::FoundationdbOperationBytesTotal,
+        CounterMetric::FoundationdbOperationsTotal,
+        CounterMetric::GsiUpdateEmptyBatches,
+        CounterMetric::GsiUpdateOps,
+        CounterMetric::GsiUpdatePointerBatches,
+        CounterMetric::GsiUpdateStreamItems,
+        CounterMetric::HttpRequestBytesTotalMetric,
+        CounterMetric::HttpResponseBytesTotalMetric,
+        CounterMetric::MetricAuthnAuthenticationAttemptTotal,
+        CounterMetric::MetricAuthnAuthenticatorDisabledTotal,
+        CounterMetric::MetricAuthnAuthenticatorLifecycleTotal,
+        CounterMetric::MetricAuthnFraudReportTotal,
+        CounterMetric::MetricAuthnRecoveryAttemptTotal,
+        CounterMetric::MetricAuthnSessionAssuranceTotal,
+        CounterMetric::MetricAuthnSupportInterventionTotal,
+        CounterMetric::MetricBlocklistBatchWriteRetryExhaustedTotal,
+        CounterMetric::MetricBlocklistBatchWriteRetryTotal,
+        CounterMetric::MetricFederatedProvisionHookTotal,
+        CounterMetric::MetricFederatedProvisionPolicyTotal,
+        CounterMetric::MetricFederatedProvisionStageTotal,
+        CounterMetric::MetricFederatedProvisionTotal,
+        CounterMetric::MetricHttpRequestAttempts,
+        CounterMetric::MetricHttpRequestErrors,
+        CounterMetric::MetricHttpRequestRetries,
+        CounterMetric::LimitsExpiryReclaimedTotal,
+        CounterMetric::LimitsExpiryRowsScannedTotal,
+        CounterMetric::LimitsExpirySweepsTotal,
+        CounterMetric::LimitsTransitionConflictsTotal,
+        CounterMetric::LimitsTransitionTotal,
+        CounterMetric::MetricNotificationsDeliveryAttemptTotal,
+        CounterMetric::MetricNotificationsDeliveryBackpressureTotal,
+        CounterMetric::MetricNotificationsDeliveryEnqueuedTotal,
+        CounterMetric::MetricNotificationsDeliveryFailedTotal,
+        CounterMetric::MetricNotificationsDeliveryRetryScheduledTotal,
+        CounterMetric::MetricNotificationsDeliverySuccessTotal,
+        CounterMetric::MetricNotificationsDestinationCircuitOpenTotal,
+        CounterMetric::MetricNotificationsQueuePointerEnqueuedTotal,
+        CounterMetric::MetricNotificationsQueuePointerProcessTotal,
+        CounterMetric::MetricNotificationsWorkerProcessedTotal,
+        CounterMetric::MetricNotificationsWorkerRunTotal,
+        CounterMetric::MetricOauthUserinfoFallbackTotal,
+        CounterMetric::MetricQueueEmptyReceivesTotal,
+        CounterMetric::MetricOutboxItemsProcessedTotal,
+        CounterMetric::ManagedTenantDecisionsTotal,
+        CounterMetric::ManagedTenantQuotaDenialsTotal,
+        CounterMetric::ManagedTenantSupportSessionTransitionsTotal,
+        CounterMetric::ManagedTenantSuspensionsTotal,
+        CounterMetric::ManagedTenantTemplateApplyTotal,
+        CounterMetric::PrefetchBatchGetTotal,
+        CounterMetric::PrefetchKeysTotal,
+        CounterMetric::PrefetchSkippedHotTotal,
+        CounterMetric::PrefetchUnprocessedTotal,
+        CounterMetric::PartitionLoadSamplesFlushedTotalMetric,
+        CounterMetric::PartitionReconcileActionsTotalMetric,
+        CounterMetric::PartitionReconcileRunsTotalMetric,
+        CounterMetric::PartitionRoutingRetriesTotalMetric,
+        CounterMetric::MetricSamlAcsIssuerOrgResolutionTotal,
+        CounterMetric::MetricSamlProviderMetadataTotal,
+        CounterMetric::MetricSamlProviderSsoFailureTotal,
+        CounterMetric::MetricSecurityFailureTotal,
+        CounterMetric::MetricSloSuccessTotal,
+        CounterMetric::MetricSsoSuccessTotal,
+        CounterMetric::MetricStaleCleanupTotal,
+        CounterMetric::RemoteStorageFailoverCount,
+        CounterMetric::RemoteStorageRequestBytesTotalMetric,
+        CounterMetric::RemoteStorageResponseBytesTotalMetric,
+        CounterMetric::RocksdbConditionalPutFailureMetric,
+        CounterMetric::RocksdbConditionalPutRetryMetric,
+        CounterMetric::SamlProviderApiErrorTotal,
+        CounterMetric::StorageBilledItemOpsTotalMetric,
+        CounterMetric::StorageLogicalItemBytesTotalMetric,
+        CounterMetric::StorageDdbBatchGetItemCacheHitMetric,
+        CounterMetric::StorageDdbBatchGetItemCacheHitPartialMetric,
+        CounterMetric::StorageDdbBatchGetItemCacheMissMetric,
+        CounterMetric::StorageDdbGetItemCacheHitMetric,
+        CounterMetric::StorageDdbGetItemCacheMissMetric,
+        CounterMetric::StorageDdbAuthoritativePreimageHitMetric,
+        CounterMetric::StorageDdbAuthoritativePreimageMissMetric,
+        CounterMetric::StorageDdbGuardConflictFallbackMetric,
+        CounterMetric::StorageDdbGuardUnsupportedFallbackMetric,
+        CounterMetric::StorageMultiRegionApplyTotalMetric,
+        CounterMetric::StorageMultiRegionAuthFailureTotalMetric,
+        CounterMetric::StorageMultiRegionConflictTotalMetric,
+        CounterMetric::StorageApiDynamodbRequestsTotalMetric,
+        CounterMetric::StorageApiDynamodbRequestLatencyMicrosTotalMetric,
+        CounterMetric::StorageApiDynamodbStageTotalMetric,
+        CounterMetric::StorageProviderStageTotalMetric,
+        CounterMetric::StorageOperationTotalMetric,
+        CounterMetric::StorageDdbQueryCacheHitMetric,
+        CounterMetric::StorageDdbQueryCacheHitPartialMetric,
+        CounterMetric::StorageDdbQueryCacheMissMetric,
+        CounterMetric::StreamTrimDecodeFailures,
+        CounterMetric::StreamTrimDeleteBatches,
+        CounterMetric::StreamTrimGroupsDeleted,
+        CounterMetric::StreamTrimGroupsProtectedByReplication,
+        CounterMetric::StreamTrimItemsScanned,
+        CounterMetric::StreamTrimPagesScanned,
+        CounterMetric::StreamTtlCleanupItemsDeletedTotalMetric,
+        CounterMetric::StreamTtlCleanupRunsTotalMetric,
+        CounterMetric::StreamTtlCleanupStreamsScannedTotalMetric,
+        CounterMetric::TtlSweepExpiredLockFoundCount,
+        CounterMetric::TtlSweepItemsDeleted,
+        CounterMetric::TtlSweepRetryAttempts,
+        CounterMetric::TtlSweepRetryBatches,
+        CounterMetric::TtlSweepRetryFailures,
+        CounterMetric::TtlSweepShardsChecked,
+        CounterMetric::TtlSweepTablesChecked,
+        CounterMetric::TtlSweepThrottledCount,
+        CounterMetric::VaultTokenRenewalMetricAttemptTotal,
+        CounterMetric::VaultTokenRenewalMetricFailureTotal,
+        CounterMetric::VaultTokenRenewalMetricFatalTotal,
+        CounterMetric::VaultTokenRenewalMetricLockAcquiredTotal,
+        CounterMetric::VaultTokenRenewalMetricLockConflictTotal,
+        CounterMetric::VaultTokenRenewalMetricNotRenewableTotal,
+        CounterMetric::VaultTokenRenewalMetricSuccessTotal,
+        CounterMetric::VaultTokenRenewalMetricVerifyFailedTotal,
+        CounterMetric::WebhookDeliveryOutcomeTotal,
+        CounterMetric::CacheClusterJoinTotal,
+        CounterMetric::CacheClusterLeaveTotal,
+        CounterMetric::CacheClusterReconfigureTotal,
+        CounterMetric::CacheClusterElectionTotal,
+        CounterMetric::CacheClusterMigrationTotal,
+    ];
+    let gauges = [
+        GaugeMetric::AnalyticsIngestionQueueDepthMetric,
+        GaugeMetric::BackfillJobsConcurrentCount,
+        GaugeMetric::BgJobsRunningCountMetric,
+        GaugeMetric::CustomDomainActivationStateTotalMetric,
+        GaugeMetric::CustomDomainBillingStateTotalMetric,
+        GaugeMetric::CustomDomainCertificateStateTotalMetric,
+        GaugeMetric::CustomDomainFrontDoorStateTotalMetric,
+        GaugeMetric::CustomDomainProviderTotalMetric,
+        GaugeMetric::CustomDomainValidationStateTotalMetric,
+        GaugeMetric::MetricOutboxMaxDelayMs,
+        GaugeMetric::MetricNotificationsWorkerDueBatchSize,
+        GaugeMetric::MetricNotificationsWorkerOldestDueAgeMs,
+        GaugeMetric::MetricFederatedProvisionEnabledSources,
+        GaugeMetric::PartitionFamilyHotFamiliesMetric,
+        GaugeMetric::PartitionFamilyManagedFamiliesMetric,
+        GaugeMetric::PartitionFamilyOpenPartitionsMetric,
+        GaugeMetric::PartitionFamilyPressureMetric,
+        GaugeMetric::PartitionFamilyTransitionPartitionsMetric,
+        GaugeMetric::StorageMultiRegionHeartbeatStalenessMsMetric,
+        GaugeMetric::StorageMultiRegionReplicationLagMsMetric,
+        GaugeMetric::StorageMultiRegionSenderQueueDepthMetric,
+        GaugeMetric::StorageDdbCacheHitRatioMetric,
+        GaugeMetric::CacheClusterActiveNodes,
+        GaugeMetric::CacheClusterActiveShards,
+    ];
+    let histograms = [
+        HistogramMetric::AnalyticsCompactionRuntimeMsMetric,
+        HistogramMetric::AnalyticsIngestionTableRuntimeMsMetric,
+        HistogramMetric::AnalyticsQueryRuntimeMsMetric,
+        HistogramMetric::AuthzApiLatencyMs,
+        HistogramMetric::AuthzAxumDecisionMs,
+        HistogramMetric::AuthzJwtVerifyMs,
+        HistogramMetric::BackfillEnumerateLatencyMs,
+        HistogramMetric::BackfillJobRuntimeMs,
+        HistogramMetric::BackfillLockAcquireLatencyMs,
+        HistogramMetric::BgJobsRunDurationMsMetric,
+        HistogramMetric::BgWorkerRunOnceMsMetric,
+        HistogramMetric::BillingOperationUsageIngestionLagMs,
+        HistogramMetric::BillingProviderPendingDurationMs,
+        HistogramMetric::FoundationdbGetReadVersionLatencyMs,
+        HistogramMetric::GsiUpdateRuntimeMs,
+        HistogramMetric::MetricAuthnFraudResolutionMs,
+        HistogramMetric::MetricAuthnLockoutDurationMs,
+        HistogramMetric::MetricFederatedProvisionHookLatencyMs,
+        HistogramMetric::MetricFederatedProvisionLatencyMs,
+        HistogramMetric::MetricFederatedProvisionStageLatencyMs,
+        HistogramMetric::LimitsExpirySweepDurationMs,
+        HistogramMetric::LimitsTransitionDurationMs,
+        HistogramMetric::MetricHttpRequestLatencyMs,
+        HistogramMetric::MetricOauthUserinfoFallbackLatencyMs,
+        HistogramMetric::MetricQueueMessageDelayMs,
+        HistogramMetric::MetricSamlAcsIssuerOrgResolutionLatencyMs,
+        HistogramMetric::PartitionReconcileRuntimeMsMetric,
+        HistogramMetric::RemoteStorageRequestLatencyMs,
+        HistogramMetric::RequestLatencyMetric,
+        HistogramMetric::StorageApiDynamodbRequestLatencyMsMetric,
+        HistogramMetric::StorageApiDynamodbStageLatencyMsMetric,
+        HistogramMetric::StorageProviderStageLatencyMsMetric,
+        HistogramMetric::StorageMultiRegionHeartbeatRttMsMetric,
         HistogramMetric::StorageOperationLatencyMsMetric,
-        "operation" => "x".repeat(MAX_METRIC_LABEL_VALUE_BYTES + 1)
-    )
-    .record(1.0);
+        HistogramMetric::StreamTrimRuntimeMs,
+        HistogramMetric::StreamTtlCleanupRuntimeMsMetric,
+        HistogramMetric::TtlSweepRuntimeMs,
+        HistogramMetric::WebhookDeliveryAttempts,
+    ];
 
-    assert!(facade.calls().is_empty());
-    set_metrics_facade(previous);
+    let expected_counter_names = [
+        "analytics_compaction_objects_read_total",
+        "analytics_compaction_objects_written_total",
+        "analytics_compaction_runs_total",
+        "analytics_ingestion_bytes_written_total",
+        "analytics_ingestion_cursor_stalls_total",
+        "analytics_ingestion_failures_total",
+        "analytics_ingestion_lease_conflicts_total",
+        "analytics_ingestion_lease_errors_total",
+        "analytics_ingestion_leases_acquired_total",
+        "analytics_ingestion_process_errors_total",
+        "analytics_ingestion_records_deduped_total",
+        "analytics_ingestion_records_deleted_total",
+        "analytics_ingestion_records_fetched_total",
+        "analytics_ingestion_records_inserted_total",
+        "analytics_ingestion_records_unique_total",
+        "analytics_ingestion_records_updated_total",
+        "analytics_ingestion_schema_changes_total",
+        "analytics_ingestion_table_errors_total",
+        "analytics_ingestion_tables_total",
+        "analytics_ingestion_transactions_total",
+        "analytics_query_records_returned_total",
+        "audit_emitter_events_recorded_total",
+        "audit_emitter_write_failures_total",
+        "audit_emitter_write_retries_total",
+        "audit_emitter_write_success_total",
+        "audit_transactional_cowrite_success_total",
+        "audit_transactional_overflow_total",
+        "authz.api.decisions_total",
+        "authz.cedar.evaluation_errors_total",
+        "authz.api.token_context_deny_total",
+        "authz.api.token_context_total",
+        "authz.axum.decision_total",
+        "authz.axum.error_total",
+        "authz.jwt.verify_total",
+        "authz.projection.operations_total",
+        "authz.token_context_deny_total",
+        "backfill.job.expired.lock.found.count",
+        "backfill.job.idle.count",
+        "backfill.jobs.throttled.count",
+        "billing_route_metric_candidates_total",
+        "billing_operation_usage_duplicate_requests_total",
+        "billing_provider_pending_reconciliation_total",
+        "api_operation",
+        "bg.jobs.lock.skips.total",
+        "bg.jobs.run.errors.total",
+        "bg.jobs.runs.total",
+        "bg.worker.items.processed.total",
+        "bg.worker.lease.conflicts.total",
+        "bg.worker.process.errors.total",
+        "bg.worker.run.errors.total",
+        "custom_domain_billing_transitions_total",
+        "custom_domain_front_door_attempts_total",
+        "custom_domain_front_door_outcomes_total",
+        "custom_domain_reconcile_attempts_total",
+        "custom_domain_reconcile_outcomes_total",
+        "foundationdb_operation_bytes_total",
+        "foundationdb_operations_total",
+        "gsi.update.empty.batches",
+        "gsi.update.ops",
+        "gsi.update.pointer.batches",
+        "gsi.update.stream.items",
+        "http.request.bytes.total",
+        "http.response.bytes.total",
+        "authn.authentication_attempt_total",
+        "authn.authenticator_disabled_total",
+        "authn.authenticator_lifecycle_total",
+        "authn.fraud_report_total",
+        "authn.recovery_attempt_total",
+        "authn.session_assurance_total",
+        "authn.support_intervention_total",
+        "blocklist.batch_write_retry_exhausted_total",
+        "blocklist.batch_write_retry_total",
+        "authn.federated.provision_hook_total",
+        "authn.federated.provision_policy_total",
+        "authn.federated.provision_stage_total",
+        "authn.federated.provision_total",
+        "http.request.attempts",
+        "http.request.errors",
+        "http.request.retries",
+        "limits.expiry.reclaimed.total",
+        "limits.expiry.rows.scanned.total",
+        "limits.expiry.sweeps.total",
+        "limits.transition.conflicts.total",
+        "limits.transition.total",
+        "notifications_delivery_attempt_total",
+        "notifications_delivery_backpressure_total",
+        "notifications_delivery_enqueued_total",
+        "notifications_delivery_failed_total",
+        "notifications_delivery_retry_scheduled_total",
+        "notifications_delivery_success_total",
+        "notifications_destination_circuit_open_total",
+        "notifications_queue_pointer_enqueued_total",
+        "notifications_queue_pointer_process_total",
+        "notifications_worker_processed_total",
+        "notifications_worker_run_total",
+        "authn.oauth.userinfo_fallback_total",
+        "jobs.immediate.empty.receives.total",
+        "jobs.immediate.outbox.items.processed.total",
+        "managed_tenant_decisions_total",
+        "managed_tenant_quota_denials_total",
+        "managed_tenant_support_session_transitions_total",
+        "managed_tenant_suspensions_total",
+        "managed_tenant_template_apply_total",
+        "prefetch.batch.get.total",
+        "prefetch.keys.total",
+        "prefetch.skipped.hot.total",
+        "prefetch.unprocessed.total",
+        "partition.load.samples.flushed.total",
+        "partition.reconcile.actions.total",
+        "partition.reconcile.runs.total",
+        "partition.routing.retries.total",
+        "authn.saml.acs.issuer_org_resolution_total",
+        "saml_provider_metadata_total",
+        "saml_provider_sso_failure_total",
+        "saml_provider_security_failure_total",
+        "saml_provider_slo_success_total",
+        "saml_provider_sso_success_total",
+        "saml_provider_stale_cleanup_total",
+        "remote.storage.failover.count",
+        "remote.storage.request.bytes.total",
+        "remote.storage.response.bytes.total",
+        "kv.rocksdb.conditional.put.failure.total",
+        "kv.rocksdb.conditional.put.retry.total",
+        "saml_provider_api_error_total",
+        "storage.billed.item.ops.total",
+        "storage.logical.item.bytes.total",
+        "ddb.batch.get.item.cache.hit",
+        "ddb.batch.get.item.cache.hit.partial",
+        "ddb.batch.get.item.cache.miss",
+        "ddb.get.item.cache.hit",
+        "ddb.get.item.cache.miss",
+        "ddb.authoritative.preimage.hit",
+        "ddb.authoritative.preimage.miss",
+        "ddb.guard.conflict.fallback",
+        "ddb.guard.unsupported.fallback",
+        "storage.multi.region.apply.total",
+        "storage.multi.region.auth.failure.total",
+        "storage.multi.region.conflict.total",
+        "storage.api.dynamodb.requests.total",
+        "storage.api.dynamodb.request.latency.micros.total",
+        "storage.api.dynamodb.stage.total",
+        "storage.provider.stage.total",
+        "storage.operation.total",
+        "ddb.query.cache.hit",
+        "ddb.query.cache.hit.partial",
+        "ddb.query.cache.miss",
+        "stream.trim.decode.failures",
+        "stream.trim.delete.batches",
+        "stream.trim.groups.deleted",
+        "stream.trim.groups.protected.by.replication",
+        "stream.trim.items.scanned",
+        "stream.trim.pages.scanned",
+        "stream.ttl.cleanup.items.deleted.total",
+        "stream.ttl.cleanup.runs.total",
+        "stream.ttl.cleanup.streams.scanned.total",
+        "ttl.sweep.expired.lock.found.count",
+        "ttl.sweep.items.deleted",
+        "ttl.sweep.retry.attempts",
+        "ttl.sweep.retry.batches",
+        "ttl.sweep.retry.failures",
+        "ttl.sweep.shards.checked",
+        "ttl.sweep.tables.checked",
+        "ttl.sweep.throttled.count",
+        "vault_token_renewal_attempt_total",
+        "vault_token_renewal_failure_total",
+        "vault_token_renewal_fatal_total",
+        "vault_token_renewal_lock_acquired_total",
+        "vault_token_renewal_lock_conflict_total",
+        "vault_token_renewal_not_renewable_total",
+        "vault_token_renewal_success_total",
+        "vault_token_renewal_verify_failed_total",
+        "webhook_delivery_outcome_total",
+        "cache.cluster.join.total",
+        "cache.cluster.leave.total",
+        "cache.cluster.reconfigure.total",
+        "cache.cluster.election.total",
+        "cache.cluster.migration.total",
+    ];
+    let expected_gauge_names = [
+        "analytics_ingestion_queue_depth",
+        "backfill.jobs.concurrent.count",
+        "bg.jobs.running.count",
+        "custom_domain_activation_state_total",
+        "custom_domain_billing_state_total",
+        "custom_domain_certificate_state_total",
+        "custom_domain_front_door_state_total",
+        "custom_domain_provider_total",
+        "custom_domain_validation_state_total",
+        "jobs.immediate.outbox.max.delay.ms",
+        "notifications_worker_due_batch_size",
+        "notifications_worker_oldest_due_age_ms",
+        "authn.federated.provision_enabled_sources",
+        "partition.family.hot.families",
+        "partition.family.managed.families",
+        "partition.family.open.partitions",
+        "partition.family.pressure",
+        "partition.family.transition.partitions",
+        "storage.multi.region.heartbeat.staleness.ms",
+        "storage.multi.region.replication.lag.ms",
+        "storage.multi.region.sender.queue.depth",
+        "ddb.cache.hit.ratio",
+        "cache.cluster.active.nodes",
+        "cache.cluster.active.shards",
+    ];
+    let expected_histogram_names = [
+        "analytics_compaction_runtime_ms",
+        "analytics_ingestion_table_runtime_ms",
+        "analytics_query_runtime_ms",
+        "authz.api.latency_ms",
+        "authz.axum.decision_ms",
+        "authz.jwt.verify_ms",
+        "backfill.enumerate.latency.ms",
+        "backfill.job.runtime.ms",
+        "backfill.lock.acquire.latency.ms",
+        "bg.jobs.run.duration.ms",
+        "bg.worker.run.once.ms",
+        "billing_operation_usage_ingestion_lag_ms",
+        "billing_provider_pending_duration_ms",
+        "foundationdb.get.read.version.latency.ms",
+        "gsi.update.runtime.ms",
+        "authn.fraud_resolution_ms",
+        "authn.lockout_duration_ms",
+        "authn.federated.provision_hook_latency_ms",
+        "authn.federated.provision_latency_ms",
+        "authn.federated.provision_stage_latency_ms",
+        "limits.expiry.sweep.duration.ms",
+        "limits.transition.duration.ms",
+        "http.request.latency.ms",
+        "authn.oauth.userinfo_fallback_latency_ms",
+        "jobs.immediate.queue.message.delay.ms",
+        "authn.saml.acs.issuer_org_resolution_latency_ms",
+        "partition.reconcile.runtime.ms",
+        "remote.storage.request.latency.ms",
+        "http.request.latency.ms",
+        "storage.api.dynamodb.request.latency.ms",
+        "storage.api.dynamodb.stage.latency.ms",
+        "storage.provider.stage.latency.ms",
+        "storage.multi.region.heartbeat.rtt.ms",
+        "storage.operation.latency.ms",
+        "stream.trim.runtime.ms",
+        "stream.ttl.cleanup.runtime.ms",
+        "ttl.sweep.runtime.ms",
+        "webhook_delivery_attempts",
+    ];
+    assert_eq!(expected_counter_names.len(), counters.len());
+    assert_eq!(expected_gauge_names.len(), gauges.len());
+    assert_eq!(expected_histogram_names.len(), histograms.len());
+
+    // When each variant resolves its exported metric name.
+    for (metric, expected) in counters.iter().zip(expected_counter_names) {
+        assert_eq!(metric.name(), expected);
+    }
+    for (metric, expected) in gauges.iter().zip(expected_gauge_names) {
+        assert_eq!(metric.name(), expected);
+    }
+    for (metric, expected) in histograms.iter().zip(expected_histogram_names) {
+        assert_eq!(metric.name(), expected);
+    }
+    // The two request-latency variants intentionally share one histogram
+    // series.
+    assert_eq!(
+        HistogramMetric::MetricHttpRequestLatencyMs.name(),
+        HistogramMetric::RequestLatencyMetric.name()
+    );
+
+    // Then no customer-controlled value can create a new name or collide with a
+    // sibling.
+    let counter_names: Vec<_> = counters.into_iter().map(CounterMetric::name).collect();
+    let gauge_names: Vec<_> = gauges.into_iter().map(GaugeMetric::name).collect();
+    let histogram_names: Vec<_> = histograms.into_iter().map(HistogramMetric::name).collect();
+
+    // Then no customer-controlled value can create a new name or collide with a
+    // sibling.
+    assert_eq!(counter_names.len(), 177);
+    assert_eq!(gauge_names.len(), 24);
+    assert_eq!(histogram_names.len(), 38);
+    for (names, expected_unique_names) in [
+        (&counter_names, 177),
+        (&gauge_names, 24),
+        (&histogram_names, 37),
+    ] {
+        assert!(names.iter().all(|name| {
+            !name.is_empty()
+                && name.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'.'
+                        || byte == b'_'
+                })
+        }));
+        let unique_names: HashSet<_> = names.iter().copied().collect();
+        assert_eq!(unique_names.len(), expected_unique_names);
+    }
 }

@@ -22,6 +22,7 @@ url = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 alloc-counter = { workspace = true }
+proptest = { workspace = true }
 
 [lints]
 workspace = true

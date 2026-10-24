@@ -1,6 +1,6 @@
 use std::fmt;
 
-use aws_credential_types::provider;
+use aws_credentials::CredentialsError;
 use http_request::HttpRequestErrorKind;
 use thiserror::Error;
 
@@ -32,8 +32,8 @@ pub enum SigningError {
     InsecureTransport,
 }
 
-impl From<provider::error::CredentialsError> for SigningError {
-    fn from(_error: provider::error::CredentialsError) -> Self {
+impl From<CredentialsError> for SigningError {
+    fn from(_error: CredentialsError) -> Self {
         Self::Credentials(CredentialErrorKind::Provider)
     }
 }

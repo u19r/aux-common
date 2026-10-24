@@ -1,0 +1,1315 @@
+use std::collections::HashMap;
+
+use authz_types::{
+    AcrLevel, ConfigurationModel, PermissionActionRef, PermissionId, Scope, StepUpRule,
+};
+use cedar_policy::PolicySet;
+
+use crate::{generate_static_policies, policy::policy_generator::balanced_boolean_expr};
+
+#[test]
+fn boolean_expression_depth_grows_logarithmically() {
+    let terms = (0..64)
+        .map(|index| format!("term{index}"))
+        .collect::<Vec<_>>();
+
+    let expression = balanced_boolean_expr(&terms, "&&");
+    let mut depth = 0_u8;
+    let mut maximum_depth = 0_u8;
+    for character in expression.chars() {
+        match character {
+            '(' => {
+                depth += 1;
+                maximum_depth = maximum_depth.max(depth);
+            }
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+
+    assert_eq!(0, depth, "the generated expression must be balanced");
+    assert_eq!(6, maximum_depth, "64 terms require six binary levels");
+    assert_eq!(63, expression.matches(" && ").count());
+}
+
+fn permission_actions(resource_type: &str, action_names: &[String]) -> Vec<PermissionActionRef> {
+    action_names
+        .iter()
+        .map(|action_name| PermissionActionRef {
+            resource_type: resource_type.into(),
+            action_name: action_name.clone(),
+        })
+        .collect()
+}
+
+fn parse_policy_set(policies_json: &str) -> PolicySet {
+    PolicySet::from_json_str(policies_json).expect("policy set json")
+}
+
+fn template_texts(policy_set: &PolicySet) -> Vec<String> {
+    policy_set
+        .templates()
+        .map(|template| template.to_cedar())
+        .collect()
+}
+
+fn linked_role_ids(policy_set: &PolicySet) -> Vec<String> {
+    let mut role_ids = policy_set
+        .policies()
+        .filter(|policy| !policy.is_static())
+        .map(|policy| {
+            let links = policy.template_links().expect("template links");
+            links
+                .values()
+                .next()
+                .expect("principal slot binding")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    role_ids.sort();
+    role_ids
+}
+
+fn static_policy_texts(policy_set: &PolicySet) -> Vec<String> {
+    policy_set
+        .policies()
+        .filter(|policy| policy.is_static())
+        .map(|policy| policy.to_cedar().expect("static policy text"))
+        .collect()
+}
+
+#[test]
+fn policy_generation_emits_role_policies() {
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![
+                authz_types::ActionDefinition {
+                    name: "read".into(),
+                    description: None,
+                },
+                authz_types::ActionDefinition {
+                    name: "write".into(),
+                    description: None,
+                },
+            ],
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "document:editor".into(),
+            name: "Editor".into(),
+            description: None,
+            actions: permission_actions("document", &["read".into(), "write".into()]),
+            not_actions: vec![],
+        }],
+        roles: vec![authz_types::Role {
+            id: "editor".into(),
+            name: "Editor".into(),
+            description: None,
+            permissions: vec![authz_types::RolePermission {
+                permission_id: PermissionId::new("document:editor").expect("permission id"),
+                scopes: vec![authz_types::Scope::Org],
+            }],
+            actions: vec![],
+            not_actions: vec![],
+            assignment_policy: crate::bundle::permanent_assignment_policy(),
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: Vec::new(),
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+    };
+
+    let config = config.into_validated().expect("valid config");
+    let policies_json = generate_static_policies(&config).expect("policies");
+    let policy_set = parse_policy_set(&policies_json);
+    let policy_text = template_texts(&policy_set).join("\n");
+    assert_eq!(2, policy_set.num_of_templates(), "one template per action");
+    assert_eq!(
+        vec!["Authz::Role::\"editor\"", "Authz::Role::\"editor\""],
+        linked_role_ids(&policy_set),
+        "expected one linked policy per role/action"
+    );
+    assert!(policy_text.contains("document:read"));
+    assert!(policy_text.contains("document:write"));
+    assert!(
+        policy_text.contains("allowed_actions") && policy_text.contains("document:read"),
+        "token guard should be present"
+    );
+}
+
+#[test]
+fn write_only_resource_does_not_gain_implicit_public_read_policy() {
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "write".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![],
+        roles: vec![],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: Vec::new(),
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+    }
+    .into_validated()
+    .expect("valid config");
+
+    let policies_json = generate_static_policies(&config).expect("policies");
+    let policy_set = parse_policy_set(&policies_json);
+
+    assert_eq!(policy_set.num_of_policies(), 0);
+}
+
+#[test]
+fn org_owner_policy_is_scoped_to_org() {
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![
+            authz_types::ResourceType {
+                id: "repository".into(),
+                name: "Repository".into(),
+                description: None,
+                actions: vec![
+                    authz_types::ActionDefinition {
+                        name: "read".into(),
+                        description: None,
+                    },
+                    authz_types::ActionDefinition {
+                        name: "write".into(),
+                        description: None,
+                    },
+                ],
+                context_schema: None,
+            },
+            authz_types::ResourceType {
+                id: "organization".into(),
+                name: "Organization".into(),
+                description: None,
+                actions: vec![authz_types::ActionDefinition {
+                    name: "manage".into(),
+                    description: None,
+                }],
+                context_schema: None,
+            },
+        ],
+        permissions: vec![
+            authz_types::Permission {
+                id: "repo:admin".into(),
+                name: "Repo Admin".into(),
+                description: None,
+                actions: permission_actions("repository", &["read".into(), "write".into()]),
+                not_actions: vec![],
+            },
+            authz_types::Permission {
+                id: "org:manage".into(),
+                name: "Org Manage".into(),
+                description: None,
+                actions: permission_actions("organization", &["manage".into()]),
+                not_actions: vec![],
+            },
+        ],
+        roles: vec![authz_types::Role {
+            id: "owner-role".into(),
+            name: "org:owner".into(),
+            description: None,
+            permissions: vec![
+                authz_types::RolePermission {
+                    permission_id: PermissionId::new("repo:admin").expect("permission id"),
+                    scopes: vec![authz_types::Scope::Org],
+                },
+                authz_types::RolePermission {
+                    permission_id: PermissionId::new("org:manage").expect("permission id"),
+                    scopes: vec![authz_types::Scope::Org],
+                },
+            ],
+            actions: vec![],
+            not_actions: vec![],
+            assignment_policy: crate::bundle::permanent_assignment_policy(),
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: Vec::new(),
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+    };
+
+    let config = config.into_validated().expect("valid config");
+    let policies_json = generate_static_policies(&config).expect("policies");
+    let policy_set = parse_policy_set(&policies_json);
+    // Owner policies must include org scoping condition.
+    let owner_policies: Vec<_> = template_texts(&policy_set)
+        .into_iter()
+        .filter(|p| p.contains("?principal"))
+        .collect();
+    assert!(
+        !owner_policies.is_empty(),
+        "expected owner policies to be generated"
+    );
+    for policy in owner_policies {
+        assert!(
+            policy.contains("resource has org_id")
+                && policy.contains("principal has org_id")
+                && policy.contains("resource.org_id")
+                && policy.contains("principal.org_id"),
+            "owner policies must be org-scoped: {policy}"
+        );
+    }
+}
+
+#[test]
+fn step_up_policy_includes_session_guard() {
+    let mut step_up_config = HashMap::new();
+    step_up_config.insert(
+        "document".to_string(),
+        authz_types::StepUpConfig {
+            default_rule: None,
+            action_rules: [("write".to_string(), "mfa".to_string())]
+                .into_iter()
+                .collect(),
+        },
+    );
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "write".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "document:editor".into(),
+            name: "Editor".into(),
+            description: None,
+            actions: permission_actions("document", &["write".into()]),
+            not_actions: vec![],
+        }],
+        roles: vec![authz_types::Role {
+            id: "editor".into(),
+            name: "Editor".into(),
+            description: None,
+            permissions: vec![authz_types::RolePermission {
+                permission_id: PermissionId::new("document:editor").expect("permission id"),
+                scopes: vec![authz_types::Scope::Tenant],
+            }],
+            actions: vec![],
+            not_actions: vec![],
+            assignment_policy: crate::bundle::permanent_assignment_policy(),
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: vec![authz_types::StepUpRule::require_acr(
+            "mfa",
+            "Require MFA",
+            authz_types::AcrLevel::MultiFactor,
+        )],
+        step_up_config,
+        default_step_up_rule: None,
+    };
+
+    let config = config.into_validated().expect("valid config");
+    let policies_json = generate_static_policies(&config).expect("policies");
+    let policy_set = parse_policy_set(&policies_json);
+    let policy_text = template_texts(&policy_set).join("\n");
+    assert!(
+        policy_text.contains("session_present"),
+        "step-up guard should require session"
+    );
+    assert!(
+        policy_text.contains("session_acr"),
+        "step-up guard should require MFA ACR"
+    );
+    assert!(
+        policy_text.contains("session_acr == 4"),
+        "assurance guard must exclude RecentAuth freshness marker: {policy_text}"
+    );
+}
+
+#[test]
+fn step_up_policy_escapes_required_amr_values() {
+    let mut step_up_config = HashMap::new();
+    step_up_config.insert(
+        "document".to_string(),
+        authz_types::StepUpConfig {
+            default_rule: None,
+            action_rules: [("read".to_string(), "mfa".to_string())]
+                .into_iter()
+                .collect(),
+        },
+    );
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "read".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "document:reader".into(),
+            name: "Reader".into(),
+            description: None,
+            actions: permission_actions("document", &["read".into()]),
+            not_actions: vec![],
+        }],
+        roles: vec![authz_types::Role {
+            id: "reader".into(),
+            name: "Reader".into(),
+            description: None,
+            permissions: vec![authz_types::RolePermission {
+                permission_id: PermissionId::new("document:reader").expect("permission id"),
+                scopes: vec![authz_types::Scope::Tenant],
+            }],
+            actions: vec![],
+            not_actions: vec![],
+            assignment_policy: crate::bundle::permanent_assignment_policy(),
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: vec![authz_types::StepUpRule::require_amr(
+            "mfa",
+            "Require MFA",
+            vec![r#"otp") || true || (context._authz.session_amr.contains("x"#.into()],
+        )],
+        step_up_config,
+        default_step_up_rule: None,
+    }
+    .into_validated()
+    .expect("valid config");
+
+    let policies_json = generate_static_policies(&config).expect("escaped policy should parse");
+    let policy_set = parse_policy_set(&policies_json);
+    let policy_text = template_texts(&policy_set).join("\n");
+    assert!(
+        policy_text.contains(r#"otp\") || true"#),
+        "AMR syntax must be escaped inside the Cedar string literal"
+    );
+}
+
+#[test]
+fn policy_generation_emits_scope_guards_for_all_scopes() {
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "read".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "document:reader".into(),
+            name: "Reader".into(),
+            description: None,
+            actions: permission_actions("document", &["read".into()]),
+            not_actions: vec![],
+        }],
+        roles: vec![authz_types::Role {
+            id: "reader".into(),
+            name: "Reader".into(),
+            description: None,
+            permissions: vec![authz_types::RolePermission {
+                permission_id: PermissionId::new("document:reader").expect("permission id"),
+                scopes: vec![
+                    Scope::Tenant,
+                    Scope::Org,
+                    Scope::Group,
+                    Scope::Own,
+                    Scope::Shared,
+                    Scope::Public,
+                    Scope::OrgRelationship,
+                    Scope::GroupRelationship,
+                    Scope::resource("document"),
+                ],
+            }],
+            actions: vec![],
+            not_actions: vec![],
+            assignment_policy: crate::bundle::permanent_assignment_policy(),
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: Vec::new(),
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+    };
+
+    let config = config.into_validated().expect("valid config");
+    let policies_json = generate_static_policies(&config).expect("policies");
+    let policy_set = parse_policy_set(&policies_json);
+    let policy_text = template_texts(&policy_set).join("\n");
+    assert!(
+        policy_text.contains("resource has org_id")
+            && policy_text.contains("principal has org_id")
+            && policy_text.contains("resource.org_id")
+            && policy_text.contains("principal.org_id"),
+        "org guard should be present"
+    );
+    assert!(
+        policy_text.contains("resource.group_id") && policy_text.contains("principal.group_id"),
+        "group guard should be present"
+    );
+    assert!(
+        policy_text.contains("resource.owner_id") && policy_text.contains("principal.id"),
+        "own guard should be present"
+    );
+    assert!(
+        policy_text.contains("resource.shared_with") && policy_text.contains("principal.id"),
+        "shared guard should be present"
+    );
+    assert!(
+        policy_text.contains("resource.is_public"),
+        "public guard should be present"
+    );
+    assert!(
+        policy_text.contains("resource.org_parents")
+            && policy_text.contains("contains(principal.id)"),
+        "org relationship guard should be present"
+    );
+    assert!(
+        policy_text.contains("resource.group_parents")
+            && policy_text.contains("contains(principal.id)"),
+        "group relationship guard should be present"
+    );
+    assert!(
+        policy_text.contains("resource_scopes") && policy_text.contains("Authz::Role::\"reader\""),
+        "resource scope should be role-specific"
+    );
+}
+
+#[test]
+fn step_up_policy_includes_auth_age_guard() {
+    let mut step_up_config = HashMap::new();
+    step_up_config.insert(
+        "document".to_string(),
+        authz_types::StepUpConfig {
+            default_rule: Some("recent".to_string()),
+            action_rules: HashMap::new(),
+        },
+    );
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "read".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "document:reader".into(),
+            name: "Reader".into(),
+            description: None,
+            actions: permission_actions("document", &["read".into()]),
+            not_actions: vec![],
+        }],
+        roles: vec![authz_types::Role {
+            id: "reader".into(),
+            name: "Reader".into(),
+            description: None,
+            permissions: vec![authz_types::RolePermission {
+                permission_id: PermissionId::new("document:reader").expect("permission id"),
+                scopes: vec![Scope::Tenant],
+            }],
+            actions: vec![],
+            not_actions: vec![],
+            assignment_policy: crate::bundle::permanent_assignment_policy(),
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: vec![StepUpRule {
+            rule_id: "recent".into(),
+            name: "Recent".into(),
+            description: None,
+            required_acr: AcrLevel::RecentAuth,
+            max_auth_age_seconds: Some(300),
+            max_mfa_age_seconds: None,
+            required_amr: Vec::new(),
+            applies_to_api_keys: false,
+        }],
+        step_up_config,
+        default_step_up_rule: None,
+    };
+
+    let config = config.into_validated().expect("valid config");
+    let policies_json = generate_static_policies(&config).expect("policies");
+    let policy_set = parse_policy_set(&policies_json);
+    let policy_text = template_texts(&policy_set).join("\n");
+    assert!(
+        policy_text.contains("session_auth_age_present"),
+        "auth age guard should require auth age"
+    );
+    assert!(
+        policy_text.contains("session_auth_age_seconds"),
+        "auth age guard should enforce max age"
+    );
+    assert!(
+        policy_text.contains("context._authz.session_acr == 4"),
+        "RecentAuth must require the dedicated assurance level: {policy_text}"
+    );
+    assert!(
+        policy_text.contains("token_present"),
+        "auth age guard should allow api keys"
+    );
+    assert!(
+        policy_text.contains("context._authz.token_present && context._authz.token_valid"),
+        "an API-key exemption must not bypass an invalid token"
+    );
+}
+
+#[test]
+fn step_up_policy_includes_mfa_age_and_amr_guards() {
+    let mut step_up_config = HashMap::new();
+    step_up_config.insert(
+        "document".to_string(),
+        authz_types::StepUpConfig {
+            default_rule: Some("mfa".to_string()),
+            action_rules: HashMap::new(),
+        },
+    );
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "read".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "document:reader".into(),
+            name: "Reader".into(),
+            description: None,
+            actions: permission_actions("document", &["read".into()]),
+            not_actions: vec![],
+        }],
+        roles: vec![authz_types::Role {
+            id: "reader".into(),
+            name: "Reader".into(),
+            description: None,
+            permissions: vec![authz_types::RolePermission {
+                permission_id: PermissionId::new("document:reader").expect("permission id"),
+                scopes: vec![Scope::Tenant],
+            }],
+            actions: vec![],
+            not_actions: vec![],
+            assignment_policy: crate::bundle::permanent_assignment_policy(),
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: vec![StepUpRule {
+            rule_id: "mfa".into(),
+            name: "Require MFA".into(),
+            description: None,
+            required_acr: AcrLevel::MultiFactor,
+            max_auth_age_seconds: None,
+            max_mfa_age_seconds: Some(120),
+            required_amr: vec!["webauthn".into(), "otp".into()],
+            applies_to_api_keys: true,
+        }],
+        step_up_config,
+        default_step_up_rule: None,
+    };
+
+    let config = config.into_validated().expect("valid config");
+    let policies_json = generate_static_policies(&config).expect("policies");
+    let policy_set = parse_policy_set(&policies_json);
+    let policy_text = template_texts(&policy_set).join("\n");
+    assert!(
+        policy_text.contains("session_mfa_age_present"),
+        "mfa age guard should require mfa age"
+    );
+    assert!(
+        policy_text.contains("session_mfa_age_seconds"),
+        "mfa age guard should enforce max age"
+    );
+    assert!(
+        policy_text.contains("session_amr") && policy_text.contains("webauthn"),
+        "amr guard should include webauthn"
+    );
+    assert!(
+        policy_text.contains("session_amr") && policy_text.contains("otp"),
+        "amr guard should include otp"
+    );
+}
+
+#[test]
+fn matching_role_shapes_share_one_template_and_one_link_per_role() {
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "read".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "document:reader".into(),
+            name: "Reader".into(),
+            description: None,
+            actions: permission_actions("document", &["read".into()]),
+            not_actions: vec![],
+        }],
+        roles: vec![
+            authz_types::Role {
+                id: "reader-a".into(),
+                name: "Reader A".into(),
+                description: None,
+                permissions: vec![authz_types::RolePermission {
+                    permission_id: PermissionId::new("document:reader").expect("permission id"),
+                    scopes: vec![Scope::Org],
+                }],
+                actions: vec![],
+                not_actions: vec![],
+                assignment_policy: crate::bundle::permanent_assignment_policy(),
+            },
+            authz_types::Role {
+                id: "reader-b".into(),
+                name: "Reader B".into(),
+                description: None,
+                permissions: vec![authz_types::RolePermission {
+                    permission_id: PermissionId::new("document:reader").expect("permission id"),
+                    scopes: vec![Scope::Org],
+                }],
+                actions: vec![],
+                not_actions: vec![],
+                assignment_policy: crate::bundle::permanent_assignment_policy(),
+            },
+        ],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: Vec::new(),
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+    }
+    .into_validated()
+    .expect("valid config");
+
+    let policy_set = parse_policy_set(&generate_static_policies(&config).expect("policies"));
+    assert_eq!(
+        1,
+        policy_set.num_of_templates(),
+        "shared shape should collapse"
+    );
+    assert_eq!(
+        2,
+        policy_set
+            .policies()
+            .filter(|policy| !policy.is_static())
+            .count(),
+        "expected one linked policy per role"
+    );
+    assert_eq!(
+        vec!["Authz::Role::\"reader-a\"", "Authz::Role::\"reader-b\""],
+        linked_role_ids(&policy_set)
+    );
+}
+
+#[test]
+fn public_read_remains_static_and_is_not_linked() {
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "read".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "document:reader".into(),
+            name: "Reader".into(),
+            description: None,
+            actions: permission_actions("document", &["read".into()]),
+            not_actions: vec![],
+        }],
+        roles: vec![authz_types::Role {
+            id: "reader".into(),
+            name: "Reader".into(),
+            description: None,
+            permissions: vec![authz_types::RolePermission {
+                permission_id: PermissionId::new("document:reader").expect("permission id"),
+                scopes: vec![Scope::Tenant],
+            }],
+            actions: vec![],
+            not_actions: vec![],
+            assignment_policy: crate::bundle::permanent_assignment_policy(),
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: Vec::new(),
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+    }
+    .into_validated()
+    .expect("valid config");
+
+    let policy_set = parse_policy_set(&generate_static_policies(&config).expect("policies"));
+    let static_policies = static_policy_texts(&policy_set);
+    assert_eq!(1, static_policies.len(), "public read should stay static");
+    assert!(
+        static_policies[0].contains("resource.is_public"),
+        "public read guard should stay on a static policy"
+    );
+}
+
+#[test]
+fn different_scope_guards_produce_distinct_templates() {
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "read".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "document:reader".into(),
+            name: "Reader".into(),
+            description: None,
+            actions: permission_actions("document", &["read".into()]),
+            not_actions: vec![],
+        }],
+        roles: vec![authz_types::Role {
+            id: "reader".into(),
+            name: "Reader".into(),
+            description: None,
+            permissions: vec![authz_types::RolePermission {
+                permission_id: PermissionId::new("document:reader").expect("permission id"),
+                scopes: vec![Scope::Tenant, Scope::Org],
+            }],
+            actions: vec![],
+            not_actions: vec![],
+            assignment_policy: crate::bundle::permanent_assignment_policy(),
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: Vec::new(),
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+    }
+    .into_validated()
+    .expect("valid config");
+
+    let policy_set = parse_policy_set(&generate_static_policies(&config).expect("policies"));
+    assert_eq!(2, policy_set.num_of_templates(), "tenant and org differ");
+}
+
+#[test]
+fn different_step_up_guards_produce_distinct_templates() {
+    let mut step_up_config = HashMap::new();
+    step_up_config.insert(
+        "document".to_string(),
+        authz_types::StepUpConfig {
+            default_rule: None,
+            action_rules: [("write".to_string(), "mfa".to_string())]
+                .into_iter()
+                .collect(),
+        },
+    );
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![
+                authz_types::ActionDefinition {
+                    name: "read".into(),
+                    description: None,
+                },
+                authz_types::ActionDefinition {
+                    name: "write".into(),
+                    description: None,
+                },
+            ],
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "document:editor".into(),
+            name: "Editor".into(),
+            description: None,
+            actions: permission_actions("document", &["read".into(), "write".into()]),
+            not_actions: vec![],
+        }],
+        roles: vec![authz_types::Role {
+            id: "editor".into(),
+            name: "Editor".into(),
+            description: None,
+            permissions: vec![authz_types::RolePermission {
+                permission_id: PermissionId::new("document:editor").expect("permission id"),
+                scopes: vec![Scope::Tenant],
+            }],
+            actions: vec![],
+            not_actions: vec![],
+            assignment_policy: crate::bundle::permanent_assignment_policy(),
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: vec![authz_types::StepUpRule::require_acr(
+            "mfa",
+            "Require MFA",
+            authz_types::AcrLevel::MultiFactor,
+        )],
+        step_up_config,
+        default_step_up_rule: None,
+    }
+    .into_validated()
+    .expect("valid config");
+
+    let policy_set = parse_policy_set(&generate_static_policies(&config).expect("policies"));
+    assert_eq!(
+        2,
+        policy_set.num_of_templates(),
+        "read and write differ on step-up"
+    );
+}
+
+#[test]
+fn different_effects_produce_distinct_templates() {
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "read".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![],
+        roles: vec![authz_types::Role {
+            id: "editor".into(),
+            name: "Editor".into(),
+            description: None,
+            permissions: vec![],
+            actions: vec![authz_types::RoleActionRef {
+                resource_type: "document".into(),
+                action_name: "read".into(),
+                scopes: vec![Scope::Tenant],
+                limit: None,
+            }],
+            not_actions: vec![authz_types::RoleActionRef {
+                resource_type: "document".into(),
+                action_name: "read".into(),
+                scopes: vec![Scope::Tenant],
+                limit: None,
+            }],
+            assignment_policy: crate::bundle::permanent_assignment_policy(),
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: Vec::new(),
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+    }
+    .into_validated()
+    .expect("valid config");
+
+    let policy_set = parse_policy_set(&generate_static_policies(&config).expect("policies"));
+    assert_eq!(
+        2,
+        policy_set.num_of_templates(),
+        "permit and forbid must stay distinct"
+    );
+}
+
+#[test]
+fn given_multiple_resources_when_filtering_policy_generation_then_only_the_requested_resource_is_emitted()
+ {
+    // Given a validated model whose permissions and direct role actions span
+    // two resources.
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![
+            authz_types::ResourceType {
+                id: "document".into(),
+                name: "Document".into(),
+                description: None,
+                actions: vec![
+                    authz_types::ActionDefinition {
+                        name: "read".into(),
+                        description: None,
+                    },
+                    authz_types::ActionDefinition {
+                        name: "write".into(),
+                        description: None,
+                    },
+                ],
+                context_schema: None,
+            },
+            authz_types::ResourceType {
+                id: "image".into(),
+                name: "Image".into(),
+                description: None,
+                actions: vec![authz_types::ActionDefinition {
+                    name: "read".into(),
+                    description: None,
+                }],
+                context_schema: None,
+            },
+        ],
+        permissions: vec![authz_types::Permission {
+            id: "document:editor".into(),
+            name: "Editor".into(),
+            description: None,
+            actions: permission_actions("document", &["read".into(), "write".into()]),
+            not_actions: vec![],
+        }],
+        roles: vec![authz_types::Role {
+            id: "editor".into(),
+            name: "Editor".into(),
+            description: None,
+            permissions: vec![authz_types::RolePermission {
+                permission_id: PermissionId::new("document:editor").expect("permission id"),
+                scopes: vec![Scope::Tenant],
+            }],
+            actions: vec![authz_types::RoleActionRef {
+                resource_type: "image".into(),
+                action_name: "read".into(),
+                scopes: vec![Scope::Org],
+                limit: None,
+            }],
+            not_actions: vec![authz_types::RoleActionRef {
+                resource_type: "document".into(),
+                action_name: "write".into(),
+                scopes: vec![Scope::Tenant],
+                limit: None,
+            }],
+            assignment_policy: crate::bundle::permanent_assignment_policy(),
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: Vec::new(),
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+    }
+    .into_validated()
+    .expect("valid config");
+
+    // When generating a policy slice for each resource independently.
+    let document = parse_policy_set(
+        &crate::generate_static_policies_for_resource(&config, "document")
+            .expect("document policies"),
+    );
+    let image = parse_policy_set(
+        &crate::generate_static_policies_for_resource(&config, "image").expect("image policies"),
+    );
+    let missing = parse_policy_set(
+        &crate::generate_static_policies_for_resource(&config, "missing")
+            .expect("missing resource produces an empty policy set"),
+    );
+
+    // Then each result contains only its selected resource and an unknown
+    // filter fails closed.
+    let document_text = template_texts(&document)
+        .into_iter()
+        .chain(static_policy_texts(&document))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(document_text.contains("document:read"));
+    assert!(document_text.contains("document:write"));
+    assert!(!document_text.contains("image:read"));
+    assert_eq!(3, document.num_of_templates());
+    assert_eq!(4, document.num_of_policies());
+
+    let image_text = template_texts(&image)
+        .into_iter()
+        .chain(static_policy_texts(&image))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(image_text.contains("image:read"));
+    assert!(!image_text.contains("document:read"));
+    assert!(!image_text.contains("document:write"));
+    assert_eq!(1, image.num_of_templates());
+    assert_eq!(2, image.num_of_policies());
+    assert_eq!(0, missing.num_of_templates());
+    assert_eq!(0, missing.num_of_policies());
+}
+
+#[test]
+fn given_direct_role_actions_when_generating_step_up_policies_then_only_permits_require_step_up() {
+    // Given direct permit and forbid actions with the same scoped role and a
+    // step-up rule.
+    let mut step_up_config = HashMap::new();
+    step_up_config.insert(
+        "document".to_string(),
+        authz_types::StepUpConfig {
+            default_rule: Some("mfa".to_string()),
+            action_rules: HashMap::new(),
+        },
+    );
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![
+                authz_types::ActionDefinition {
+                    name: "read".into(),
+                    description: None,
+                },
+                authz_types::ActionDefinition {
+                    name: "write".into(),
+                    description: None,
+                },
+            ],
+            context_schema: None,
+        }],
+        permissions: vec![],
+        roles: vec![authz_types::Role {
+            id: "editor".into(),
+            name: "Editor".into(),
+            description: None,
+            permissions: vec![],
+            actions: vec![authz_types::RoleActionRef {
+                resource_type: "document".into(),
+                action_name: "read".into(),
+                scopes: vec![Scope::Org],
+                limit: None,
+            }],
+            not_actions: vec![authz_types::RoleActionRef {
+                resource_type: "document".into(),
+                action_name: "write".into(),
+                scopes: vec![Scope::Org],
+                limit: None,
+            }],
+            assignment_policy: crate::bundle::permanent_assignment_policy(),
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: vec![StepUpRule::require_acr(
+            "mfa",
+            "Require MFA",
+            AcrLevel::MultiFactor,
+        )],
+        step_up_config,
+        default_step_up_rule: None,
+    }
+    .into_validated()
+    .expect("valid config");
+
+    // When generating the policy set at the public policy boundary.
+    let policy_set = parse_policy_set(&generate_static_policies(&config).expect("policies"));
+    let templates = template_texts(&policy_set);
+    let permit = templates
+        .iter()
+        .find(|template| template.contains("permit(") && template.contains("document:read"))
+        .expect("direct permit template");
+    let forbid = templates
+        .iter()
+        .find(|template| template.contains("forbid(") && template.contains("document:write"))
+        .expect("direct forbid template");
+
+    // Then the permit is scoped and step-up protected while the forbid cannot
+    // weaken policy with a step-up condition.
+    assert!(permit.contains("resource has org_id"));
+    assert!(permit.contains("session_present"));
+    assert!(forbid.contains("resource has org_id"));
+    assert!(!forbid.contains("session_present"));
+}
+
+#[test]
+fn given_control_characters_in_required_amr_when_generating_policies_then_literals_are_escaped() {
+    // Given a hostile AMR value containing every Cedar escape class.
+    let hostile_amr =
+        "quote\" slash\\ newline\n carriage\r tab\t backspace\u{08} formfeed\u{0c} control\u{01}";
+    let mut step_up_config = HashMap::new();
+    step_up_config.insert(
+        "document".to_string(),
+        authz_types::StepUpConfig {
+            default_rule: Some("hostile".to_string()),
+            action_rules: HashMap::new(),
+        },
+    );
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "read".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "document:reader".into(),
+            name: "Reader".into(),
+            description: None,
+            actions: permission_actions("document", &["read".into()]),
+            not_actions: vec![],
+        }],
+        roles: vec![authz_types::Role {
+            id: "reader".into(),
+            name: "Reader".into(),
+            description: None,
+            permissions: vec![authz_types::RolePermission {
+                permission_id: PermissionId::new("document:reader").expect("permission id"),
+                scopes: vec![Scope::Tenant],
+            }],
+            actions: vec![],
+            not_actions: vec![],
+            assignment_policy: crate::bundle::permanent_assignment_policy(),
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: vec![StepUpRule {
+            rule_id: "hostile".into(),
+            name: "Hostile AMR".into(),
+            description: None,
+            required_acr: AcrLevel::MultiFactor,
+            max_auth_age_seconds: None,
+            max_mfa_age_seconds: None,
+            required_amr: vec![hostile_amr.to_string()],
+            applies_to_api_keys: true,
+        }],
+        step_up_config,
+        default_step_up_rule: None,
+    }
+    .into_validated()
+    .expect("valid config");
+
+    // When generating policies through the public API and parsing the returned
+    // Cedar document.
+    let policy_set = parse_policy_set(&generate_static_policies(&config).expect("policies parse"));
+    let policy_text = template_texts(&policy_set).join("\n");
+
+    // Then hostile bytes remain data inside one Cedar string literal.
+    assert!(policy_text.contains(
+        r#"quote\" slash\\ newline\n carriage\r tab\t backspace\u{8} formfeed\u{c} control\u{1}"#
+    ));
+}
+
+use authz_types::{Permission, ResourceType, Role, RolePermission};
+
+#[test]
+fn relationship_scope_policies_present() {
+    let permission_actions = vec![
+        PermissionActionRef {
+            resource_type: "repository".into(),
+            action_name: "read".into(),
+        },
+        PermissionActionRef {
+            resource_type: "repository".into(),
+            action_name: "write".into(),
+        },
+    ];
+    let config = ConfigurationModel {
+        version: 1,
+        resource_types: vec![ResourceType {
+            id: "repository".into(),
+            name: "Repository".into(),
+            description: None,
+            actions: vec![
+                authz_types::ActionDefinition {
+                    name: "read".into(),
+                    description: None,
+                },
+                authz_types::ActionDefinition {
+                    name: "write".into(),
+                    description: None,
+                },
+            ],
+            context_schema: None,
+        }],
+        permissions: vec![Permission {
+            id: "repo:contrib".into(),
+            name: "Contributor".into(),
+            description: None,
+            actions: permission_actions,
+            not_actions: vec![],
+        }],
+        roles: vec![Role {
+            id: "contributor".into(),
+            name: "Contributor".into(),
+            description: None,
+            permissions: vec![RolePermission {
+                permission_id: PermissionId::new("repo:contrib").expect("permission id"),
+                scopes: vec![authz_types::Scope::OrgRelationship],
+            }],
+            actions: vec![],
+            not_actions: vec![],
+            assignment_policy: crate::bundle::permanent_assignment_policy(),
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: Vec::new(),
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+    };
+
+    let config = config.into_validated().expect("valid config");
+    let policy_set = PolicySet::from_json_str(generate_static_policies(&config).expect("policies"))
+        .expect("policy set");
+    let policy_text = policy_set
+        .templates()
+        .map(|template| template.to_cedar())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        policy_text.contains("resource.org_parents")
+            && policy_text.contains("contains(principal.id)"),
+        "org relationship scope condition rendered"
+    );
+}

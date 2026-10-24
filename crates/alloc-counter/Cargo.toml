@@ -1,12 +1,18 @@
 [package]
+rust-version.workspace = true
 publish = false
 name = "alloc-counter"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
 
+[features]
+default = []
+opt-loop-profiling = ["dep:opt-loop-probe"]
+
 [dependencies]
 alloc-counter-macros = { workspace = true }
+opt-loop-probe = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

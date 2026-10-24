@@ -14,6 +14,13 @@ loopback hosts (`localhost`, `127.0.0.1`, or `::1`). CBOR is preflighted before
 decoding with byte, depth, and value-count budgets to keep attacker-controlled
 credential and attestation data bounded.
 
+Counters are classified as `Initial`, `Increased`, `Unchanged`, `Regression`,
+or `ZeroCounter`. A zero counter with no history (`previous == 0 &&
+current == 0`) reports `ZeroCounter`, not `Initial`: the authenticator may
+not implement a counter, so first use and unlimited replays are
+indistinguishable and the result must not back replay-detection-sensitive
+decisions.
+
 The default profile rejects raw r||s signatures, duplicate or trailing CBOR,
 wrong key type/curve/algorithm, malformed credential boundaries, unsupported
 attestation formats, and unsupported extensions. The caller owns challenge
@@ -23,7 +30,7 @@ counter persistence, and audit.
 ## Target support
 
 `wasm32-unknown-unknown` is a compile-only supported target, checked by
-`just check-wasm`; this crate has no WASM runtime harness. Verification does
+`cargo check -p webauthn-core --target wasm32-unknown-unknown`; this crate has no WASM runtime harness. Verification does
 not require runtime entropy, so its P-256 dependency enables only the ECDSA
 feature and keeps default features disabled. In particular, the crate does not
 enable `getrandom/wasm_js`: browser-specific entropy must remain an explicit

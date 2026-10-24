@@ -15,6 +15,8 @@ pub enum HttpRequestError {
     RequestSizeUnknown { max: usize },
     #[error("request body not cloneable for retry or redirect")]
     RequestNotCloneable,
+    #[error("response body could not be read")]
+    ResponseBody,
     #[error("response body too large: {size} > {max}")]
     ResponseTooLarge { size: usize, max: usize },
     #[error("response cache lifetime is too large: {seconds} seconds")]
@@ -41,6 +43,8 @@ pub enum HttpRequestErrorKind {
     Connect,
     Request,
     Body,
+    ResponseBody,
+    ResponseTooLarge,
     Status,
     Redirect,
     Ssrf,
@@ -48,6 +52,15 @@ pub enum HttpRequestErrorKind {
     Decode,
     InvalidCacheTtl,
     Unknown,
+}
+
+/// Whether an HTTP failure proves that no request reached the destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpRequestDispatchStatus {
+    /// Request bytes are known not to have reached the destination.
+    NotDispatched,
+    /// Request bytes may have reached the destination before the failure.
+    PossiblyDispatched,
 }
 
 impl fmt::Debug for HttpRequestError {
@@ -78,8 +91,9 @@ impl HttpRequestError {
             HttpRequestError::Transport { kind } => *kind,
             HttpRequestError::RequestTooLarge { .. }
             | HttpRequestError::RequestSizeUnknown { .. }
-            | HttpRequestError::RequestNotCloneable
-            | HttpRequestError::ResponseTooLarge { .. } => HttpRequestErrorKind::Body,
+            | HttpRequestError::RequestNotCloneable => HttpRequestErrorKind::Body,
+            HttpRequestError::ResponseBody => HttpRequestErrorKind::ResponseBody,
+            HttpRequestError::ResponseTooLarge { .. } => HttpRequestErrorKind::ResponseTooLarge,
             HttpRequestError::CacheTtlOverflow { .. } => HttpRequestErrorKind::InvalidCacheTtl,
             HttpRequestError::HttpStatus { .. } => HttpRequestErrorKind::Status,
             HttpRequestError::RedirectBlocked { .. } => HttpRequestErrorKind::Redirect,
@@ -88,14 +102,42 @@ impl HttpRequestError {
             HttpRequestError::Decode => HttpRequestErrorKind::Decode,
         }
     }
+
+    /// Classifies whether a caller may safely treat the operation as not
+    /// applied.
+    #[must_use]
+    pub const fn dispatch_status(&self) -> HttpRequestDispatchStatus {
+        match self {
+            Self::Build
+            | Self::RequestTooLarge { .. }
+            | Self::RequestSizeUnknown { .. }
+            | Self::SsrfBlocked { .. }
+            | Self::InvalidUrl
+            | Self::Transport {
+                kind:
+                    HttpRequestErrorKind::Build
+                    | HttpRequestErrorKind::Connect
+                    | HttpRequestErrorKind::Ssrf
+                    | HttpRequestErrorKind::InvalidUrl,
+            } => HttpRequestDispatchStatus::NotDispatched,
+            Self::Transport { .. }
+            | Self::RequestNotCloneable
+            | Self::ResponseBody
+            | Self::ResponseTooLarge { .. }
+            | Self::CacheTtlOverflow { .. }
+            | Self::HttpStatus { .. }
+            | Self::RedirectBlocked { .. }
+            | Self::Decode => HttpRequestDispatchStatus::PossiblyDispatched,
+        }
+    }
 }
 
 impl From<reqwest::Error> for HttpRequestError {
     fn from(error: reqwest::Error) -> Self {
-        let kind = if error.is_timeout() {
-            HttpRequestErrorKind::Timeout
-        } else if error.is_connect() {
+        let kind = if error.is_connect() {
             HttpRequestErrorKind::Connect
+        } else if error.is_timeout() {
+            HttpRequestErrorKind::Timeout
         } else if error.is_body() {
             HttpRequestErrorKind::Body
         } else if error.is_request() {

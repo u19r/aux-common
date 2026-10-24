@@ -5,34 +5,29 @@
 //! snapshots; this crate does not fetch storage, validate service tokens, or
 //! know private AuxFn row formats.
 
+mod access;
 mod enrichment;
 mod error;
-mod evaluation_runtime;
-mod local_evaluator;
-mod role_assignment;
-mod scope;
-mod step_up_evaluator;
+mod evaluation;
+mod local;
+mod step_up;
 
+pub use access::{
+    EffectiveRoleAssignment, ScopeKind, classify_scope, role_assignment_covers_resource,
+};
 pub use enrichment::{
     EnrichedCedarRequest, ParentRef, ResourceAccessSnapshot, SnapshotFreshnessPolicy,
     SubjectAccessSnapshot, SubjectParentTemplate, build_subject_parent_template,
     enrich_request_with_snapshots, enrich_request_with_snapshots_at,
 };
 pub use error::{AuthzRuntimeError, AuthzRuntimeResult};
-pub use evaluation_runtime::{
+pub use evaluation::{
     ActionMasks, EvaluationRuntime, PermissionBits, ResolvedPermissionBits, RoleBits,
     ScopedPermissionBits,
 };
-pub use local_evaluator::{
+pub use local::{
     ActionPolicyDecision, LocalAuthzEvaluator, LocalBatchEvaluationInput, LocalEvaluationInput,
     TrustedAuthorizationContext, action_policy_decision_bits, best_permission_for_action_with_bits,
     permissions_for_request_bits,
 };
-pub use role_assignment::EffectiveRoleAssignment;
-pub use scope::{ScopeKind, classify_scope, role_assignment_covers_resource};
-pub use step_up_evaluator::{StepUpEvaluator, StepUpResult};
-
-#[cfg(test)]
-mod local_evaluator_tests;
-#[cfg(test)]
-mod step_up_evaluator_tests;
+pub use step_up::{StepUpEvaluator, StepUpResult};

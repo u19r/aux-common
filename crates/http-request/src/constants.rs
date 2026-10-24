@@ -21,10 +21,6 @@ pub(crate) const DEFAULT_ALLOWED_SCHEMES: &[&str] = &["https"];
 pub(crate) const DEFAULT_ALLOWED_PORTS: &[u16] = &[443];
 pub(crate) const DEFAULT_HTTPS_PORT: u16 = 443;
 
-pub(crate) const LABEL_METHOD: &str = "method";
-pub(crate) const LABEL_STATUS_CLASS: &str = "status_class";
-pub(crate) const LABEL_OUTCOME: &str = "outcome";
-
 pub(crate) const OUTCOME_SUCCESS: &str = "success";
 pub(crate) const OUTCOME_ERROR: &str = "error";
 pub(crate) const OUTCOME_RETRY: &str = "retry";
@@ -52,3 +48,38 @@ pub(crate) const SSRF_BLOCKED_USERINFO: &str = "user_info_not_allowed";
 pub(crate) const SSRF_BLOCKED_FRAGMENT: &str = "fragment_not_allowed";
 pub(crate) const SSRF_BLOCKED_PORT: &str = "disallowed_port";
 pub(crate) const SSRF_BLOCKED_HOST_HEADER: &str = "host_header_override";
+
+pub(crate) const RESERVED_IP_RANGES: &[&str] = &[
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.168.0.0/16",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+    "255.255.255.255/32",
+    "::/128",
+    "::1/128",
+    // RFC 8215 local-use NAT64 space can be forwardable inside a translation
+    // domain even though it is not globally reachable.
+    "64:ff9b:1::/48",
+    "100::/64",
+    "2001:db8::/32",
+    // 6to4 and Teredo tunnel IPv4 addresses through globally routable IPv6.
+    // Treat their embedded private/reserved destinations as untrusted rather
+    // than relying on the platform's tunnel configuration.
+    "2001::/32",
+    "2002::/16",
+    "fc00::/7",
+    // Deprecated IPv6 site-local space is still potentially routed locally.
+    "fec0::/10",
+    "fe80::/10",
+    "ff00::/8",
+];

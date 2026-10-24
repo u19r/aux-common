@@ -1,0 +1,147 @@
+[package]
+rust-version = "1.99.1"
+name = "aux-common-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detached from the parent workspace: fuzz builds require nightly with
+# libfuzzer and must never join the stable `cargo check/test` gates.
+[workspace]
+
+[[bin]]
+name = "xml_document"
+path = "fuzz_targets/xml_document.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "xml_signature_mutation"
+path = "fuzz_targets/xml_signature_mutation.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "jwt_shape"
+path = "fuzz_targets/jwt_shape.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "jwt_decision"
+path = "fuzz_targets/jwt_decision.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "jose_decision"
+path = "fuzz_targets/jose_decision.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "saml_redirect"
+path = "fuzz_targets/saml_redirect.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "webauthn_ceremony"
+path = "fuzz_targets/webauthn_ceremony.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ssrf_decision"
+path = "fuzz_targets/ssrf_decision.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cedar_decision"
+path = "fuzz_targets/cedar_decision.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cedar_role_decision"
+path = "fuzz_targets/cedar_role_decision.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cbor_key"
+path = "fuzz_targets/cbor_key.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "saml_metadata"
+path = "fuzz_targets/saml_metadata.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ecs_uri_decision"
+path = "fuzz_targets/ecs_uri_decision.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "dpop_proof"
+path = "fuzz_targets/dpop_proof.rs"
+test = false
+doc = false
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+
+[dependencies.authz-cedar]
+path = "../crates/authz-cedar"
+[dependencies.authz-types]
+path = "../crates/authz-types"
+[dependencies.aws-credentials]
+path = "../crates/aws-credentials"
+[dependencies.aws-lc-rs]
+version = "1.18.2"
+[dependencies.base64]
+version = "0.23.1"
+[dependencies.bg-jobs-http]
+path = "../crates/bg-jobs-http"
+[dependencies.chrono]
+version = "0.4.45"
+[dependencies.ciborium]
+version = "0.2.2"
+[dependencies.hmac]
+version = "0.13.0"
+[dependencies.http-request]
+path = "../crates/http-request"
+[dependencies.jose-core]
+path = "../crates/jose-core"
+[dependencies.jwt-decode]
+path = "../crates/jwt-decode"
+
+[dependencies.oauth-dpop]
+path = "../crates/oauth-dpop"
+[dependencies.p256]
+version = "0.14.0"
+features = ["ecdsa"]
+[dependencies.saml2]
+path = "../crates/saml2"
+[dependencies.serde_json]
+version = "1.0.154"
+[dependencies.sha2]
+version = "0.11.1"
+[dependencies.url]
+version = "2.5.8"
+[dependencies.webauthn-core]
+path = "../crates/webauthn-core"
+[dependencies.xml-security]
+path = "../crates/xml-security"
+
+[workspace.package]
+rust-version = "1.99.1"

@@ -1,6 +1,6 @@
 [package]
 publish = false
-name = "crypto-hash"
+name = "aux-crypto-hash"
 version = "0.1.0"
 rust-version.workspace = true
 edition.workspace = true
@@ -8,10 +8,14 @@ description = "Small, policy-explicit hashing primitives for public consumers"
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "crypto_hash"
+
 [dependencies]
 argon2 = { workspace = true }
 base64 = { workspace = true }
 data-encoding = { workspace = true }
+hmac = { workspace = true }
 password-hash = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }

@@ -1,0 +1,11 @@
+pub(crate) const MIN_CHALLENGE_BYTES: usize = 16;
+pub(crate) const MAX_CHALLENGE_BYTES: usize = 128;
+pub(crate) const MAX_AUTHENTICATOR_DATA_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_SIGNATURE_BYTES: usize = 256;
+pub(crate) const MAX_CREDENTIAL_ID_BYTES: usize = 1023;
+pub(crate) const MAX_ATTESTATION_OBJECT_BYTES: usize = 32 * 1024;
+pub(crate) const MAX_COSE_KEY_BYTES: usize = 1024;
+pub(crate) const MAX_CBOR_DEPTH: usize = 16;
+pub(crate) const MAX_CBOR_ITEMS: usize = 256;
+pub(crate) const MAX_CLIENT_DATA_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_USER_HANDLE_BYTES: usize = 64;

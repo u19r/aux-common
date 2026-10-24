@@ -26,7 +26,7 @@ fn performance_parse_cose_reports_valid_and_bounded_invalid_paths() {
     );
     let valid_result = black_box(parse_cose_key(&valid)).expect("valid COSE key");
     let valid_report = valid_guard.finish();
-    alloc_counter::emit_report(&valid_report);
+    alloc_counter::emit_report(&valid_report).expect("allocation report");
 
     let invalid_guard = AllocationGuard::start(
         module_path!(),
@@ -37,7 +37,7 @@ fn performance_parse_cose_reports_valid_and_bounded_invalid_paths() {
     );
     let invalid_result = black_box(parse_cose_key(&oversized));
     let invalid_report = invalid_guard.finish();
-    alloc_counter::emit_report(&invalid_report);
+    alloc_counter::emit_report(&invalid_report).expect("allocation report");
 
     assert_eq!(valid_result.algorithm, -7);
     assert!(invalid_result.is_err());

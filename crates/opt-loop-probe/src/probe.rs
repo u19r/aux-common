@@ -42,6 +42,87 @@ pub(crate) struct ProbeConfig {
     pub(crate) stack_depth: usize,
 }
 
+impl ProbeConfig {
+    fn from_env() -> Option<Self> {
+        Self::from_getter(|key| env::var(key).ok())
+    }
+
+    #[cfg(test)]
+    fn from_values(values: &HashMap<String, String>) -> Option<Self> {
+        Self::from_getter(|key| values.get(key).cloned())
+    }
+
+    fn from_getter<F>(get: F) -> Option<Self>
+    where F: Fn(&str) -> Option<String> {
+        if !get(ENV_ENABLED).is_some_and(|value| env_truthy_value(&value)) {
+            return None;
+        }
+
+        let target_id = get(ENV_TARGET_ID).map_or_else(
+            || "unknown".to_string(),
+            |value| sanitize_path_component(&value, MAX_TARGET_ID_BYTES),
+        );
+        let phase = get(ENV_PHASE).map_or_else(
+            || "unknown".to_string(),
+            |value| sanitize_path_component(&value, MAX_PHASE_BYTES),
+        );
+        let sample_index = get(ENV_SAMPLE_INDEX)
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        let (sample_file, hotspot_file) =
+            Self::resolve_output_paths(&get, &target_id, &phase, sample_index);
+        if sample_file == hotspot_file {
+            return None;
+        }
+        let alloc_sample_rate = get(ENV_ALLOC_SAMPLE_RATE)
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_ALLOC_SAMPLE_RATE);
+        let stack_depth = get(ENV_STACK_DEPTH)
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .map_or(DEFAULT_STACK_DEPTH, |value| value.min(MAX_STACK_DEPTH));
+
+        Some(Self {
+            target_id,
+            phase,
+            sample_index,
+            sample_file,
+            hotspot_file,
+            alloc_sample_rate,
+            stack_depth,
+        })
+    }
+
+    fn resolve_output_paths<F>(
+        get: &F,
+        target_id: &str,
+        phase: &str,
+        sample_index: u32,
+    ) -> (PathBuf, PathBuf)
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let sample_file = get(ENV_SAMPLE_FILE).map_or_else(
+            || {
+                PathBuf::from(format!(
+                    "tmp/opt-loop/runs/{target_id}/{phase}/sample-{sample_index}.json"
+                ))
+            },
+            PathBuf::from,
+        );
+        let hotspot_file = get(ENV_HOTSPOT_FILE).map_or_else(
+            || {
+                PathBuf::from(format!(
+                    "tmp/opt-loop/runs/{target_id}/{phase}/sample-{sample_index}-hotspots.json"
+                ))
+            },
+            PathBuf::from,
+        );
+        (sample_file, hotspot_file)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeSample {
     pub target_id: String,
@@ -187,63 +268,19 @@ pub(crate) struct ProbeState {
 
 impl ProbeState {
     fn from_env() -> Option<Self> {
-        if !env_truthy(ENV_ENABLED) {
-            return None;
-        }
+        let state = Self::from_config(ProbeConfig::from_env()?);
+        state.flush();
+        Some(state)
+    }
 
-        let target_id = env::var(ENV_TARGET_ID).map_or_else(
-            |_| "unknown".to_string(),
-            |value| sanitize_path_component(&value, MAX_TARGET_ID_BYTES),
-        );
-        let phase = env::var(ENV_PHASE).map_or_else(
-            |_| "unknown".to_string(),
-            |value| sanitize_path_component(&value, MAX_PHASE_BYTES),
-        );
-        let sample_index = env::var(ENV_SAMPLE_INDEX)
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(0);
+    #[cfg(test)]
+    pub(crate) fn from_env_values(values: &HashMap<String, String>) -> Option<Self> {
+        ProbeConfig::from_values(values).map(Self::from_config)
+    }
 
-        let sample_file = env::var(ENV_SAMPLE_FILE).map_or_else(
-            |_| {
-                PathBuf::from(format!(
-                    "tmp/opt-loop/runs/{target_id}/{phase}/sample-{sample_index}.json"
-                ))
-            },
-            PathBuf::from,
-        );
-
-        let hotspot_file = env::var(ENV_HOTSPOT_FILE).map_or_else(
-            |_| {
-                PathBuf::from(format!(
-                    "tmp/opt-loop/runs/{target_id}/{phase}/sample-{sample_index}-hotspots.json"
-                ))
-            },
-            PathBuf::from,
-        );
-
-        let alloc_sample_rate = env::var(ENV_ALLOC_SAMPLE_RATE)
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_ALLOC_SAMPLE_RATE);
-
-        let stack_depth = env::var(ENV_STACK_DEPTH)
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .map_or(DEFAULT_STACK_DEPTH, |v| v.min(MAX_STACK_DEPTH));
-
-        let state = Self {
-            config: ProbeConfig {
-                target_id,
-                phase,
-                sample_index,
-                sample_file,
-                hotspot_file,
-                alloc_sample_rate,
-                stack_depth,
-            },
+    fn from_config(config: ProbeConfig) -> Self {
+        Self {
+            config,
             alloc_count: AtomicU64::new(0),
             alloc_bytes: AtomicU64::new(0),
             live_bytes: AtomicI64::new(0),
@@ -264,10 +301,7 @@ impl ProbeState {
             hotspot_count: AtomicUsize::new(0),
             hotspots: Mutex::new(HashMap::new()),
             flush_lock: Mutex::new(()),
-        };
-
-        state.flush();
-        Some(state)
+        }
     }
 
     pub(crate) fn record_alloc(&self, size: usize) {
@@ -315,8 +349,8 @@ impl ProbeState {
         calls: &AtomicU64,
         total_bytes: &AtomicU64,
     ) {
-        calls.fetch_add(1, Ordering::Relaxed);
-        total_bytes.fetch_add(bytes, Ordering::Relaxed);
+        saturating_fetch_add(calls, 1);
+        saturating_fetch_add(total_bytes, bytes);
         self.record_hotspot(kind, Some(operation), bytes);
     }
 
@@ -371,10 +405,6 @@ impl ProbeState {
     }
 
     pub(crate) fn record_hotspot(&self, kind: &str, operation: Option<&str>, bytes: u64) {
-        if self.hotspot_count.load(Ordering::Relaxed) >= MAX_HOTSPOTS {
-            return;
-        }
-
         let kind = sanitize_diagnostic_label(kind, MAX_OPERATION_BYTES);
         let operation =
             operation.map(|value| sanitize_diagnostic_label(value, MAX_OPERATION_BYTES));
@@ -386,24 +416,28 @@ impl ProbeState {
         );
 
         if let Ok(mut guard) = self.hotspots.lock() {
-            let previous_len = guard.len();
-            if previous_len >= MAX_HOTSPOTS {
+            if let Some(entry) = guard.get_mut(&key) {
+                entry.count = entry.count.saturating_add(1);
+                entry.total_bytes = entry.total_bytes.saturating_add(bytes);
                 return;
             }
-            let entry = guard.entry(key).or_insert_with(|| HotspotAggregate {
-                kind,
-                operation,
-                stack_hash: format!("{stack_hash:016x}"),
-                count: 0,
-                total_bytes: 0,
-                sample_backtrace: backtrace.clone(),
-            });
-            entry.count = entry.count.saturating_add(1);
-            entry.total_bytes = entry.total_bytes.saturating_add(bytes);
-            let inserted = guard.len() > previous_len;
-            if inserted {
-                self.hotspot_count.fetch_add(1, Ordering::Relaxed);
+
+            if guard.len() >= MAX_HOTSPOTS {
+                return;
             }
+
+            guard.insert(
+                key,
+                HotspotAggregate {
+                    kind,
+                    operation,
+                    stack_hash: format!("{stack_hash:016x}"),
+                    count: 1,
+                    total_bytes: bytes,
+                    sample_backtrace: backtrace.clone(),
+                },
+            );
+            self.hotspot_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -493,7 +527,7 @@ impl ProbeState {
         }
     }
 
-    fn reset(&self) {
+    pub(crate) fn reset(&self) {
         self.alloc_count.store(0, Ordering::Relaxed);
         self.alloc_bytes.store(0, Ordering::Relaxed);
         self.live_bytes.store(0, Ordering::Relaxed);
@@ -539,14 +573,14 @@ impl ProbeState {
         }
     }
 
-    fn counter_snapshot(&self) -> CounterSnapshot {
+    pub(crate) fn counter_snapshot(&self) -> CounterSnapshot {
         CounterSnapshot {
             alloc_count: self.alloc_count.load(Ordering::Relaxed),
             alloc_bytes: self.alloc_bytes.load(Ordering::Relaxed),
         }
     }
 
-    fn record_manager_measurement(&self, duration_ms: u64, before: CounterSnapshot) {
+    pub(crate) fn record_manager_measurement(&self, duration_ms: u64, before: CounterSnapshot) {
         let after = self.counter_snapshot();
         self.manager_wall_time_ms
             .store(duration_ms, Ordering::Relaxed);
@@ -562,8 +596,14 @@ impl ProbeState {
     }
 }
 
+fn saturating_fetch_add(counter: &AtomicU64, amount: u64) {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(amount))
+    });
+}
+
 #[derive(Clone, Copy)]
-struct CounterSnapshot {
+pub(crate) struct CounterSnapshot {
     alloc_count: u64,
     alloc_bytes: u64,
 }
@@ -747,11 +787,9 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     truncated
 }
 
-fn env_truthy(key: &str) -> bool {
-    env::var(key).is_ok_and(|value| {
-        let normalized = value.trim().to_ascii_lowercase();
-        matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
-    })
+fn env_truthy_value(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
 }
 
 pub(crate) fn with_probe_guard<F>(f: F)

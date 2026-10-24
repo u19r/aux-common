@@ -9,4 +9,8 @@ mod probe;
 #[cfg(test)]
 mod probe_tests;
 
-pub use crate::probe::*;
+pub use crate::probe::{
+    HotspotRecord, ProbeAllocator, ProbeSample, estimate_json_bytes, force_flush, is_enabled,
+    measure_future, record_analytics_call, record_bg_job_call, record_pubsub_call,
+    record_queue_call, record_storage_call, reset,
+};

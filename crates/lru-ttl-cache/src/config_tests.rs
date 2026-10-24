@@ -21,7 +21,7 @@ fn fetching_cache_config_stores_refresh_ttl_without_exposing_fetch_in_debug() {
         .with_capacity(10)
         .with_ttl(Duration::from_secs(60))
         .with_fetch(fetch)
-        .with_refresh_ttl(Duration::from_secs(5));
+        .with_refresh_ttl(Duration::from_secs(5), String::len);
 
     let debug = format!("{config:?}");
     assert!(debug.contains("FetchingCacheConfig"));

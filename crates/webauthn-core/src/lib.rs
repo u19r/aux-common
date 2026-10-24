@@ -3,10 +3,11 @@
 //! The caller supplies expected challenge/origin/RP policy and owns stateful
 //! challenge consumption, credential binding, counters, tenants, and audit.
 
-mod assertion;
+pub(crate) mod assertion;
 mod attestation;
 mod cbor;
 mod client_data;
+mod constants;
 mod error;
 mod types;
 
@@ -19,6 +20,3 @@ pub use types::{
     AssertionInput, AssertionResult, AttestationInput, CrossOriginPolicy, RegistrationResult,
     RpPolicy, SignCountStatus, UserVerification,
 };
-
-#[cfg(test)]
-mod webauthn_tests;

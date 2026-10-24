@@ -1,0 +1,18 @@
+[package]
+publish = false
+name = "quint-rendered-parser"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Workspace-private parser support for Quint-rendered test values."
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

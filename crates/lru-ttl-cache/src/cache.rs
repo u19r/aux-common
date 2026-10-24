@@ -1,20 +1,14 @@
-use std::{
-    collections::HashMap,
-    hash::Hash,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{borrow::Borrow, hash::Hash, ops::Deref, sync::atomic::Ordering, time::Duration};
 
-use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
 use crate::{
-    config::{CacheConfig, FetchingCacheConfig},
-    core::{CacheCore, CacheEntry, CacheStats, EntryState},
-    fetch::FetchFn,
+    LoadUnavailable,
+    cache_entry::CacheEntry,
+    cache_load::LoadIntent,
+    cache_loader::CacheLoader,
+    config::{CacheConfig, FetchingCacheConfig, RefreshPolicy},
+    core::{CacheCore, CacheStats, EntryState},
 };
 
 pub struct LruTtlCache<K, V> {
@@ -22,15 +16,19 @@ pub struct LruTtlCache<K, V> {
 }
 
 pub struct FetchingLruTtlCache<K, V, E> {
-    core: CacheCore<K, V>,
-    refresh_ttl: Option<Duration>,
-    fetch: FetchFn<K, V, E>,
-    in_flight: Arc<Mutex<HashMap<K, Arc<FetchFlight>>>>,
+    loader: CacheLoader<K, V, E>,
+    refresh: Option<RefreshPolicy<K>>,
 }
 
-struct FetchFlight {
-    gate: AsyncMutex<()>,
-    missing: AtomicBool,
+#[must_use]
+pub struct CacheRead<V>(CacheEntry<V>);
+
+impl<V> Deref for CacheRead<V> {
+    type Target = V;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.value()
+    }
 }
 
 struct RefreshGuard<V>(CacheEntry<V>);
@@ -39,32 +37,6 @@ impl<V> Drop for RefreshGuard<V> {
     fn drop(&mut self) {
         self.0.finish_refresh();
     }
-}
-
-struct FetchLeader<K: Eq + Hash> {
-    key: K,
-    flight: Arc<FetchFlight>,
-    in_flight: Arc<Mutex<HashMap<K, Arc<FetchFlight>>>>,
-}
-
-impl<K> Drop for FetchLeader<K>
-where K: Eq + Hash
-{
-    fn drop(&mut self) {
-        let mut in_flight = lock_unpoisoned(&self.in_flight);
-        if in_flight
-            .get(&self.key)
-            .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
-        {
-            in_flight.remove(&self.key);
-        }
-    }
-}
-
-enum FetchRole<K: Eq + Hash> {
-    Leader(FetchLeader<K>),
-    Follower(Arc<FetchFlight>),
-    Uncoordinated,
 }
 
 impl<K, V> Clone for LruTtlCache<K, V>
@@ -87,10 +59,8 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            core: self.core.clone(),
-            refresh_ttl: self.refresh_ttl,
-            fetch: Arc::clone(&self.fetch),
-            in_flight: Arc::clone(&self.in_flight),
+            loader: self.loader.clone(),
+            refresh: self.refresh.clone(),
         }
     }
 }
@@ -104,7 +74,7 @@ where
     #[allow(clippy::needless_pass_by_value)]
     pub fn new(config: CacheConfig<K, V>) -> Self {
         Self {
-            core: CacheCore::new(config.capacity, config.ttl),
+            core: CacheCore::new(config.capacity, config.expiration, None),
         }
     }
 
@@ -115,6 +85,15 @@ where
 
     pub fn insert(&self, key: K, value: V) {
         self.core.insert(key, value);
+    }
+
+    /// Insert a value and retain an owning read handle to the inserted entry.
+    ///
+    /// The handle shares the cache entry's allocation, so callers can use the
+    /// value without a second lookup or a `V` clone. `None` means this cache is
+    /// disabled or the insertion used a zero TTL and did not retain the value.
+    pub fn insert_ref(&self, key: K, value: V) -> Option<CacheRead<V>> {
+        self.core.insert_ref(key, value).map(CacheRead)
     }
 
     pub fn insert_with_ttl(&self, key: K, value: V, ttl: Duration) {
@@ -141,6 +120,21 @@ where
         self.cached(key)
     }
 
+    /// Read a fresh value through an owning handle without cloning `V`.
+    ///
+    /// The handle keeps the cache entry alive after eviction and does not hold
+    /// the cache mutex while the caller uses the borrowed value.
+    pub fn get_ref<Q>(&self, key: &Q) -> Option<CacheRead<V>>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        match self.core.inspect_entry(key) {
+            EntryState::Fresh(entry) => Some(CacheRead(entry)),
+            EntryState::Expired | EntryState::Missing | EntryState::Stale(_) => None,
+        }
+    }
+
     #[must_use]
     pub fn stats(&self) -> CacheStats {
         self.core.stats()
@@ -151,36 +145,38 @@ impl<K, V, E> FetchingLruTtlCache<K, V, E>
 where
     K: Eq + Hash + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
-    E: Send + 'static,
+    E: Clone + From<LoadUnavailable> + Send + Sync + 'static,
 {
     #[must_use]
     pub fn new(config: FetchingCacheConfig<K, V, E>) -> Self {
         Self {
-            core: CacheCore::new(config.base.capacity, config.base.ttl),
-            refresh_ttl: config.refresh_ttl,
-            fetch: config.fetch,
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            loader: CacheLoader::new(config.base, config.fetch, config.invalidation),
+            refresh: config.refresh,
         }
     }
 
     #[must_use]
     pub fn ttl(&self) -> Duration {
-        self.core.ttl()
+        self.loader.core.ttl()
     }
 
     pub fn insert(&self, key: K, value: V) {
-        self.core.insert(key, value);
+        self.loader.core.insert(key, value);
+    }
+
+    pub fn insert_with_ttl(&self, key: K, value: V, ttl: Duration) {
+        self.loader.core.insert_with_ttl(key, value, ttl);
     }
 
     pub fn remove(&self, key: &K) -> Option<V> {
-        self.core.remove(key)
+        self.loader.core.remove(key)
     }
 
     pub fn cached(&self, key: &K) -> Option<V> {
-        match self.core.inspect_entry(key) {
+        match self.loader.core.inspect_entry(key) {
             EntryState::Fresh(entry) => {
                 let value = entry.value().clone();
-                self.maybe_spawn_refresh(key, entry);
+                self.schedule_refresh(key, entry);
                 Some(value)
             }
             EntryState::Expired | EntryState::Missing | EntryState::Stale(_) => None,
@@ -192,21 +188,21 @@ where
     /// This is useful for callers which must prove that the fast path performs
     /// no provider work before deciding whether to acquire a provider permit.
     pub fn peek(&self, key: &K) -> Option<V> {
-        match self.core.inspect_entry(key) {
+        match self.loader.core.inspect_entry(key) {
             EntryState::Fresh(entry) => Some(entry.value().clone()),
             EntryState::Expired | EntryState::Missing | EntryState::Stale(_) => None,
         }
     }
 
     pub async fn get_or_fetch(&self, key: &K) -> Result<Option<V>, E> {
-        match self.core.inspect_entry(key) {
+        match self.loader.core.inspect_entry(key) {
             EntryState::Fresh(entry) => {
                 let value = entry.value().clone();
-                self.maybe_spawn_refresh(key, entry);
+                self.schedule_refresh(key, entry);
                 Ok(Some(value))
             }
             EntryState::Expired | EntryState::Missing | EntryState::Stale(_) => {
-                self.fetch_and_store(key).await
+                self.loader.fetch_and_store(key).await
             }
         }
     }
@@ -216,127 +212,53 @@ where
         key: &K,
         stale_ttl: Duration,
     ) -> Result<Option<V>, E> {
-        match self.core.inspect_entry_with_stale(key, stale_ttl) {
+        // The stale window is evaluated at request time by
+        // `inspect_entry_with_stale`. A `Stale` entry was within `stale_ttl`
+        // of expiry when this call started, so a failing fetch serves it
+        // without re-checking the clock: otherwise the fetch's own retry
+        // budget would eat a short window and make the opt-in silently inert.
+        match self.loader.core.inspect_entry_with_stale(key, stale_ttl) {
             EntryState::Fresh(entry) => {
                 let value = entry.value().clone();
-                self.maybe_spawn_refresh(key, entry);
+                self.schedule_refresh(key, entry);
                 Ok(Some(value))
             }
-            EntryState::Stale(entry) => match self.fetch_and_store(key).await {
+            EntryState::Stale(entry) => match self.loader.fetch_and_store(key).await {
                 Ok(value) => Ok(value),
-                Err(_) if entry.is_stale_at(std::time::Instant::now(), stale_ttl) => {
-                    self.core.restore_entry_if_missing(key, &entry);
-                    self.core.refresh_errors().fetch_add(1, Ordering::Relaxed);
+                Err(_) if self.loader.core.is_current_entry(key, &entry) => {
+                    self.loader
+                        .core
+                        .refresh_errors()
+                        .fetch_add(1, Ordering::Relaxed);
                     warn!("cache_fetch_failed_serving_stale");
                     Ok(Some(entry.value().clone()))
                 }
                 Err(error) => Err(error),
             },
-            EntryState::Expired | EntryState::Missing => self.fetch_and_store(key).await,
+            EntryState::Expired | EntryState::Missing => self.loader.fetch_and_store(key).await,
         }
     }
 
     #[must_use]
     pub fn stats(&self) -> CacheStats {
-        self.core.stats()
+        let mut stats = self.loader.core.stats();
+        let loads = self.loader.loads.stats();
+        stats.active_loads = loads.active_keys;
+        stats.load_subscribers = loads.subscribers;
+        stats
     }
 
-    #[cfg(test)]
-    pub(crate) fn in_flight_count(&self) -> usize {
-        lock_unpoisoned(&self.in_flight).len()
-    }
-
-    fn fetch_clone(&self) -> FetchFn<K, V, E> {
-        Arc::clone(&self.fetch)
-    }
-
-    async fn fetch_and_store(&self, key: &K) -> Result<Option<V>, E> {
-        if self.core.is_disabled() {
-            return self.fetch_and_store_uncoordinated(key).await;
-        }
-
-        loop {
-            match self.fetch_role(key) {
-                FetchRole::Leader(leader) => {
-                    let flight = Arc::clone(&leader.flight);
-                    let gate = flight.gate.lock().await;
-                    if let Some(entry) = self.core.fresh_entry_untracked(key) {
-                        drop(leader);
-                        drop(gate);
-                        return Ok(Some(entry.value().clone()));
-                    }
-
-                    let result = self.fetch_and_store_uncoordinated(key).await;
-                    if matches!(result, Ok(None)) {
-                        flight.missing.store(true, Ordering::Release);
-                    }
-                    drop(leader);
-                    drop(gate);
-                    return result;
-                }
-                FetchRole::Follower(flight) => {
-                    let gate = flight.gate.lock().await;
-                    if flight.missing.load(Ordering::Acquire) {
-                        return Ok(None);
-                    }
-                    if let Some(entry) = self.core.fresh_entry_untracked(key) {
-                        return Ok(Some(entry.value().clone()));
-                    }
-                    drop(gate);
-                }
-                FetchRole::Uncoordinated => return self.fetch_and_store_uncoordinated(key).await,
-            }
-        }
-    }
-
-    async fn fetch_and_store_uncoordinated(&self, key: &K) -> Result<Option<V>, E> {
-        let fetcher = self.fetch_clone();
-        let key_clone = key.clone();
-        let result = fetcher(key_clone.clone()).await?;
-        if self.core.is_disabled() {
-            return Ok(result);
-        }
-        if let Some(value) = result {
-            self.core.insert(key_clone, value.clone());
-            Ok(Some(value))
-        } else {
-            self.core.remove(&key_clone);
-            Ok(None)
-        }
-    }
-
-    fn fetch_role(&self, key: &K) -> FetchRole<K> {
-        let mut in_flight = lock_unpoisoned(&self.in_flight);
-        if let Some(flight) = in_flight.get(key) {
-            return FetchRole::Follower(Arc::clone(flight));
-        }
-        if in_flight.len() >= self.core.coordination_capacity() {
-            return FetchRole::Uncoordinated;
-        }
-
-        let flight = Arc::new(FetchFlight {
-            gate: AsyncMutex::new(()),
-            missing: AtomicBool::new(false),
-        });
-        in_flight.insert(key.clone(), Arc::clone(&flight));
-        FetchRole::Leader(FetchLeader {
-            key: key.clone(),
-            flight,
-            in_flight: Arc::clone(&self.in_flight),
-        })
-    }
-
-    fn maybe_spawn_refresh(&self, key: &K, entry: CacheEntry<V>) {
-        if self.core.is_disabled() {
+    fn schedule_refresh(&self, key: &K, entry: CacheEntry<V>) {
+        if self.loader.core.is_disabled() {
             return;
         }
-        let Some(refresh_ttl) = self.refresh_ttl else {
+        let Some(policy) = &self.refresh else {
             return;
         };
-        if refresh_ttl.is_zero() {
+        if policy.ttl.is_zero() {
             return;
         }
-        if !entry.should_refresh(refresh_ttl) {
+        if !entry.should_refresh(policy.ttl) {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -346,36 +268,47 @@ where
             return;
         }
 
-        self.core.record_refresh_spawn();
-        let cache_core = self.core.clone();
-        let refresh_errors = self.core.refresh_errors();
-        let fetcher = self.fetch_clone();
-        let refresh_key = key.clone();
+        self.dispatch_refresh(key, entry, policy, &runtime);
+    }
+
+    fn dispatch_refresh(
+        &self,
+        key: &K,
+        entry: CacheEntry<V>,
+        policy: &RefreshPolicy<K>,
+        runtime: &tokio::runtime::Handle,
+    ) {
+        let loader = self.loader.clone();
+        let refresh_errors = self.loader.core.refresh_errors();
         let refresh_guard = RefreshGuard(entry.clone());
-        let refresh_entry = entry.clone();
-        let task = runtime.spawn(async move {
-            let result = fetcher(refresh_key.clone()).await;
-            match result {
-                Ok(Some(value)) => {
-                    cache_core.apply_refresh_if_current(&refresh_key, &refresh_entry, Some(value));
-                }
-                Ok(None) => {
-                    cache_core.apply_refresh_if_current(&refresh_key, &refresh_entry, None);
-                }
-                Err(_) => {
+        let build = || {
+            let refresh_key = key.clone();
+            async move {
+                if loader
+                    .fetch_shared(&refresh_key, LoadIntent::Refresh(refresh_guard.0.clone()))
+                    .await
+                    .is_err()
+                {
                     refresh_errors.fetch_add(1, Ordering::Relaxed);
                     warn!("cache_refresh_failed");
                 }
+                drop(refresh_guard);
             }
-            drop(refresh_guard);
-        });
-        entry.install_refresh_handle(task.abort_handle());
-    }
-}
-
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+        };
+        match policy
+            .executor
+            .try_submit(runtime, (policy.key_bytes)(key), build)
+        {
+            Ok(handle) => {
+                self.loader.core.record_refresh();
+                entry.install_refresh_handle(handle);
+            }
+            Err(_) => {
+                self.loader
+                    .core
+                    .refresh_errors()
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 }

@@ -2,6 +2,8 @@ use thiserror::Error;
 
 use crate::SignatureAlgorithm;
 
+pub(crate) type Result<T> = std::result::Result<T, JwtDecodeError>;
+
 #[derive(Debug, Clone, Error)]
 #[error("{kind}")]
 pub struct JwtDecodeError {
@@ -85,6 +87,15 @@ pub enum PolicyErrorKind {
     EmptyAlgorithmAllowlist,
     #[error("empty value for {0}")]
     EmptyValue(&'static str),
+    #[error("value out of range for {0}")]
+    OutOfRange(&'static str),
     #[error("mixed symmetric and asymmetric algorithms")]
     MixedAlgorithmFamilies,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<lru_ttl_cache::LoadUnavailable> for JwtDecodeError {
+    fn from(_: lru_ttl_cache::LoadUnavailable) -> Self {
+        Self::new(JwtDecodeErrorKind::JwksCache)
+    }
 }

@@ -1,0 +1,12 @@
+**
+!Cargo.toml
+!Cargo.lock
+!README.md
+!crates/
+!crates/**
+**/target/
+**/node_modules/
+**/run-artifacts/
+
+!scripts/
+!scripts/install-mold.sh

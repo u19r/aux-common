@@ -1,5 +1,16 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CounterMetric {
+    BufferedMeteringEventsTotal,
+    BufferedMeteringItemsTotal,
+    BufferedMeteringBytesTotal,
+    BufferedMeteringAdmissionTotal,
+    BufferedMeteringSkippedTotal,
+    AccessProfileOperationsTotal,
+    AccessProfileStorageRequestsTotal,
+    AccessProfileTransitionsTotal,
+    AccessProfileReplaysTotal,
+    AccessProfileLimitRejectionsTotal,
+
     AnalyticsCompactionObjectsReadTotalMetric,
     AnalyticsCompactionObjectsWrittenTotalMetric,
     AnalyticsCompactionRunsTotalMetric,
@@ -41,9 +52,13 @@ pub enum CounterMetric {
     BackfillJobsThrottledCount,
     BillingRouteMetricCandidatesTotal,
     BillingOperationUsageDuplicateRequestsTotal,
+    BillingProviderPendingReconciliationTotal,
     BillingRoutePolicyApiOperationTotal,
     BgJobsLockSkipsTotalMetric,
     BgJobsRunErrorsTotalMetric,
+    BgJobsCapacityLimitedTotal,
+    BgJobsStoreOperationsTotal,
+    BgJobsStoreOperationsReservedTotal,
     BgJobsRunsTotalMetric,
     BgWorkerItemsProcessedTotalMetric,
     BgWorkerLeaseConflictsTotalMetric,
@@ -103,7 +118,6 @@ pub enum CounterMetric {
     ManagedTenantSuspensionsTotal,
     ManagedTenantTemplateApplyTotal,
     PrefetchBatchGetTotal,
-    PrefetchFallbackGetTotal,
     PrefetchKeysTotal,
     PrefetchSkippedHotTotal,
     PrefetchUnprocessedTotal,
@@ -171,6 +185,7 @@ pub enum CounterMetric {
     VaultTokenRenewalMetricNotRenewableTotal,
     VaultTokenRenewalMetricSuccessTotal,
     VaultTokenRenewalMetricVerifyFailedTotal,
+    WebhookDeliveryOutcomeTotal,
     CacheClusterJoinTotal,
     CacheClusterLeaveTotal,
     CacheClusterReconfigureTotal,
@@ -183,6 +198,17 @@ impl CounterMetric {
     #[allow(clippy::too_many_lines)]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::BufferedMeteringEventsTotal => "buffered_metering_events_total",
+            Self::BufferedMeteringItemsTotal => "buffered_metering_items_total",
+            Self::BufferedMeteringBytesTotal => "buffered_metering_bytes_total",
+            Self::BufferedMeteringAdmissionTotal => "buffered_metering_admission_total",
+            Self::BufferedMeteringSkippedTotal => "buffered_metering_skipped_total",
+            Self::AccessProfileOperationsTotal => "access_profiles.operations_total",
+            Self::AccessProfileStorageRequestsTotal => "access_profiles.storage_requests_total",
+            Self::AccessProfileTransitionsTotal => "access_profiles.transitions_total",
+            Self::AccessProfileReplaysTotal => "access_profiles.replays_total",
+            Self::AccessProfileLimitRejectionsTotal => "access_profiles.limit_rejections_total",
+
             Self::AnalyticsCompactionObjectsReadTotalMetric => {
                 "analytics_compaction_objects_read_total"
             }
@@ -264,10 +290,16 @@ impl CounterMetric {
             Self::BillingOperationUsageDuplicateRequestsTotal => {
                 "billing_operation_usage_duplicate_requests_total"
             }
+            Self::BillingProviderPendingReconciliationTotal => {
+                "billing_provider_pending_reconciliation_total"
+            }
             Self::BillingRoutePolicyApiOperationTotal => "api_operation",
 
             Self::BgJobsLockSkipsTotalMetric => "bg.jobs.lock.skips.total",
             Self::BgJobsRunErrorsTotalMetric => "bg.jobs.run.errors.total",
+            Self::BgJobsCapacityLimitedTotal => "bg.jobs.capacity.limited.total",
+            Self::BgJobsStoreOperationsTotal => "bg.jobs.store.operations.total",
+            Self::BgJobsStoreOperationsReservedTotal => "bg.jobs.store.operations.reserved.total",
             Self::BgJobsRunsTotalMetric => "bg.jobs.runs.total",
             Self::BgWorkerItemsProcessedTotalMetric => "bg.worker.items.processed.total",
             Self::BgWorkerLeaseConflictsTotalMetric => "bg.worker.lease.conflicts.total",
@@ -354,7 +386,6 @@ impl CounterMetric {
             Self::ManagedTenantSuspensionsTotal => "managed_tenant_suspensions_total",
             Self::ManagedTenantTemplateApplyTotal => "managed_tenant_template_apply_total",
             Self::PrefetchBatchGetTotal => "prefetch.batch.get.total",
-            Self::PrefetchFallbackGetTotal => "prefetch.fallback.get.total",
             Self::PrefetchKeysTotal => "prefetch.keys.total",
             Self::PrefetchSkippedHotTotal => "prefetch.skipped.hot.total",
             Self::PrefetchUnprocessedTotal => "prefetch.unprocessed.total",
@@ -444,6 +475,7 @@ impl CounterMetric {
             Self::VaultTokenRenewalMetricVerifyFailedTotal => {
                 "vault_token_renewal_verify_failed_total"
             }
+            Self::WebhookDeliveryOutcomeTotal => "webhook_delivery_outcome_total",
             Self::CacheClusterJoinTotal => "cache.cluster.join.total",
             Self::CacheClusterLeaveTotal => "cache.cluster.leave.total",
             Self::CacheClusterReconfigureTotal => "cache.cluster.reconfigure.total",
@@ -455,6 +487,12 @@ impl CounterMetric {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GaugeMetric {
+    BufferedMeteringWriters,
+    BufferedMeteringSinkWriters,
+    BufferedMeteringObservedItems,
+    BufferedMeteringObservedBytes,
+    BufferedMeteringUnknownBuffers,
+
     AnalyticsIngestionQueueDepthMetric,
     BackfillJobsConcurrentCount,
     BgJobsRunningCountMetric,
@@ -485,6 +523,12 @@ impl GaugeMetric {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::BufferedMeteringWriters => "buffered_metering_writers",
+            Self::BufferedMeteringSinkWriters => "buffered_metering_sink_writers",
+            Self::BufferedMeteringObservedItems => "buffered_metering_observed_items",
+            Self::BufferedMeteringObservedBytes => "buffered_metering_observed_bytes",
+            Self::BufferedMeteringUnknownBuffers => "buffered_metering_unknown_buffers",
+
             Self::AnalyticsIngestionQueueDepthMetric => "analytics_ingestion_queue_depth",
             Self::BackfillJobsConcurrentCount => "backfill.jobs.concurrent.count",
             Self::BgJobsRunningCountMetric => "bg.jobs.running.count",
@@ -529,6 +573,15 @@ impl GaugeMetric {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HistogramMetric {
+    BufferedMeteringDurationSeconds,
+    BufferedMeteringBatchAgeSeconds,
+
+    BufferedMeteringAdmissionSeconds,
+    BufferedMeteringResponseReadySeconds,
+    AccessProfileOperationMs,
+    AccessProfileCandidates,
+    AccessProfileTransactionItems,
+
     AnalyticsCompactionRuntimeMsMetric,
     AnalyticsIngestionTableRuntimeMsMetric,
     AnalyticsQueryRuntimeMsMetric,
@@ -538,9 +591,11 @@ pub enum HistogramMetric {
     BackfillEnumerateLatencyMs,
     BackfillJobRuntimeMs,
     BackfillLockAcquireLatencyMs,
+    BgJobsDueDelayMs,
     BgJobsRunDurationMsMetric,
     BgWorkerRunOnceMsMetric,
     BillingOperationUsageIngestionLagMs,
+    BillingProviderPendingDurationMs,
     FoundationdbGetReadVersionLatencyMs,
     GsiUpdateRuntimeMs,
     MetricAuthnFraudResolutionMs,
@@ -565,12 +620,24 @@ pub enum HistogramMetric {
     StreamTrimRuntimeMs,
     StreamTtlCleanupRuntimeMsMetric,
     TtlSweepRuntimeMs,
+    WebhookDeliveryAttempts,
 }
 
 impl HistogramMetric {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::BufferedMeteringDurationSeconds => "buffered_metering_duration_seconds",
+            Self::BufferedMeteringBatchAgeSeconds => "buffered_metering_batch_age_seconds",
+
+            Self::BufferedMeteringAdmissionSeconds => "buffered_metering_admission_seconds",
+            Self::BufferedMeteringResponseReadySeconds => {
+                "buffered_metering_response_ready_seconds"
+            }
+            Self::AccessProfileOperationMs => "access_profiles.operation_ms",
+            Self::AccessProfileCandidates => "access_profiles.candidates",
+            Self::AccessProfileTransactionItems => "access_profiles.transaction_items",
+
             Self::AnalyticsCompactionRuntimeMsMetric => "analytics_compaction_runtime_ms",
             Self::AnalyticsIngestionTableRuntimeMsMetric => "analytics_ingestion_table_runtime_ms",
             Self::AnalyticsQueryRuntimeMsMetric => "analytics_query_runtime_ms",
@@ -580,9 +647,11 @@ impl HistogramMetric {
             Self::BackfillEnumerateLatencyMs => "backfill.enumerate.latency.ms",
             Self::BackfillJobRuntimeMs => "backfill.job.runtime.ms",
             Self::BackfillLockAcquireLatencyMs => "backfill.lock.acquire.latency.ms",
+            Self::BgJobsDueDelayMs => "bg.jobs.due.delay.ms",
             Self::BgJobsRunDurationMsMetric => "bg.jobs.run.duration.ms",
             Self::BgWorkerRunOnceMsMetric => "bg.worker.run.once.ms",
             Self::BillingOperationUsageIngestionLagMs => "billing_operation_usage_ingestion_lag_ms",
+            Self::BillingProviderPendingDurationMs => "billing_provider_pending_duration_ms",
             Self::FoundationdbGetReadVersionLatencyMs => "foundationdb.get.read.version.latency.ms",
             Self::GsiUpdateRuntimeMs => "gsi.update.runtime.ms",
             Self::MetricAuthnFraudResolutionMs => "authn.fraud_resolution_ms",
@@ -618,6 +687,7 @@ impl HistogramMetric {
             Self::StreamTrimRuntimeMs => "stream.trim.runtime.ms",
             Self::StreamTtlCleanupRuntimeMsMetric => "stream.ttl.cleanup.runtime.ms",
             Self::TtlSweepRuntimeMs => "ttl.sweep.runtime.ms",
+            Self::WebhookDeliveryAttempts => "webhook_delivery_attempts",
         }
     }
 }

@@ -25,20 +25,21 @@ fn allocation_guard_records_allocations_tests() {
     assert!(report.allocation_count >= 1);
     assert!(report.allocated_bytes >= 16);
 
-    let Some(json) = alloc_counter::report_json(&report) else {
-        panic!("allocation report should serialize to JSON");
-    };
+    let json = alloc_counter::report_json(&report).expect("allocation report should serialize");
     assert!(json.contains("\"allocation_count\""));
     assert!(json.contains("\"allocated_bytes\""));
     assert!(json.contains("\"label\":\"unit\""));
 }
 
 #[test]
-fn allocation_guard_characterizes_process_global_background_allocations() {
+fn given_background_thread_allocations_when_current_thread_is_measured_then_background_is_excluded()
+{
     use std::{
         hint::black_box,
         sync::{Arc, Barrier},
     };
+
+    const BACKGROUND_BYTES: usize = 1024 * 1024;
 
     let start_allocation = Arc::new(Barrier::new(2));
     let allocation_finished = Arc::new(Barrier::new(2));
@@ -47,7 +48,7 @@ fn allocation_guard_characterizes_process_global_background_allocations() {
         let allocation_finished = Arc::clone(&allocation_finished);
         move || {
             start_allocation.wait();
-            let mut background = Vec::with_capacity(4096);
+            let mut background = Vec::with_capacity(BACKGROUND_BYTES);
             background.push(1_u8);
             black_box(&background);
             allocation_finished.wait();
@@ -55,19 +56,46 @@ fn allocation_guard_characterizes_process_global_background_allocations() {
     });
     let guard = alloc_counter::AllocationGuard::start(
         module_path!(),
-        "allocation_guard_characterizes_process_global_background_allocations",
+        "given_background_thread_allocations_when_current_thread_is_measured_then_background_is_excluded",
         file!(),
         line!(),
-        Some("global-scope-characterization"),
+        Some("thread-scope-isolation"),
     );
+    let mut measured = Vec::with_capacity(64);
+    measured.push(1_u8);
+    black_box(&measured);
 
     start_allocation.wait();
     allocation_finished.wait();
     let report = guard.finish();
+    drop(measured);
     worker.join().expect("background allocation worker");
 
     assert!(report.allocation_count >= 1);
-    assert!(report.allocated_bytes >= 4096);
+    assert!(report.allocated_bytes >= 64);
+    assert!(report.allocated_bytes < BACKGROUND_BYTES as u64);
+}
+
+#[test]
+fn given_parallel_measurements_when_threads_allocate_then_each_report_is_isolated() {
+    use std::sync::{Arc, Barrier, atomic::AtomicUsize};
+
+    let workers_ready = Arc::new(Barrier::new(2));
+    let measurements_started = Arc::new(AtomicUsize::new(0));
+    let first = spawn_isolated_measurement(
+        64,
+        Arc::clone(&workers_ready),
+        Arc::clone(&measurements_started),
+    );
+    let second = spawn_isolated_measurement(128, workers_ready, measurements_started);
+
+    let first_report = first.join().expect("first allocation worker");
+    let second_report = second.join().expect("second allocation worker");
+
+    assert_eq!(first_report.allocation_count, 1);
+    assert_eq!(first_report.allocated_bytes, 64);
+    assert_eq!(second_report.allocation_count, 1);
+    assert_eq!(second_report.allocated_bytes, 128);
 }
 
 #[test]
@@ -126,7 +154,7 @@ fn given_report_path_when_child_helper_runs_then_emits_json_line() {
     let report = guard.finish();
     drop(payload);
 
-    alloc_counter::emit_report(&report);
+    alloc_counter::emit_report(&report).expect("allocation report should be written");
 
     let exists = std::fs::metadata(PathBuf::from(report_path)).is_ok();
     assert!(exists);
@@ -176,4 +204,31 @@ fn unique_report_path() -> PathBuf {
         "alloc-counter-report-{}-{nanos_since_epoch}.jsonl",
         std::process::id()
     ))
+}
+
+fn spawn_isolated_measurement(
+    capacity: usize,
+    workers_ready: std::sync::Arc<std::sync::Barrier>,
+    measurements_started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> std::thread::JoinHandle<alloc_counter::AllocationReport<'static>> {
+    std::thread::spawn(move || {
+        workers_ready.wait();
+        let guard = alloc_counter::AllocationGuard::start(
+            module_path!(),
+            "given_parallel_measurements_when_threads_allocate_then_each_report_is_isolated",
+            file!(),
+            line!(),
+            Some("parallel-thread-isolation"),
+        );
+        measurements_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        while measurements_started.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            std::hint::spin_loop();
+        }
+        let mut measured = Vec::with_capacity(capacity);
+        measured.push(1_u8);
+        std::hint::black_box(&measured);
+        let report = guard.finish();
+        drop(measured);
+        report
+    })
 }

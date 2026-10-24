@@ -1,9 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["crates/quickjs"]
 
 [workspace.package]
-rust-version = "1.96.0"
+rust-version = "1.99.1"
 edition = "2024"
 repository = "https://github.com/u19r/aux-common"
 readme = "README.md"
@@ -19,51 +20,73 @@ authz-cedar = { path = "crates/authz-cedar" }
 authz-runtime = { path = "crates/authz-runtime" }
 authz-types = { path = "crates/authz-types" }
 aws-credentials = { path = "crates/aws-credentials" }
-aws-lc-rs = "1.18.0"
-crypto-hash = { path = "crates/crypto-hash" }
+aws-lc-rs = "1.18.2"
+aws-sigv4-signing = { path = "crates/aws-sigv4-signing" }
+bg-jobs = { path = "crates/bg-jobs", version = "0.2.0" }
+bg-jobs-aws = { path = "crates/bg-jobs-aws" }
+bg-jobs-conformance = { path = "crates/bg-jobs-conformance" }
+bg-jobs-http = { path = "crates/bg-jobs-http" }
+bg-jobs-tokio = { path = "crates/bg-jobs-tokio", version = "0.2.0" }
+buffered-writes = { path = "crates/buffered-writes" }
+crypto-hash = { package = "aux-crypto-hash", path = "crates/crypto-hash" }
 curve25519-dalek = { version = "5.0.0", default-features = false }
 http-request = { path = "crates/http-request" }
+javascript = { path = "crates/javascript" }
 jose-core = { path = "crates/jose-core" }
-jsonwebtoken = { version = "11.0.0", default-features = false }
+jsonwebtoken = { version = "11.1.0", default-features = false }
 lru-ttl-cache = { path = "crates/lru-ttl-cache" }
 metrics-facade = { path = "crates/metrics-facade", default-features = false }
+oauth-dpop = { path = "crates/oauth-dpop" }
 opt-loop-probe = { path = "crates/opt-loop-probe" }
 saml2 = { path = "crates/saml2" }
-telemetry = { path = "crates/telemetry" }
+telemetry = { package = "aux-telemetry", path = "crates/telemetry" }
 webauthn-core = { path = "crates/webauthn-core" }
 xml-security = { path = "crates/xml-security" }
 
-argon2 = { version = "0.6.0-rc.8", default-features = false, features = ["alloc", "getrandom", "password-hash"] }
-aws-credential-types = "1.3.0"
-aws-sigv4 = "1.5.1"
-aws-smithy-runtime-api = "1.14.0"
-aws-smithy-types = "1.6.2"
+argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "getrandom", "password-hash"] }
+aws-credential-types = "1.3.1"
+aws-sigv4 = "1.6.3"
+aws-smithy-runtime-api = "1.19.1"
 axum = "0.8.9"
 axum-prometheus = "0.10.1"
 base64 = "0.23.1"
 bytes = "1.12.1"
-cedar-policy = "=4.12.0"
+cedar-policy = "=4.14.0"
 chrono = { version = "0.4.45", features = ["clock", "serde"] }
 ciborium = "0.2.2"
+cpu-time = "1.0.0"
+cron = "0.17.0"
+cucumber = "0.23.0"
 data-encoding = "2.11.1"
-flate2 = "1.1.9"
+ed25519-dalek = { version = "3.0.0", default-features = false }
+flate2 = "1.1.10"
+futures-timer = "3.0.4"
 futures-util = "0.3.34"
 getrandom = "0.4.3"
 getrandom-02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
+hashlink = "0.12.2"
 hmac = "0.13.0"
 http = "1.5.0"
 httpdate = "1.0.3"
-ipnet = "2.12.1"
+ipnet = "2.12.2"
 metrics = "0.24.6"
 mimalloc = "0.1.52"
 p256 = { version = "0.14.0", default-features = false, features = ["arithmetic"] }
 p384 = { version = "0.14.0", features = ["ecdsa"] }
 password-hash = { version = "0.6.1", features = ["rand_core"] }
 pem = "4.0.0"
+proc-macro2 = "1.0.107"
+proptest = { version = "1.12.0", default-features = false, features = ["std", "fork", "timeout"] }
+purecrypto = { version = "0.10.3", default-features = false, features = ["alloc", "rsa"] }
+quint-connect = "=0.1.2"
+quint-connect-guard = { path = "crates/quint-connect-guard" }
+quint-http-connector = { path = "crates/quint-http-connector" }
+quint-rendered-parser = { path = "crates/quint-rendered-parser" }
 quote = "1.0.47"
-rand = "0.10.2"
+rand = "0.10.3"
+redis = { version = "1.8.0", default-features = false, features = ["tokio-rustls-comp", "tls-rustls-webpki-roots", "connection-manager", "script"] }
 regex = "1.13.1"
-reqwest = { version = "0.13.4", default-features = false, features = [
+reqwest = { version = "0.13.5", default-features = false, features = [
     "blocking",
     "form",
     "json",
@@ -72,18 +95,19 @@ reqwest = { version = "0.13.4", default-features = false, features = [
     "rustls",
     "stream",
 ] }
-schemars = "1.2.2"
+rustix = { version = "1.1.5", features = ["time"] }
+schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-sha2 = "0.11.0"
+serde_json = "1.0.154"
+sha2 = "0.11.1"
 sha3 = "0.12.0"
 signature = "3.0.0"
 subtle = "2.6.1"
-syn = { version = "3.0.3", features = ["full"] }
-thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["full", "tracing"] }
+syn = { version = "3.0.9", features = ["full"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["full", "tracing"] }
 tower = "0.5.3"
-tower-http = { version = "0.7.0", features = ["trace"] }
+tower-http = { version = "0.7.1", features = ["trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = [
     "env-filter",
@@ -92,10 +116,16 @@ tracing-subscriber = { version = "0.3.23", features = [
 ] }
 typed-builder = "0.23.2"
 url = "2.5.8"
-utoipa = { version = "5.5.0", features = ["chrono", "uuid"] }
-uuid = "1.24.1"
+utoipa = { version = "6.0.0", features = ["chrono", "uuid"] }
+uuid = "1.29.0"
 x509-parser = "0.18.1"
 xml = "1.4.0"
+zeroize = "1.9.1"
+
+# Match Wasmtime's binary-format generation to avoid duplicate parser/encoder stacks.
+wasmparser = "=0.261.0"
+wasmtime = { version = "=50.0.0", default-features = false, features = ["runtime", "std"] }
+wat = "=1.261.0"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

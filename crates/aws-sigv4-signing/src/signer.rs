@@ -1,21 +1,16 @@
 use std::time::{Duration, SystemTime};
 
-use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
-use aws_credentials::{CredentialSource, DefaultChainCredentialsProvider, static_credentials};
-use aws_sigv4::{
-    http_request::{
-        PayloadChecksumKind, SignableRequest, SignatureLocation, SigningParams, SigningSettings,
-        sign,
-    },
-    sign::v4,
+use aws_credentials::{
+    CredentialSource, DefaultChainCredentialsProvider, ProvideCredentials,
+    SharedCredentialsProvider, static_credentials,
 };
-use aws_smithy_runtime_api::client::identity::Identity;
-use http::{HeaderMap, HeaderName, HeaderValue, Uri, header::AUTHORIZATION};
-use url::Url;
+use http::{HeaderMap, Uri};
 
-use crate::{SignableBody, SigningError};
-
-const MAX_PRESIGN_EXPIRY: Duration = Duration::from_hours(168);
+use crate::{
+    SignableBody, SigningError,
+    constants::MAX_PRESIGN_EXPIRY,
+    signing::{SigningContext, SigningRequest},
+};
 
 #[derive(Debug, Clone)]
 pub struct AwsRequestSigner {
@@ -40,11 +35,25 @@ impl AwsRequestSigner {
             }
         };
 
-        Ok(Self {
+        Ok(Self::new_with_provider(region, provider, service_name))
+    }
+
+    /// Creates a signer backed by the supplied credentials provider.
+    ///
+    /// The provider is the sole credential source for this signer. This is
+    /// useful when the caller owns credential loading, and it avoids silently
+    /// consulting an ambient default chain.
+    #[must_use]
+    pub fn new_with_provider(
+        region: &str,
+        credentials: SharedCredentialsProvider,
+        service_name: &str,
+    ) -> Self {
+        Self {
             region: region.to_owned(),
-            credentials: provider,
+            credentials,
             service_name: service_name.to_string(),
-        })
+        }
     }
 
     pub async fn sign(
@@ -77,71 +86,15 @@ impl AwsRequestSigner {
         signing_time: SystemTime,
     ) -> Result<HeaderMap, SigningError> {
         require_https(uri)?;
-        let credentials = self
-            .credentials
-            .provide_credentials()
-            .await
-            .map_err(SigningError::from)?;
-
-        let mut headers = base_headers.clone();
-        if !headers.contains_key(http::header::HOST)
-            && let Some(authority) = uri.authority()
-        {
-            let host_value = HeaderValue::from_str(authority.as_str())
-                .map_err(|_| SigningError::InvalidHeaderValue)?;
-            headers.insert(http::header::HOST, host_value);
-        }
-
-        let mut header_pairs = Vec::with_capacity(headers.len());
-        for (name, value) in &headers {
-            let value_str = value
-                .to_str()
-                .map_err(|_| SigningError::InvalidHeaderValue)?;
-            header_pairs.push((name.as_str().to_owned(), value_str.to_owned()));
-        }
-
-        let signable = SignableRequest::new(
+        let credentials = self.credentials.provide_credentials().await?;
+        let context =
+            SigningContext::try_new(&self.region, &self.service_name, credentials, signing_time)?;
+        context.sign_headers(&SigningRequest {
             method,
-            uri.to_string(),
-            header_pairs
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_str())),
+            uri,
+            headers: base_headers,
             body,
-        )
-        .map_err(|_| SigningError::PrepareRequest)?;
-
-        let mut settings = SigningSettings::default();
-        settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
-
-        let identity = Identity::new(credentials.clone(), credentials.expiry());
-        let signing_params: SigningParams = v4::SigningParams::builder()
-            .identity(&identity)
-            .region(&self.region)
-            .name(&self.service_name)
-            .time(signing_time)
-            .settings(settings)
-            .build()
-            .map_err(|_| SigningError::Signing)?
-            .into();
-
-        let (instructions, _) = sign(signable, &signing_params)
-            .map_err(|_| SigningError::Signing)?
-            .into_parts();
-
-        for (name, value) in instructions.headers() {
-            let header_name = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| SigningError::InvalidHeaderName)?;
-            let header_value =
-                HeaderValue::from_str(value).map_err(|_| SigningError::InvalidHeaderValue)?;
-            headers.insert(header_name, header_value);
-        }
-        for sensitive_name in [AUTHORIZATION.as_str(), "x-amz-security-token"] {
-            if let Some(value) = headers.get_mut(sensitive_name) {
-                value.set_sensitive(true);
-            }
-        }
-
-        Ok(headers)
+        })
     }
 
     pub async fn presign_request(
@@ -174,70 +127,18 @@ impl AwsRequestSigner {
     ) -> Result<Uri, SigningError> {
         require_https(uri)?;
         validate_presign_expiry(expires_in)?;
-        let credentials = self
-            .credentials
-            .provide_credentials()
-            .await
-            .map_err(SigningError::from)?;
-
-        let mut headers = base_headers.clone();
-        if !headers.contains_key(http::header::HOST)
-            && let Some(authority) = uri.authority()
-        {
-            let host_value = HeaderValue::from_str(authority.as_str())
-                .map_err(|_| SigningError::InvalidHeaderValue)?;
-            headers.insert(http::header::HOST, host_value);
-        }
-
-        let mut header_pairs = Vec::with_capacity(headers.len());
-        for (name, value) in &headers {
-            let value_str = value
-                .to_str()
-                .map_err(|_| SigningError::InvalidHeaderValue)?;
-            header_pairs.push((name.as_str().to_owned(), value_str.to_owned()));
-        }
-
-        let signable = SignableRequest::new(
-            method,
-            uri.to_string(),
-            header_pairs
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_str())),
-            body,
+        let credentials = self.credentials.provide_credentials().await?;
+        let context =
+            SigningContext::try_new(&self.region, &self.service_name, credentials, signing_time)?;
+        context.presign(
+            &SigningRequest {
+                method,
+                uri,
+                headers: base_headers,
+                body,
+            },
+            expires_in,
         )
-        .map_err(|_| SigningError::PrepareRequest)?;
-
-        let mut settings = SigningSettings::default();
-        settings.payload_checksum_kind = PayloadChecksumKind::NoHeader;
-        settings.signature_location = SignatureLocation::QueryParams;
-        settings.expires_in = Some(expires_in);
-
-        let identity = Identity::new(credentials.clone(), credentials.expiry());
-        let signing_params: SigningParams = v4::SigningParams::builder()
-            .identity(&identity)
-            .region(&self.region)
-            .name(&self.service_name)
-            .time(signing_time)
-            .settings(settings)
-            .build()
-            .map_err(|_| SigningError::Signing)?
-            .into();
-
-        let (instructions, _) = sign(signable, &signing_params)
-            .map_err(|_| SigningError::Signing)?
-            .into_parts();
-
-        let mut url = Url::parse(&uri.to_string()).map_err(|_| SigningError::InvalidUrl)?;
-        if !instructions.params().is_empty() {
-            let mut pairs = url.query_pairs_mut();
-            for (name, value) in instructions.params() {
-                pairs.append_pair(name, value.as_ref());
-            }
-        }
-
-        url.as_str()
-            .parse::<Uri>()
-            .map_err(|_| SigningError::InvalidUri)
     }
 }
 
@@ -250,7 +151,7 @@ fn require_https(uri: &Uri) -> Result<(), SigningError> {
 }
 
 fn validate_presign_expiry(expires_in: Duration) -> Result<(), SigningError> {
-    if expires_in.is_zero() || expires_in > MAX_PRESIGN_EXPIRY {
+    if expires_in.as_secs() == 0 || expires_in > MAX_PRESIGN_EXPIRY {
         return Err(SigningError::InvalidPresignExpiry);
     }
     Ok(())

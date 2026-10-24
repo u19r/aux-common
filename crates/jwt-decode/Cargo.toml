@@ -1,4 +1,5 @@
 [package]
+rust-version.workspace = true
 publish = false
 name = "jwt-decode"
 version = "0.1.0"
@@ -9,6 +10,7 @@ description = "Reusable signed JWT verification utilities"
 [dependencies]
 base64 = { workspace = true }
 curve25519-dalek = { workspace = true }
+oauth-dpop = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -19,15 +21,23 @@ jsonwebtoken = { workspace = true, default-features = false, features = ["aws_lc
 lru-ttl-cache = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+ed25519-dalek = { workspace = true }
 getrandom = { workspace = true, features = ["wasm_js"] }
-# jsonwebtoken 11 declares getrandom 0.2 for wasm without enabling its js backend.
 getrandom-02 = { workspace = true }
-jsonwebtoken = { workspace = true, default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { workspace = true, default-features = false }
+p256 = { workspace = true, features = ["ecdsa"] }
+p384 = { workspace = true }
+purecrypto = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 alloc-counter = { workspace = true }
+ed25519-dalek = { workspace = true }
 jsonwebtoken = { workspace = true, default-features = false, features = ["aws_lc_rs", "use_pem"] }
 opt-loop-probe = { workspace = true }
+p256 = { workspace = true, features = ["ecdsa"] }
+p384 = { workspace = true }
+proptest = { workspace = true }
+purecrypto = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

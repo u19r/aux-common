@@ -8,6 +8,10 @@ use std::{
 use http::{HeaderMap, HeaderValue};
 use reqwest::{Method, Request, StatusCode, Url};
 use serde_json::json;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 
 use crate::{
     HttpClientBuilder, HttpRequestError, HttpRequestErrorKind, HttpResponse, RetryConfig,
@@ -137,11 +141,33 @@ fn request_attempt_diagnostics_do_not_log_sensitive_path_or_query() {
         .expect("request URL");
     let diagnostics = crate::client::request_attempt_diagnostics(&url);
     let output = format!("{diagnostics:?}");
-    assert!(output.contains("host: \"example.test\""));
+    assert!(output.contains("host_present: true"));
+    assert!(!output.contains("example.test"));
     assert!(output.contains("path_length: 21"));
     assert!(output.contains("query_present: true"));
     assert!(!output.contains("secret-token"));
     assert!(!output.contains("access_token=sentinel"));
+}
+
+#[test]
+fn method_telemetry_label_is_bounded_and_normalized() {
+    for (method, expected) in [
+        (Method::GET, "GET"),
+        (Method::POST, "POST"),
+        (Method::PUT, "PUT"),
+        (Method::PATCH, "PATCH"),
+        (Method::DELETE, "DELETE"),
+        (Method::HEAD, "HEAD"),
+        (Method::OPTIONS, "OPTIONS"),
+        (Method::TRACE, "TRACE"),
+        (Method::CONNECT, "CONNECT"),
+        (
+            Method::from_bytes(b"x-private-method").expect("method"),
+            "OTHER",
+        ),
+    ] {
+        assert_eq!(crate::method_telemetry_label(&method), expected);
+    }
 }
 
 #[tokio::test]
@@ -337,9 +363,41 @@ async fn mock_response_text_respects_max_body_size_limit() {
     .expect_err("response larger than limit should fail");
 
     assert!(matches!(
-        error,
+        &error,
         HttpRequestError::ResponseTooLarge { size: 9, max: 3 }
     ));
+    assert_eq!(error.kind(), HttpRequestErrorKind::ResponseTooLarge);
+}
+
+#[tokio::test]
+async fn truncated_response_stream_is_distinct_from_response_size_error() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test server");
+    let address = listener.local_addr().expect("test server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept test request");
+        let mut request = [0; 1024];
+        let _ = stream.read(&mut request).await.expect("read test request");
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nab")
+            .await
+            .expect("write truncated response");
+    });
+
+    let client = HttpClientBuilder::new().build().expect("build http client");
+    let error = client
+        .get(format!("http://{address}/stream"))
+        .send()
+        .await
+        .expect("receive response")
+        .bytes()
+        .await
+        .expect_err("truncated response must fail");
+
+    server.await.expect("test server");
+    assert!(matches!(error, HttpRequestError::ResponseBody));
+    assert_eq!(error.kind(), HttpRequestErrorKind::ResponseBody);
 }
 
 #[tokio::test]
@@ -961,10 +1019,19 @@ fn http_error_debug_redacts_retained_response_body() {
 
 #[test]
 fn custom_transport_does_not_claim_redirects_are_disabled() {
+    let transport = SequenceTransport::from_responses(Vec::new());
     let client = HttpClientBuilder::new()
-        .with_transport(SequenceTransport::from_responses(Vec::new()))
+        .with_transport(transport)
         .build()
         .expect("build client");
 
     assert!(!client.redirects_disabled());
+}
+
+#[test]
+fn custom_transport_defaults_to_untrusted_policy_capabilities() {
+    let transport = SequenceTransport::from_responses(Vec::new());
+    assert!(!transport.redirects_disabled());
+    assert!(!transport.destination_policy_enforced());
+    assert!(!transport.deadline_enforced());
 }

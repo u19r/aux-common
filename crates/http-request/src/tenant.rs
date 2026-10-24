@@ -1,5 +1,4 @@
 use std::{
-    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{Arc, OnceLock},
     time::Duration,
@@ -14,26 +13,38 @@ use reqwest::{
 use tokio::net::lookup_host;
 
 use crate::{
-    client::{HttpClient, HttpResponse},
+    client::HttpClient,
     constants::{
         DEFAULT_ALLOWED_PORTS, DEFAULT_ALLOWED_SCHEMES, DEFAULT_HTTPS_PORT,
         DEFAULT_MAX_CONTENT_LENGTH_BYTES, DEFAULT_MAX_DNS_ADDRESSES, DEFAULT_MAX_REDIRECTS,
         DEFAULT_MAX_RESPONSE_LENGTH_BYTES, DEFAULT_TENANT_CONNECT_TIMEOUT,
         DEFAULT_TENANT_REQUEST_TIMEOUT, REDIRECT_BLOCKED_HOST_MISMATCH,
         REDIRECT_BLOCKED_METHOD_CHANGE, REDIRECT_BLOCKED_SCHEME_CHANGE, REDIRECT_BLOCKED_TOO_MANY,
-        SSRF_BLOCKED_DNS_EMPTY, SSRF_BLOCKED_DNS_FAILURE, SSRF_BLOCKED_DNS_TIMEOUT,
-        SSRF_BLOCKED_DOMAIN_NOT_ALLOWLISTED, SSRF_BLOCKED_FRAGMENT, SSRF_BLOCKED_HOST_HEADER,
-        SSRF_BLOCKED_IP_LITERAL, SSRF_BLOCKED_MISSING_HOST, SSRF_BLOCKED_PORT,
-        SSRF_BLOCKED_RESERVED_IP, SSRF_BLOCKED_SCHEME, SSRF_BLOCKED_USERINFO,
+        RESERVED_IP_RANGES, SSRF_BLOCKED_DNS_EMPTY, SSRF_BLOCKED_DNS_FAILURE,
+        SSRF_BLOCKED_DNS_TIMEOUT, SSRF_BLOCKED_DOMAIN_NOT_ALLOWLISTED, SSRF_BLOCKED_FRAGMENT,
+        SSRF_BLOCKED_HOST_HEADER, SSRF_BLOCKED_IP_LITERAL, SSRF_BLOCKED_MISSING_HOST,
+        SSRF_BLOCKED_PORT, SSRF_BLOCKED_RESERVED_IP, SSRF_BLOCKED_SCHEME, SSRF_BLOCKED_USERINFO,
     },
     error::{HttpRequestError, Result},
+    observer::HttpRequestObserver,
+    response::HttpResponse,
     retry::RetryConfig,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AllowedDomain {
     pub host: String,
     pub allow_subdomains: bool,
+}
+
+impl std::fmt::Debug for AllowedDomain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AllowedDomain")
+            .field("host_present", &true)
+            .field("allow_subdomains", &self.allow_subdomains)
+            .finish()
+    }
 }
 
 impl AllowedDomain {
@@ -97,13 +108,17 @@ pub struct TenantHttpClient {
     tenant_id: String,
     config: TenantHttpRequestConfig,
     http: HttpClient,
-    ssrf: SsrfProtector,
+    ssrf: Arc<SsrfProtector>,
 }
 
 pub struct TenantHttpClientBuilder {
     tenant_id: String,
     config: TenantHttpRequestConfig,
     retry: RetryConfig,
+    resolver: Arc<dyn Resolve>,
+    observer: Option<Arc<dyn HttpRequestObserver>>,
+    #[cfg(any(test, feature = "test-support"))]
+    test_certificates: Vec<reqwest::Certificate>,
 }
 
 impl TenantHttpClientBuilder {
@@ -112,6 +127,10 @@ impl TenantHttpClientBuilder {
             tenant_id: tenant_id.into(),
             config: TenantHttpRequestConfig::default(),
             retry: RetryConfig::default(),
+            resolver: Arc::new(TokioDnsResolver),
+            observer: None,
+            #[cfg(any(test, feature = "test-support"))]
+            test_certificates: Vec::new(),
         }
     }
 
@@ -187,6 +206,37 @@ impl TenantHttpClientBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_observer<O>(mut self, observer: O) -> Self
+    where O: HttpRequestObserver {
+        self.observer = Some(Arc::new(observer));
+        self
+    }
+
+    #[must_use]
+    pub fn with_shared_observer(mut self, observer: Arc<dyn HttpRequestObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Supply deterministic test DNS while retaining destination and address
+    /// validation.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn test_dns_resolver(mut self, resolver: Arc<dyn Resolve>) -> Self {
+        self.resolver = resolver;
+        self
+    }
+
+    /// Trust a fixture CA without disabling certificate or hostname
+    /// verification.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn test_root_certificate(mut self, certificate: reqwest::Certificate) -> Self {
+        self.test_certificates.push(certificate);
+        self
+    }
+
     pub fn build(self) -> Result<TenantHttpClient> {
         if self.config.allowed_domains.is_empty() {
             return Err(HttpRequestError::SsrfBlocked {
@@ -201,16 +251,24 @@ impl TenantHttpClientBuilder {
             allow_loopback_ips: self.config.allow_loopback_ips,
             dns_timeout: self.config.timeout,
         };
+        let ssrf = Arc::new(SsrfProtector::with_resolver(ssrf_config, self.resolver));
         let client = reqwest::Client::builder()
             .timeout(self.config.timeout)
             .connect_timeout(self.config.connect_timeout)
+            // Keep proxy resolution outside the tenant SSRF trust boundary.
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .dns_resolver(SsrfDnsResolver::new(ssrf_config.clone()))
-            .build()
-            .map_err(|_| HttpRequestError::Build)?;
+            .dns_resolver(Arc::clone(&ssrf));
+        #[cfg(any(test, feature = "test-support"))]
+        let client = self
+            .test_certificates
+            .into_iter()
+            .fold(client, |builder, certificate| {
+                builder.add_root_certificate(certificate)
+            });
+        let client = client.build().map_err(|_| HttpRequestError::Build)?;
 
-        let http = HttpClient::with_client(client, self.retry);
-        let ssrf = SsrfProtector::new(ssrf_config);
+        let http = HttpClient::with_client_and_observer(client, self.retry, self.observer);
 
         Ok(TenantHttpClient {
             tenant_id: self.tenant_id,
@@ -461,35 +519,6 @@ pub(crate) struct SsrfProtectionConfig {
     pub(crate) dns_timeout: Duration,
 }
 
-#[derive(Clone)]
-pub(crate) struct SsrfDnsResolver {
-    config: SsrfProtectionConfig,
-    resolver: Arc<dyn Resolve>,
-}
-
-impl SsrfDnsResolver {
-    fn new(config: SsrfProtectionConfig) -> Self {
-        Self::with_resolver(config, Arc::new(TokioDnsResolver))
-    }
-
-    pub(crate) fn with_resolver(config: SsrfProtectionConfig, resolver: Arc<dyn Resolve>) -> Self {
-        Self { config, resolver }
-    }
-}
-
-impl Resolve for SsrfDnsResolver {
-    fn resolve(&self, name: Name) -> Resolving {
-        let resolving = self.resolver.resolve(name);
-        let max_dns_addresses = self.config.max_dns_addresses;
-        let allow_loopback_ips = self.config.allow_loopback_ips;
-        Box::pin(async move {
-            let mut addrs = resolving.await?.take(max_dns_addresses).collect::<Vec<_>>();
-            validate_resolved_addresses(&mut addrs, allow_loopback_ips)?;
-            Ok(Box::new(addrs.into_iter()) as Addrs)
-        })
-    }
-}
-
 #[derive(Clone, Copy)]
 struct TokioDnsResolver;
 
@@ -497,8 +526,10 @@ impl Resolve for TokioDnsResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_owned();
         Box::pin(async move {
-            let addrs = lookup_host(format!("{host}:0")).await?.collect::<Vec<_>>();
-            Ok(Box::new(addrs.into_iter()) as Addrs)
+            // Keep Tokio's DNS iterator lazy so callers apply their address
+            // cap before materializing a result vector.
+            let addrs = lookup_host((host, 0)).await?;
+            Ok(Box::new(addrs) as Addrs)
         })
     }
 }
@@ -506,11 +537,29 @@ impl Resolve for TokioDnsResolver {
 #[derive(Clone)]
 pub(crate) struct SsrfProtector {
     config: SsrfProtectionConfig,
+    resolver: Arc<dyn Resolve>,
 }
 
 impl SsrfProtector {
+    #[cfg(test)]
     pub(crate) fn new(config: SsrfProtectionConfig) -> Self {
-        Self { config }
+        Self::with_resolver(config, Arc::new(TokioDnsResolver))
+    }
+
+    pub(crate) fn with_resolver(config: SsrfProtectionConfig, resolver: Arc<dyn Resolve>) -> Self {
+        Self { config, resolver }
+    }
+
+    fn resolve_capped(&self, name: Name) -> Resolving {
+        let resolving = self.resolver.resolve(name);
+        let max_dns_addresses = self.config.max_dns_addresses;
+        let allow_loopback_ips = self.config.allow_loopback_ips;
+        Box::pin(async move {
+            let mut addrs = resolving.await?.take(max_dns_addresses).collect::<Vec<_>>();
+            validate_resolved_addresses(&mut addrs, allow_loopback_ips)
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
     }
 
     fn validate_url_syntax(&self, url: &Url) -> Result<()> {
@@ -552,7 +601,6 @@ impl SsrfProtector {
         let host = url.host_str().ok_or(HttpRequestError::SsrfBlocked {
             reason: SSRF_BLOCKED_MISSING_HOST,
         })?;
-        let port = url.port_or_known_default().unwrap_or(DEFAULT_HTTPS_PORT);
 
         // Tokio's zero-duration timeout is allowed to poll an immediately
         // ready future once before observing the deadline.  Treat a zero DNS
@@ -564,39 +612,62 @@ impl SsrfProtector {
             });
         }
 
-        let mut addrs = tokio::time::timeout(self.config.dns_timeout, lookup_host((host, port)))
+        let name = host
+            .parse::<Name>()
+            .map_err(|_| HttpRequestError::SsrfBlocked {
+                reason: SSRF_BLOCKED_DNS_FAILURE,
+            })?;
+        // `resolve_capped` materializes only the bounded, validated result;
+        // preflight only needs to consume that proof, not copy it again.
+        let _ = tokio::time::timeout(self.config.dns_timeout, self.resolve_capped(name))
             .await
             .map_err(|_| HttpRequestError::SsrfBlocked {
                 reason: SSRF_BLOCKED_DNS_TIMEOUT,
             })?
-            .map_err(|_| HttpRequestError::SsrfBlocked {
-                reason: SSRF_BLOCKED_DNS_FAILURE,
-            })?
-            .take(self.config.max_dns_addresses)
-            .collect::<Vec<_>>();
-
-        if addrs.is_empty() {
-            return Err(HttpRequestError::SsrfBlocked {
-                reason: SSRF_BLOCKED_DNS_EMPTY,
-            });
-        }
-
-        validate_resolved_addresses(&mut addrs, self.config.allow_loopback_ips).map_err(|_| {
-            HttpRequestError::SsrfBlocked {
-                reason: SSRF_BLOCKED_RESERVED_IP,
-            }
-        })?;
-
+            .map_err(|error| HttpRequestError::SsrfBlocked {
+                reason: error
+                    .downcast_ref::<SsrfResolutionError>()
+                    .map_or(SSRF_BLOCKED_DNS_FAILURE, |error| error.reason()),
+            })?;
         Ok(())
     }
 }
 
+impl Resolve for SsrfProtector {
+    fn resolve(&self, name: Name) -> Resolving {
+        self.resolve_capped(name)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SsrfResolutionError {
+    Empty,
+    Reserved,
+}
+
+impl SsrfResolutionError {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Empty => SSRF_BLOCKED_DNS_EMPTY,
+            Self::Reserved => SSRF_BLOCKED_RESERVED_IP,
+        }
+    }
+}
+
+impl std::fmt::Display for SsrfResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.reason())
+    }
+}
+
+impl std::error::Error for SsrfResolutionError {}
+
 fn validate_resolved_addresses(
     addrs: &mut Vec<SocketAddr>,
     allow_loopback_ips: bool,
-) -> io::Result<()> {
+) -> std::result::Result<(), SsrfResolutionError> {
     if addrs.is_empty() {
-        return Err(io::Error::other(SSRF_BLOCKED_DNS_EMPTY));
+        return Err(SsrfResolutionError::Empty);
     }
 
     addrs.sort_by_key(SocketAddr::ip);
@@ -605,7 +676,7 @@ fn validate_resolved_addresses(
         .iter()
         .any(|addr| is_blocked_ip(addr.ip(), allow_loopback_ips))
     {
-        return Err(io::Error::other(SSRF_BLOCKED_RESERVED_IP));
+        return Err(SsrfResolutionError::Reserved);
     }
     Ok(())
 }
@@ -638,18 +709,29 @@ pub(crate) fn request_body_len(request: &Request) -> Option<usize> {
 }
 
 pub(crate) fn is_blocked_ip(ip: IpAddr, allow_loopback_ips: bool) -> bool {
+    if allow_loopback_ips && ip.is_loopback() {
+        return false;
+    }
     if let IpAddr::V6(ipv6) = ip {
-        if let Some(ipv4) = ipv6.to_ipv4_mapped() {
+        // Normalize IPv4-compatible and mapped forms before applying the
+        // shared IPv4 reserved-range policy.
+        if let Some(ipv4) = ipv6.to_ipv4().or_else(|| isatap_ipv4(ipv6)) {
             return is_blocked_ip(IpAddr::V4(ipv4), allow_loopback_ips);
         }
         if let Some(ipv4) = well_known_nat64_ipv4(ipv6) {
             return is_blocked_ip(IpAddr::V4(ipv4), allow_loopback_ips);
         }
     }
-    if allow_loopback_ips && ip.is_loopback() {
-        return false;
-    }
     reserved_ip_ranges().iter().any(|range| range.contains(&ip))
+}
+
+fn isatap_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    // ISATAP uses a modified EUI-64 identifier: 00-00-5e-fe followed by IPv4.
+    let segments = ip.segments();
+    (segments[5] == 0x5efe && (segments[4] & 0xfcff) == 0).then(|| {
+        let octets = ip.octets();
+        Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15])
+    })
 }
 
 fn well_known_nat64_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
@@ -710,33 +792,3 @@ fn reserved_ip_ranges() -> &'static [IpNet] {
             .collect()
     })
 }
-
-const RESERVED_IP_RANGES: &[&str] = &[
-    "0.0.0.0/8",
-    "10.0.0.0/8",
-    "100.64.0.0/10",
-    "127.0.0.0/8",
-    "169.254.0.0/16",
-    "172.16.0.0/12",
-    "192.0.0.0/24",
-    "192.0.2.0/24",
-    "192.168.0.0/16",
-    "198.18.0.0/15",
-    "198.51.100.0/24",
-    "203.0.113.0/24",
-    "224.0.0.0/4",
-    "240.0.0.0/4",
-    "255.255.255.255/32",
-    "::/128",
-    "::1/128",
-    "100::/64",
-    "2001:db8::/32",
-    // 6to4 and Teredo tunnel IPv4 addresses through globally routable IPv6.
-    // Treat their embedded private/reserved destinations as untrusted rather
-    // than relying on the platform's tunnel configuration.
-    "2001::/32",
-    "2002::/16",
-    "fc00::/7",
-    "fe80::/10",
-    "ff00::/8",
-];

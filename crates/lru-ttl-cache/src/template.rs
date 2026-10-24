@@ -1,6 +1,6 @@
 use std::{fmt, hash::Hash, time::Duration};
 
-use crate::{CacheConfig, FetchFn, FetchingLruTtlCache};
+use crate::{CacheConfig, FetchFn, FetchingLruTtlCache, LoadUnavailable};
 
 #[derive(Clone)]
 pub struct CacheTemplate {
@@ -25,18 +25,22 @@ impl CacheTemplate {
         self
     }
 
-    pub fn fetching<K, V, E>(&self, fetch: FetchFn<K, V, E>) -> FetchingLruTtlCache<K, V, E>
+    pub fn fetching<K, V, E>(
+        &self,
+        fetch: FetchFn<K, V, E>,
+        key_bytes: fn(&K) -> usize,
+    ) -> FetchingLruTtlCache<K, V, E>
     where
         K: Eq + Hash + Clone + Send + Sync + 'static,
         V: Clone + Send + Sync + 'static,
-        E: Send + 'static,
+        E: Clone + From<LoadUnavailable> + Send + Sync + 'static,
     {
         let mut config = CacheConfig::new()
             .with_capacity(self.capacity)
             .with_ttl(self.ttl)
             .with_fetch(fetch);
         if let Some(refresh_ttl) = self.refresh_ttl {
-            config = config.with_refresh_ttl(refresh_ttl);
+            config = config.with_refresh_ttl(refresh_ttl, key_bytes);
         }
         FetchingLruTtlCache::new(config)
     }

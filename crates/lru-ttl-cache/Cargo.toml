@@ -1,4 +1,5 @@
 [package]
+rust-version.workspace = true
 publish = false
 name = "lru-ttl-cache"
 version = "0.1.0"
@@ -7,8 +8,13 @@ license.workspace = true
 description = "Thread-safe LRU cache with ttl enforcement and async refresh support"
 
 [dependencies]
+futures-util = { workspace = true }
+hashlink = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

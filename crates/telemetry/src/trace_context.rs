@@ -96,6 +96,8 @@ impl fmt::Display for SpanId {
 pub struct TraceFlags(u8);
 
 impl TraceFlags {
+    const SUPPORTED_MASK: u8 = 0x01;
+
     pub const DEFAULT: Self = Self(0);
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -103,7 +105,9 @@ impl TraceFlags {
         if trimmed.len() != 2 || !trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return None;
         }
-        u8::from_str_radix(trimmed, 16).ok().map(Self)
+        u8::from_str_radix(trimmed, 16)
+            .ok()
+            .map(|value| Self(value & Self::SUPPORTED_MASK))
     }
 
     fn parse_exact_bytes(value: &[u8]) -> Option<Self> {
@@ -111,7 +115,8 @@ impl TraceFlags {
             return None;
         }
         Some(Self(
-            (decode_hex_nibble(value[0])? << 4) | decode_hex_nibble(value[1])?,
+            ((decode_hex_nibble(value[0])? << 4) | decode_hex_nibble(value[1])?)
+                & Self::SUPPORTED_MASK,
         ))
     }
 
@@ -122,14 +127,16 @@ impl TraceFlags {
 
     fn write_hex(self, output: &mut String) {
         const HEX: &[u8; 16] = b"0123456789abcdef";
-        output.push(HEX[usize::from(self.0 >> 4)] as char);
-        output.push(HEX[usize::from(self.0 & 0x0f)] as char);
+        let value = self.0 & Self::SUPPORTED_MASK;
+        output.push(HEX[usize::from(value >> 4)] as char);
+        output.push(HEX[usize::from(value & 0x0f)] as char);
     }
 
     fn write_hex_bytes(self, output: &mut [u8; 2]) {
         const HEX: &[u8; 16] = b"0123456789abcdef";
-        output[0] = HEX[usize::from(self.0 >> 4)];
-        output[1] = HEX[usize::from(self.0 & 0x0f)];
+        let value = self.0 & Self::SUPPORTED_MASK;
+        output[0] = HEX[usize::from(value >> 4)];
+        output[1] = HEX[usize::from(value & 0x0f)];
     }
 }
 
@@ -271,6 +278,13 @@ fn parse_traceparent_bytes(bytes: &[u8]) -> Option<ParsedTraceparent> {
     if bytes.len() < 55 {
         return None;
     }
+    if !bytes[..2].iter().copied().all(is_lower_hex_byte)
+        || !bytes[3..35].iter().copied().all(is_lower_hex_byte)
+        || !bytes[36..52].iter().copied().all(is_lower_hex_byte)
+        || !bytes[53..55].iter().copied().all(is_lower_hex_byte)
+    {
+        return None;
+    }
     let version = (decode_hex_nibble(bytes[0])? << 4) | decode_hex_nibble(bytes[1])?;
     if version == u8::MAX
         || (version == 0 && bytes.len() != 55)
@@ -337,11 +351,14 @@ fn canonical_hex_byte(byte: u8) -> Option<u8> {
     }
 }
 
+fn is_lower_hex_byte(byte: u8) -> bool {
+    byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+}
+
 fn decode_hex_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
 }

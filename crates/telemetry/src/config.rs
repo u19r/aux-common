@@ -1,55 +1,10 @@
 use std::{collections::BTreeMap, fmt};
 
-const DEFAULT_LOG_DESTINATION: &str = "stdout";
-const DEFAULT_LOG_FILTER: &str = "warn";
-const DEFAULT_SLOW_OPERATION_THRESHOLD_MS: u64 = 500;
-const DEFAULT_METRICS_PATH: &str = "/internal/metrics";
-
-const DEFAULT_TOP_LEVEL_FIELD_ALLOWLIST: &[&str] = &[
-    crate::constants::FIELD_FEATURE,
-    crate::constants::FIELD_OPERATION_NAME,
-    crate::constants::FIELD_REQUEST_ID,
-    crate::constants::FIELD_TRACE_ID,
-    crate::constants::FIELD_SOURCE_IP,
-    crate::constants::FIELD_TENANT_ID,
-    crate::constants::FIELD_ORG_ID,
-    crate::constants::FIELD_USER_ID,
-    "method",
-    "path",
-    "host",
-    "status_code",
-    "duration_ms",
-    "request_bytes",
-    "response_bytes",
-    crate::constants::FIELD_SPAN_ID,
-    crate::constants::FIELD_TRACE_FLAGS,
-];
-
-const DEFAULT_SENSITIVE_FIELD_BLOCKLIST: &[&str] = &[
-    "authorization",
-    "cookie",
-    "set-cookie",
-    "set_cookie",
-    "x-api-key",
-    "api-key",
-    "api_key",
-    "access_token",
-    "accessToken",
-    "refresh_token",
-    "refreshToken",
-    "id_token",
-    "idToken",
-    "client_secret",
-    "clientSecret",
-    "apiKey",
-    "privateKey",
-    "secretKey",
-    "signingKey",
-    "bearerToken",
-    "password",
-    "secret",
-    "token",
-];
+use crate::constants::{
+    DEFAULT_LOG_DESTINATION, DEFAULT_LOG_FILTER, DEFAULT_METRICS_PATH,
+    DEFAULT_SENSITIVE_FIELD_BLOCKLIST, DEFAULT_SLOW_OPERATION_THRESHOLD_MS,
+    DEFAULT_TOP_LEVEL_FIELD_ALLOWLIST,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TracingConfig {

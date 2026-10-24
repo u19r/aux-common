@@ -1,0 +1,13 @@
+name: buffered-writes-demo
+services:
+  buffered-host:
+    image: buffered-writes-host:local
+    platform: linux/arm64
+    build:
+      context: ../../..
+      dockerfile: crates/buffered-writes/deployments/persistent-host.Dockerfile
+    environment:
+      BUFFERED_WRITES_SHUTDOWN_GRACE_MS: "10000"
+    stop_signal: SIGTERM
+    stop_grace_period: 20s
+    read_only: true

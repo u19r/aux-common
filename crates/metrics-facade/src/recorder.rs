@@ -10,15 +10,17 @@ use std::{
 
 use metrics::{Key, Label, Level, Metadata, with_recorder};
 
-use crate::metrics::{CounterMetric, GaugeMetric, HistogramMetric};
 #[cfg(feature = "request-cost")]
 use crate::request_cost;
+use crate::{
+    constants::{
+        INVALID_METRIC_LABEL_VALUE, MAX_HANDLE_CACHE_ENTRIES, MAX_METRIC_LABEL_VALUE_BYTES,
+        MAX_METRIC_LABELS, MAX_REGISTERED_METRIC_KEYS,
+    },
+    metrics::{CounterMetric, GaugeMetric, HistogramMetric},
+};
 
-pub(crate) const MAX_METRIC_LABELS: usize = 16;
-pub(crate) const MAX_METRIC_LABEL_VALUE_BYTES: usize = 256;
-const MAX_HANDLE_CACHE_ENTRIES: usize = 256;
-const MAX_REGISTERED_METRIC_KEYS: usize = 4_096;
-const INVALID_METRIC_LABEL_VALUE: &str = "<invalid>";
+static REGISTERED_KEYS: OnceLock<Mutex<HashSet<Key>>> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MetricLabel {
@@ -182,7 +184,6 @@ where
 }
 
 fn allow_metric_key(key: &Key) -> bool {
-    static REGISTERED_KEYS: OnceLock<Mutex<HashSet<Key>>> = OnceLock::new();
     let keys = REGISTERED_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
     let Ok(mut keys) = keys.lock() else {
         return false;
@@ -194,6 +195,32 @@ fn allow_metric_key(key: &Key) -> bool {
         return false;
     }
     keys.insert(key.clone())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_registered_metric_keys() {
+    if let Some(keys) = REGISTERED_KEYS.get()
+        && let Ok(mut keys) = keys.lock()
+    {
+        keys.clear();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn registered_metric_key_count() -> usize {
+    REGISTERED_KEYS
+        .get()
+        .and_then(|keys| keys.lock().ok().map(|keys| keys.len()))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+pub(crate) fn allow_test_metric_key(label_value: String) -> bool {
+    let key = Key::from_parts(
+        "metrics_facade_registered_key_test",
+        vec![Label::new("case", label_value)],
+    );
+    allow_metric_key(&key)
 }
 
 impl MetricsCrateFacade {
@@ -335,6 +362,8 @@ impl MetricsFacade for MetricsCrateFacade {
 static METRICS_FACADE: OnceLock<RwLock<Arc<dyn MetricsFacade>>> = OnceLock::new();
 
 fn metrics_facade_cell() -> &'static RwLock<Arc<dyn MetricsFacade>> {
+    #[cfg(all(feature = "http-observer", not(target_arch = "wasm32")))]
+    crate::http_request_observer::ensure_default_http_request_observer_installed();
     METRICS_FACADE.get_or_init(|| RwLock::new(Arc::new(MetricsCrateFacade)))
 }
 

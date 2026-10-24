@@ -4,6 +4,12 @@ Shared HTTP client behavior for service-to-service and remote-provider calls.
 
 The crate provides retries, timeouts, typed errors, metrics, response parsing helpers, and optional constrained outbound fetching for untrusted URLs. Keep storage callers explicit about retry policy and response-size limits.
 
+`HttpRequestError::dispatch_status` separates failures that prove no request bytes reached the
+destination from failures that may have happened after dispatch. DNS, connection, TLS setup, and
+their timeouts are `NotDispatched`; response loss, response timeout, body failure, and uncertain
+transport failures are `PossiblyDispatched`. Callers implementing an atomic remote protocol must
+map the latter to their ambiguous-outcome path rather than retrying with a new operation identity.
+
 Important files:
 
 - `crates/http-request/src/client.rs`: `HttpClient`, request builder, response handling.

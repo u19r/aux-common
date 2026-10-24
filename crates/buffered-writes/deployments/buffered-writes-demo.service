@@ -1,0 +1,16 @@
+[Unit]
+Description=Buffered writes lifecycle demonstration
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/buffered-writes/persistent-host
+Environment=BUFFERED_WRITES_SHUTDOWN_GRACE_MS=10000
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=20s
+NoNewPrivileges=true
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

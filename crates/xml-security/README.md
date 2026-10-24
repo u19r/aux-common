@@ -1,7 +1,7 @@
 # xml-security
 
-xml-security is a bounded XML 1.0/UTF-8 parser and a narrowly documented
-canonicalisation primitive for the SAML profile. The default limits are 512 KiB
+xml-security provides bounded XML 1.0/UTF-8 parsing, exclusive canonicalisation,
+and strict enveloped XML signature verification for the SAML profile. The default limits are 512 KiB
 of input, 64 nested elements, 8,192 total elements, 128 attributes per element,
 and 64 in-scope namespace bindings per element. Callers with a smaller protocol
 profile can use `XmlLimits::try_with_cardinality` to lower any of those bounds.
@@ -19,7 +19,20 @@ The canonicaliser supports the reviewed Exclusive XML Canonicalization subset
 inclusive-prefix list is explicit and must name a prefix declared on the canonical
 root; a declaration that appears only on a descendant is rejected. XPath, XSLT,
 external references, entity expansion, XML Encryption, and unrecognised
-transforms are not implemented. This crate does not verify signatures. Parsed
-children must be selected with `Element::find_child_in_namespace`, which compares
+transforms are rejected. Parsed
+children must be selected with `UnverifiedElement::find_child_in_namespace`, which compares
 both local name and exact namespace URI. Parsed elements expose read-only accessors
 and no application or tenant types; debug output redacts text and attribute values.
+
+## Signature verification
+
+`VerifiedXmlDocument::verify_enveloped` verifies RSA-SHA256 signatures and SHA-256 reference
+digests against caller-supplied trusted public keys. It requires a unique signed element ID,
+a same-document reference, and the supported enveloped-signature and exclusive-canonicalisation
+transforms. Embedded key material does not establish trust.
+
+Use `signed_element()` or `into_signed_element()` to obtain the verified subtree. A root
+signature authenticates the root; otherwise exactly one nested signed target is required.
+Signature descendants are removed from the returned subtree. Parsing helpers and
+`UnverifiedElement` do not establish authenticity. Callers own key trust, protocol validation,
+and application authorization.

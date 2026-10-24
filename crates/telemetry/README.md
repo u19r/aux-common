@@ -20,7 +20,7 @@ let tracing = TracingConfig::with_default_security()
         log_level: "INFO".to_string(),
     }]);
 
-let (filter, _source) = resolve_filter(&tracing);
+let (filter, _source) = resolve_filter(&tracing)?;
 let _guards = init_tracing(&tracing, filter)?;
 let layer = request_trace_layer();
 # Ok::<(), Box<dyn std::error::Error>>(())
@@ -65,3 +65,9 @@ let metrics = setup_metrics(&MetricsConfig::enabled("scrape-token"))?;
 
 Keep service-specific field names, root span names, and feature prefixes in their own
 crate and pass them through `FieldSecurityPolicy`, `RootSpanPolicy`, and `TraceRuleConfig`.
+
+The default destination is `stdout`, which is appropriate for services whose runtime collects the
+process log stream. Use an absolute path for an append-only file destination, or provide a
+caller-owned `WideLogSink` with `init_tracing_with_sink` when the host owns a different transport.
+Invalid filters and destinations are returned as typed errors; they are not printed or silently
+ignored.

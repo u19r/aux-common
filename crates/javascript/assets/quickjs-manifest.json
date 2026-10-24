@@ -1,0 +1,63 @@
+{
+  "exports": [
+    "__main_void",
+    "_start",
+    "memory"
+  ],
+  "guest_lock_sha256": "3730616a37ab9726272c70babe03d0e5c763ce22b36542c9a2fd8f6ac95e094f",
+  "imports": [
+    "wasi_snapshot_preview1::clock_time_get",
+    "wasi_snapshot_preview1::environ_get",
+    "wasi_snapshot_preview1::environ_sizes_get",
+    "wasi_snapshot_preview1::fd_close",
+    "wasi_snapshot_preview1::fd_fdstat_get",
+    "wasi_snapshot_preview1::fd_prestat_dir_name",
+    "wasi_snapshot_preview1::fd_prestat_get",
+    "wasi_snapshot_preview1::fd_read",
+    "wasi_snapshot_preview1::fd_seek",
+    "wasi_snapshot_preview1::fd_write",
+    "wasi_snapshot_preview1::proc_exit",
+    "wasi_snapshot_preview1::random_get"
+  ],
+  "profile": {
+    "opt_level": "s",
+    "panic": "abort",
+    "strip": true
+  },
+  "protocol_version": 1,
+  "quickjs_ng": "0.16.2",
+  "rquickjs": "0.14.0",
+  "rquickjs_sys_registry_checksum": "cee271d0eeba64f0915b846cb7ae02e16faf3dfdffdca91731101d9d30fe3423",
+  "rust": "1.99.1",
+  "schema_version": 1,
+  "sources": {
+    "Cargo.toml": "76a304ccedb8d24bbf15de93618811d4219c2eb21f7384e4aba4a2ffd5a326a6",
+    "crates/javascript/Cargo.toml": "740a584572ca00fd57c14520f127333af362f85ddbe484032eb39131fe4e07f7",
+    "crates/javascript/build.rs": "021d080f9b7fc7dd14efc4519d287cebe7a07821a78db9a06cf72e27cff290bb",
+    "crates/javascript/examples/quickjs_artifact.rs": "3ed41b12a9c4d8fe6b5ad8f0dc46bf94cc766f37986b9a247a2916641e717182",
+    "crates/javascript/src/bounded_writer.rs": "224e2b29f24d4db0e0a5cecd86b2941af59e48b866f0331dd90dc525ad5e750d",
+    "crates/javascript/src/constants.rs": "d678a132faa7e26d7ff803e4b2e9a87742438ff444b95d24a9b6b98c8fcd7cbf",
+    "crates/javascript/src/error.rs": "f6deea5c8a8c95012db7cf5b89ad3771dde4c8344fdb2074fe67289a0aaf83ea",
+    "crates/javascript/src/invocation.rs": "e3d5a8125ed1ac7dc1800c8d923ab6b83ea9d0efbcda034032473c26f12d10a1",
+    "crates/javascript/src/lib.rs": "b45b849cd219859bef296b09af3d7859517b1679b468956fc1a5de552b1fadef",
+    "crates/javascript/src/protocol.rs": "2623fe8006e08f59690f86aaa42706e6c3d18486ef52f96a65ac6c02e2e03c0b",
+    "crates/quickjs/Cargo.toml": "00833a1726117c396b038d98fef280cb23540a722bbeb8320ad5d9c2b5249f6c",
+    "crates/quickjs/rust-toolchain.toml": "4788f4fafd4fadc0298ae0dfa307cd3f4546f739d4f00925182884d6ec50cbe7",
+    "crates/quickjs/src/constants.rs": "d6d4642f606869b866265d0f42eb3681abe27df6f8fdaccd3f759d0bb12c2239",
+    "crates/quickjs/src/evaluation/dispatch.rs": "88ad019d38aedb81e98d361527caf1bd08bde2bd65c82a16293b146393861c31",
+    "crates/quickjs/src/evaluation/invocation.rs": "b4dd3e3dbec8c6cd7e6f0a54a3a07c1066ae9e961325b75518def690089fe395",
+    "crates/quickjs/src/evaluation/mod.rs": "ad3daf3777ff459a33aa236d93ed104cc6b541d3c8bbf11bb63d5d1900e66159",
+    "crates/quickjs/src/evaluation/output.rs": "6d3c0cf9c128cbc72790028baf5cc17c7f55de70a119543de2fac78140c3322c",
+    "crates/quickjs/src/main.rs": "bfa263c71bad7b9fab494dea31a1d19ee9d144ceedb4333242b2f16d31e7261a",
+    "scripts/build-quickjs-wasm.sh": "75b43e114259746e977fd19508c6214ddd1506e191cbaca124e2bb2325d3a294",
+    "scripts/quickjs-clang.sh": "a294bce32a4eff680475b2a73643f0031194240b8f51dc27858e2455fb695915",
+    "scripts/quickjs-rustc.sh": "46606bce9338b778e558cad10857374697a1497488256c23e38f8fc0426fb7cb"
+  },
+  "target": "wasm32-wasip1",
+  "vendored_quickjs_license_sha256": "96f73f9d2a16c21a36b418f06073be26e7d6d5e7c1bc99756b21a4f2c74ef171",
+  "vendored_quickjs_sha256": "5f24acd61c200c110588975ac935654037f6ca8db7fa33f87dd5b124f48898e0",
+  "wasi_sdk": "24.0",
+  "wasm_bytes": 730172,
+  "wasm_sha256": "f8732db4e5795144a90c2dcb718508ecf35977a7783e96019fc86865ffa25427",
+  "wasmtime": "50.0.0"
+}

@@ -1,3 +1,4 @@
+mod constants;
 mod field_security;
 mod otel_log_entry;
 mod sink;
@@ -7,7 +8,7 @@ mod wide_log_impl;
 
 #[cfg(test)]
 pub(crate) use field_security::{SpanFields, has_sensitive_suffix};
-pub use sink::WideLogInitError;
+pub use sink::{WideLogInitError, WideLogSink};
 pub use wide_log_impl::WideLogLayer;
 
 #[cfg(test)]

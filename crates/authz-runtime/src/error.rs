@@ -16,6 +16,9 @@ pub enum AuthzRuntimeError {
     #[error("snapshot resource does not match evaluation request")]
     ResourceSnapshotMismatch,
 
+    #[error("resource snapshot contains conflicting organization parents")]
+    ConflictingResourceOrgParents,
+
     #[error("snapshot tenant does not match evaluation tenant")]
     TenantSnapshotMismatch,
 

@@ -2,7 +2,7 @@ use std::{
     env, fmt,
     io::{self, Read},
     path::Path,
-    process::{Command, ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -11,67 +11,37 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use aws_credential_types::{
-    Credentials,
-    provider::{self, ProvideCredentials},
-};
-use aws_smithy_types::date_time::{DateTime, Format};
-use futures_util::StreamExt;
-use lru_ttl_cache::{CacheConfig, KeyedSingleflight, LruTtlCache};
+use chrono::DateTime;
+use futures_util::{StreamExt, future::BoxFuture};
+use lru_ttl_cache::{CacheConfig, KeyedSingleflight, KeyedSingleflightGuard, LruTtlCache};
 use reqwest::header::AUTHORIZATION as REQWEST_AUTHORIZATION;
 use serde::Deserialize;
 use url::Url;
 
-use crate::constants::{
-    AWS_ACCESS_KEY, AWS_ACCESS_KEY_ID, AWS_CLI_COMMAND_TIMEOUT, AWS_CLI_CREDENTIAL_PROVIDER_NAME,
-    AWS_CONFIG_FILE, AWS_CONFIG_RELATIVE_PATH, AWS_CONTAINER_AUTHORIZATION_TOKEN,
-    AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE, AWS_CONTAINER_CREDENTIALS_FULL_URI,
-    AWS_CONTAINER_CREDENTIALS_RELATIVE_URI, AWS_CREDENTIALS_RELATIVE_PATH, AWS_DEFAULT_PROFILE,
-    AWS_EC2_METADATA_DISABLED, AWS_PROFILE, AWS_SECRET_ACCESS_KEY, AWS_SECRET_KEY,
-    AWS_SESSION_TOKEN, AWS_SHARED_CREDENTIALS_FILE, CREDENTIAL_CACHE_CAPACITY,
-    CREDENTIAL_CACHE_STATIC_TTL, CREDENTIAL_REFRESH_FALLBACK, CREDENTIAL_REFRESH_SKEW,
-    DEFAULT_CREDENTIAL_CACHE_KEY, ECS_RELATIVE_CREDENTIALS_BASE, ECS_TASK_METADATA_PROVIDER_NAME,
-    ENVIRONMENT_PROVIDER_NAME, HOME, IMDS_PROVIDER_NAME, IMDS_ROLE_LIST_URL, IMDS_TOKEN_HEADER,
-    IMDS_TOKEN_TTL_HEADER, IMDS_TOKEN_TTL_SECONDS, IMDS_TOKEN_URL, LOCALHOST,
-    MAX_AUTHORIZATION_TOKEN_BYTES, MAX_AWS_CLI_OUTPUT_BYTES, MAX_METADATA_RESPONSE_BYTES,
-    METADATA_CONNECT_TIMEOUT, METADATA_REQUEST_TIMEOUT, STATIC_PROVIDER_NAME,
+use crate::{
+    constants::{
+        AWS_ACCESS_KEY, AWS_ACCESS_KEY_ID, AWS_CLI_COMMAND_TIMEOUT, AWS_CONFIG_FILE,
+        AWS_CONFIG_RELATIVE_PATH, AWS_CONTAINER_AUTHORIZATION_TOKEN,
+        AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE, AWS_CONTAINER_CREDENTIALS_FULL_URI,
+        AWS_CONTAINER_CREDENTIALS_RELATIVE_URI, AWS_CREDENTIALS_RELATIVE_PATH, AWS_DEFAULT_PROFILE,
+        AWS_EC2_METADATA_DISABLED, AWS_PROFILE, AWS_SECRET_ACCESS_KEY, AWS_SECRET_KEY,
+        AWS_SESSION_TOKEN, AWS_SHARED_CREDENTIALS_FILE, CREDENTIAL_CACHE_CAPACITY,
+        CREDENTIAL_CACHE_STATIC_TTL, CREDENTIAL_REFRESH_FALLBACK, CREDENTIAL_REFRESH_SKEW,
+        DEFAULT_CREDENTIAL_CACHE_KEY, ECS_RELATIVE_CREDENTIALS_BASE, HOME, IMDS_ROLE_LIST_URL,
+        IMDS_TOKEN_HEADER, IMDS_TOKEN_TTL_HEADER, IMDS_TOKEN_TTL_SECONDS, IMDS_TOKEN_URL,
+        LOCALHOST, MAX_AUTHORIZATION_TOKEN_BYTES, MAX_AWS_CLI_OUTPUT_BYTES,
+        MAX_METADATA_RESPONSE_BYTES, METADATA_CONNECT_TIMEOUT, METADATA_REQUEST_TIMEOUT,
+    },
+    credential_provider::ProvideCredentials,
+    credentials::{AwsResolvedCredentials, AwsStaticCredentials, Credentials},
+    error::{
+        CredentialProviderErrorKind, CredentialProviderSource, CredentialsError, MetadataEndpoint,
+    },
 };
 
-pub(crate) type CredentialProviderError = provider::error::CredentialsError;
+pub(crate) type CredentialProviderError = CredentialsError;
 pub(crate) type CredentialProviderResult<T> = Result<T, CredentialProviderError>;
-
-#[derive(Clone)]
-pub struct AwsStaticCredentials {
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    pub session_token: Option<String>,
-}
-
-#[derive(Clone)]
-pub struct AwsResolvedCredentials {
-    pub credentials: AwsStaticCredentials,
-    pub expires_after: Option<SystemTime>,
-    pub refresh_after: Option<SystemTime>,
-}
-
-impl AwsResolvedCredentials {
-    #[must_use]
-    pub fn needs_refresh(&self) -> bool {
-        self.needs_refresh_at(SystemTime::now())
-    }
-
-    #[must_use]
-    pub fn needs_refresh_at(&self, now: SystemTime) -> bool {
-        self.refresh_after
-            .is_some_and(|refresh_after| now >= refresh_after)
-    }
-}
-
-#[derive(Clone)]
-pub enum CredentialSource {
-    DefaultChain,
-    Static(AwsStaticCredentials),
-}
+type RefreshOwnership = Arc<KeyedSingleflightGuard<&'static str>>;
 
 pub fn resolve_default_chain_credentials() -> CredentialProviderResult<AwsStaticCredentials> {
     Ok(resolve_default_chain_credentials_with_expiry()?.credentials)
@@ -113,42 +83,6 @@ impl ResolvedCredentials {
     }
 }
 
-impl fmt::Debug for AwsStaticCredentials {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AwsStaticCredentials")
-            .field("access_key_id", &self.access_key_id)
-            .field("secret_access_key", &"[REDACTED]")
-            .field(
-                "session_token",
-                &self.session_token.as_ref().map(|_| "[REDACTED]"),
-            )
-            .finish()
-    }
-}
-
-impl fmt::Debug for AwsResolvedCredentials {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AwsResolvedCredentials")
-            .field("credentials", &self.credentials)
-            .field("expires_after", &self.expires_after)
-            .field("refresh_after", &self.refresh_after)
-            .finish()
-    }
-}
-
-impl fmt::Debug for CredentialSource {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DefaultChain => formatter.write_str("DefaultChain"),
-            Self::Static(credentials) => {
-                formatter.debug_tuple("Static").field(credentials).finish()
-            }
-        }
-    }
-}
-
 impl fmt::Debug for ResolvedCredentials {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -167,190 +101,6 @@ impl fmt::Debug for DefaultChainCredentialsProvider {
             .field("refresh_flight", &"[SINGLEFLIGHT]")
             .finish()
     }
-}
-
-#[derive(Debug)]
-enum CredentialProviderErrorKind {
-    NoDefaultCredentials,
-    DefaultChainFailures(Vec<ProviderFailure>),
-    BlockingDefaultChainFailures(Vec<ProviderFailure>),
-    MetadataEndpointStatus {
-        endpoint: MetadataEndpoint,
-        status: reqwest::StatusCode,
-    },
-    EmptyImdsToken,
-    MissingImdsRoleName,
-    PartialEnvironmentCredentials,
-    AwsCliRunFailed,
-    AwsCliProfileExportFailed,
-    AwsCliOutputTooLarge,
-    AwsCliTimedOut,
-    AuthorizationTokenFileTooLarge,
-    InvalidAwsCliCredentialJson,
-    EcsRelativeUriMustBePath,
-    EcsFullUriMissingHost,
-    EcsFullUriRequiresHttpsOrLocal,
-    EcsFullUriRequiresHttpOrHttps,
-    EmptyAuthorizationTokenFile,
-    IncompleteCredentialResponse,
-    MetadataRequestFailed,
-    ProviderClientInitFailed,
-    MetadataResponseInvalid,
-    MetadataCredentialsJsonInvalid,
-    MetadataCredentialsTextInvalid,
-    AuthorizationTokenFileReadFailed,
-    AuthorizationTokenFileInvalidUtf8,
-    InvalidEcsCredentialsUri,
-}
-
-#[derive(Debug)]
-struct ProviderFailure {
-    source: CredentialProviderSource,
-    error: &'static str,
-}
-
-impl ProviderFailure {
-    fn new(source: CredentialProviderSource, _error: &CredentialProviderError) -> Self {
-        Self {
-            source,
-            error: "provider request failed",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum CredentialProviderSource {
-    AwsCliProfile,
-    EcsTaskMetadata,
-    Imds,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum MetadataEndpoint {
-    Credential,
-    Credentials,
-    Token,
-    RoleListing,
-    RoleCredentials,
-}
-
-impl fmt::Display for CredentialProviderErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoDefaultCredentials => f.write_str(
-                "no credentials found in environment variables, ECS task metadata, or IMDS",
-            ),
-            Self::DefaultChainFailures(failures) => {
-                write!(f, "credential providers failed: ")?;
-                write_provider_failures(f, failures)
-            }
-            Self::BlockingDefaultChainFailures(failures) => {
-                write!(f, "failed to resolve credentials from default chain: ")?;
-                write_provider_failures(f, failures)
-            }
-            Self::MetadataEndpointStatus { endpoint, status } => {
-                write!(f, "{endpoint} endpoint returned status {status}")
-            }
-            Self::EmptyImdsToken => f.write_str("token endpoint returned an empty token"),
-            Self::MissingImdsRoleName => f.write_str("role listing endpoint returned no role name"),
-            Self::PartialEnvironmentCredentials => {
-                f.write_str("AWS credential environment variables are partially configured")
-            }
-            Self::AwsCliRunFailed => f.write_str("failed to run aws cli credential provider"),
-            Self::AwsCliProfileExportFailed => {
-                f.write_str("aws cli credential provider rejected the requested profile")
-            }
-            Self::AwsCliOutputTooLarge => {
-                write!(f, "aws cli credential output exceeds configured limit")
-            }
-            Self::AwsCliTimedOut => f.write_str("aws cli credential command timed out"),
-            Self::AuthorizationTokenFileTooLarge => {
-                write!(f, "authorization token file exceeds configured limit")
-            }
-            Self::InvalidAwsCliCredentialJson => {
-                f.write_str("aws cli credential provider returned invalid JSON")
-            }
-            Self::EcsRelativeUriMustBePath => {
-                f.write_str("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI must be a path")
-            }
-            Self::EcsFullUriMissingHost => {
-                f.write_str("AWS_CONTAINER_CREDENTIALS_FULL_URI is missing a host")
-            }
-            Self::EcsFullUriRequiresHttpsOrLocal => f.write_str(
-                "AWS_CONTAINER_CREDENTIALS_FULL_URI must use HTTPS or a loopback/local ECS host",
-            ),
-            Self::EcsFullUriRequiresHttpOrHttps => {
-                f.write_str("AWS_CONTAINER_CREDENTIALS_FULL_URI must use HTTP or HTTPS")
-            }
-            Self::EmptyAuthorizationTokenFile => f.write_str("authorization token file was empty"),
-            Self::IncompleteCredentialResponse => f.write_str(
-                "credential response did not include access key id and secret access key",
-            ),
-            Self::MetadataRequestFailed => f.write_str("metadata request failed"),
-            Self::ProviderClientInitFailed => {
-                f.write_str("credential provider client initialization failed")
-            }
-            Self::MetadataResponseInvalid => {
-                f.write_str("credential metadata response was invalid")
-            }
-            Self::MetadataCredentialsJsonInvalid => {
-                f.write_str("credential metadata response was not valid JSON")
-            }
-            Self::MetadataCredentialsTextInvalid => {
-                f.write_str("credential metadata response was not valid UTF-8")
-            }
-            Self::AuthorizationTokenFileReadFailed => {
-                f.write_str("authorization token file could not be read")
-            }
-            Self::AuthorizationTokenFileInvalidUtf8 => {
-                f.write_str("authorization token file was not valid UTF-8")
-            }
-            Self::InvalidEcsCredentialsUri => f.write_str("ECS credentials URI was invalid"),
-        }
-    }
-}
-
-impl std::error::Error for CredentialProviderErrorKind {}
-
-impl fmt::Display for ProviderFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.source, self.error)
-    }
-}
-
-impl fmt::Display for CredentialProviderSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AwsCliProfile => f.write_str("aws cli profile"),
-            Self::EcsTaskMetadata => f.write_str("ecs task metadata"),
-            Self::Imds => f.write_str("imds"),
-        }
-    }
-}
-
-impl fmt::Display for MetadataEndpoint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Credential => f.write_str("credential"),
-            Self::Credentials => f.write_str("credentials"),
-            Self::Token => f.write_str("token"),
-            Self::RoleListing => f.write_str("role listing"),
-            Self::RoleCredentials => f.write_str("role credentials"),
-        }
-    }
-}
-
-fn write_provider_failures(
-    f: &mut fmt::Formatter<'_>,
-    failures: &[ProviderFailure],
-) -> fmt::Result {
-    for (index, failure) in failures.iter().enumerate() {
-        if index > 0 {
-            f.write_str("; ")?;
-        }
-        write!(f, "{failure}")?;
-    }
-    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -380,6 +130,7 @@ impl DefaultChainCredentialsProvider {
         let client = reqwest::Client::builder()
             .connect_timeout(METADATA_CONNECT_TIMEOUT)
             .timeout(METADATA_REQUEST_TIMEOUT)
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| {
@@ -397,7 +148,7 @@ impl DefaultChainCredentialsProvider {
         })
     }
 
-    async fn load_credentials(&self) -> provider::Result {
+    async fn load_credentials(&self) -> CredentialProviderResult<Credentials> {
         if let Some(credentials) = self.cached_credentials() {
             return Ok(credentials);
         }
@@ -405,7 +156,7 @@ impl DefaultChainCredentialsProvider {
         // Re-check under the singleflight guard.  Without this second cache
         // read every concurrent miss could independently walk the profile,
         // ECS, and IMDS chain before any of them stored the result.
-        let _guard = self
+        let guard = self
             .refresh_flight
             .lock(&DEFAULT_CREDENTIAL_CACHE_KEY)
             .await;
@@ -413,7 +164,10 @@ impl DefaultChainCredentialsProvider {
             return Ok(credentials);
         }
 
-        let resolved = self.resolve_default_chain().await?;
+        // Retain ownership here through resolution and cache insertion; the
+        // blocking profile task receives its own clone for cancellation safety.
+        let refresh_ownership = Arc::new(guard);
+        let resolved = self.resolve_default_chain(&refresh_ownership).await?;
         self.store_cached_credentials(&resolved);
         Ok(resolved.credentials)
     }
@@ -430,36 +184,33 @@ impl DefaultChainCredentialsProvider {
         );
     }
 
-    async fn resolve_default_chain(&self) -> CredentialProviderResult<ResolvedCredentials> {
+    async fn resolve_default_chain(
+        &self,
+        refresh_ownership: &RefreshOwnership,
+    ) -> CredentialProviderResult<ResolvedCredentials> {
         if let Some(credentials) = resolve_environment_credentials()? {
             return Ok(credentials);
         }
 
         let mut provider_errors = Vec::new();
 
-        match resolve_profile_credentials_async().await {
+        match resolve_profile_credentials_async(Arc::clone(refresh_ownership)).await {
             Ok(Some(credentials)) => return Ok(credentials),
             Ok(None) => {}
-            Err(err) => provider_errors.push(ProviderFailure::new(
-                CredentialProviderSource::AwsCliProfile,
-                &err,
-            )),
+            Err(_) => provider_errors.push(CredentialProviderSource::AwsCliProfile),
         }
 
         match self.resolve_ecs_task_credentials().await {
             Ok(Some(credentials)) => return Ok(credentials),
             Ok(None) => {}
-            Err(err) => provider_errors.push(ProviderFailure::new(
-                CredentialProviderSource::EcsTaskMetadata,
-                &err,
-            )),
+            Err(_) => provider_errors.push(CredentialProviderSource::EcsTaskMetadata),
         }
 
         match self.resolve_imds_credentials().await {
             Ok(Some(credentials)) => return Ok(credentials),
             Ok(None) => {}
-            Err(err) => {
-                provider_errors.push(ProviderFailure::new(CredentialProviderSource::Imds, &err));
+            Err(_) => {
+                provider_errors.push(CredentialProviderSource::Imds);
             }
         }
 
@@ -504,7 +255,7 @@ impl DefaultChainCredentialsProvider {
                 provider_error_message(CredentialProviderErrorKind::MetadataCredentialsJsonInvalid)
             })?;
 
-        metadata_to_credentials(payload, ECS_TASK_METADATA_PROVIDER_NAME).map(Some)
+        metadata_to_credentials(payload).map(Some)
     }
 
     async fn resolve_imds_credentials(
@@ -603,14 +354,13 @@ impl DefaultChainCredentialsProvider {
                 provider_error_message(CredentialProviderErrorKind::MetadataCredentialsJsonInvalid)
             })?;
 
-        metadata_to_credentials(payload, IMDS_PROVIDER_NAME).map(Some)
+        metadata_to_credentials(payload).map(Some)
     }
 }
 
 impl ProvideCredentials for DefaultChainCredentialsProvider {
-    fn provide_credentials<'a>(&'a self) -> provider::future::ProvideCredentials<'a>
-    where Self: 'a {
-        provider::future::ProvideCredentials::new(self.load_credentials())
+    fn provide_credentials(&self) -> BoxFuture<'_, CredentialProviderResult<Credentials>> {
+        Box::pin(self.load_credentials())
     }
 }
 
@@ -624,10 +374,7 @@ fn resolve_default_chain_blocking() -> CredentialProviderResult<ResolvedCredenti
     match resolve_profile_credentials() {
         Ok(Some(credentials)) => return Ok(credentials),
         Ok(None) => {}
-        Err(err) => provider_errors.push(ProviderFailure::new(
-            CredentialProviderSource::AwsCliProfile,
-            &err,
-        )),
+        Err(_) => provider_errors.push(CredentialProviderSource::AwsCliProfile),
     }
 
     let client = blocking_metadata_http_client()?;
@@ -635,17 +382,14 @@ fn resolve_default_chain_blocking() -> CredentialProviderResult<ResolvedCredenti
     match resolve_ecs_task_credentials_with_blocking_client(&client) {
         Ok(Some(credentials)) => return Ok(credentials),
         Ok(None) => {}
-        Err(err) => provider_errors.push(ProviderFailure::new(
-            CredentialProviderSource::EcsTaskMetadata,
-            &err,
-        )),
+        Err(_) => provider_errors.push(CredentialProviderSource::EcsTaskMetadata),
     }
 
     match resolve_imds_credentials_with_blocking_client(&client) {
         Ok(Some(credentials)) => return Ok(credentials),
         Ok(None) => {}
-        Err(err) => {
-            provider_errors.push(ProviderFailure::new(CredentialProviderSource::Imds, &err));
+        Err(_) => {
+            provider_errors.push(CredentialProviderSource::Imds);
         }
     }
 
@@ -660,11 +404,18 @@ fn resolve_default_chain_blocking() -> CredentialProviderResult<ResolvedCredenti
     ))
 }
 
-async fn resolve_profile_credentials_async() -> CredentialProviderResult<Option<ResolvedCredentials>>
-{
-    tokio::task::spawn_blocking(resolve_profile_credentials)
-        .await
-        .map_err(|_| provider_error_message(CredentialProviderErrorKind::AwsCliRunFailed))?
+async fn resolve_profile_credentials_async(
+    refresh_ownership: RefreshOwnership,
+) -> CredentialProviderResult<Option<ResolvedCredentials>> {
+    // The blocking task owns refresh admission while the CLI is running, so
+    // canceling its async waiter cannot release the gate before the command
+    // exits.
+    tokio::task::spawn_blocking(move || {
+        let _refresh_ownership = refresh_ownership;
+        resolve_profile_credentials()
+    })
+    .await
+    .map_err(|_| provider_error_message(CredentialProviderErrorKind::AwsCliRunFailed))?
 }
 
 fn resolve_environment_credentials() -> CredentialProviderResult<Option<ResolvedCredentials>> {
@@ -681,11 +432,12 @@ fn resolve_environment_credentials() -> CredentialProviderResult<Option<Resolved
         (Some(access_key_id), Some(secret_access_key)) => {
             let session_token = non_empty_env_var(AWS_SESSION_TOKEN);
             let credentials = Credentials::new(
-                access_key_id,
-                secret_access_key,
-                session_token,
+                AwsStaticCredentials {
+                    access_key_id,
+                    secret_access_key,
+                    session_token,
+                },
                 None,
-                ENVIRONMENT_PROVIDER_NAME,
             );
             Ok(Some(ResolvedCredentials {
                 credentials,
@@ -702,51 +454,176 @@ pub(crate) struct BoundedCommandOutput {
     pub(crate) timed_out: bool,
 }
 
-pub(crate) fn run_bounded_command(mut command: Command) -> io::Result<BoundedCommandOutput> {
+pub(crate) fn run_bounded_command(
+    mut command: Command,
+    timeout: Duration,
+) -> io::Result<BoundedCommandOutput> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("aws cli stdout pipe was not captured"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("aws cli stderr pipe was not captured"))?;
-    let output_too_large = Arc::new(AtomicBool::new(false));
-    let stdout_too_large = Arc::clone(&output_too_large);
-    let stderr_too_large = Arc::clone(&output_too_large);
-    let stdout_reader = thread::spawn(move || {
-        read_capped(stdout, MAX_AWS_CLI_OUTPUT_BYTES, stdout_too_large.as_ref())
-    });
-    let stderr_reader = thread::spawn(move || {
-        read_capped(stderr, MAX_AWS_CLI_OUTPUT_BYTES, stderr_too_large.as_ref())
-    });
-
-    let deadline = Instant::now() + AWS_CLI_COMMAND_TIMEOUT;
-    let (status, timed_out) = loop {
-        if output_too_large.load(Ordering::Acquire) {
-            let _ = child.kill();
-            break (child.wait()?, false);
-        }
-        if let Some(status) = child.try_wait()? {
-            break (status, false);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            break (child.wait()?, true);
-        }
-        thread::sleep(Duration::from_millis(10));
+    let mut supervisor = CommandSupervisor {
+        child: Some(spawn_bounded_child(command)?),
+        readers: [None, None],
     };
+    let (stdout, stderr) = supervisor.take_pipes()?;
+    let output_too_large = Arc::new(AtomicBool::new(false));
+    supervisor.readers[0] = Some(spawn_command_reader(stdout, Arc::clone(&output_too_large))?);
+    supervisor.readers[1] = Some(spawn_command_reader(stderr, Arc::clone(&output_too_large))?);
+    let (status, timed_out) = supervisor.wait(timeout, &output_too_large)?;
+    supervisor.finish(status, timed_out)
+}
 
-    let stdout = join_command_reader(stdout_reader)?;
-    let stderr = join_command_reader(stderr_reader)?;
-    Ok(BoundedCommandOutput {
-        status,
-        stdout,
-        stderr,
-        timed_out,
-    })
+struct CommandSupervisor {
+    child: Option<Child>,
+    readers: [Option<thread::JoinHandle<io::Result<Vec<u8>>>>; 2],
+}
+
+impl CommandSupervisor {
+    fn child_mut(&mut self) -> io::Result<&mut Child> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("aws cli child is no longer supervised"))
+    }
+
+    fn take_pipes(&mut self) -> io::Result<(std::process::ChildStdout, std::process::ChildStderr)> {
+        let child = self.child_mut()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("aws cli stdout pipe was not captured"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("aws cli stderr pipe was not captured"))?;
+        Ok((stdout, stderr))
+    }
+
+    fn wait(
+        &mut self,
+        timeout: Duration,
+        output_too_large: &AtomicBool,
+    ) -> io::Result<(ExitStatus, bool)> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if output_too_large.load(Ordering::Acquire) {
+                return self.stop_and_reap(false);
+            }
+            match self.child_mut()?.try_wait() {
+                Ok(Some(_)) => return self.stop_and_reap(false),
+                Ok(None) if Instant::now() >= deadline => return self.stop_and_reap(true),
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Err(error) => {
+                    self.stop_and_reap(false)?;
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn stop_and_reap(&mut self, timed_out: bool) -> io::Result<(ExitStatus, bool)> {
+        let status = terminate_and_reap(self.child_mut()?)?;
+        Ok((status, timed_out))
+    }
+
+    fn finish(mut self, status: ExitStatus, timed_out: bool) -> io::Result<BoundedCommandOutput> {
+        self.child.take();
+        let [stdout, stderr] = std::mem::take(&mut self.readers).map(join_command_reader);
+        Ok(BoundedCommandOutput {
+            status,
+            stdout: stdout?,
+            stderr: stderr?,
+            timed_out,
+        })
+    }
+}
+
+impl Drop for CommandSupervisor {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = terminate_and_reap(child);
+        }
+        for reader in self.readers.iter_mut().filter_map(Option::take) {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn spawn_command_reader<R>(
+    reader: R,
+    output_too_large: Arc<AtomicBool>,
+) -> io::Result<thread::JoinHandle<io::Result<Vec<u8>>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::Builder::new()
+        .name("aws-credentials-output-reader".to_owned())
+        .spawn(move || read_capped(reader, MAX_AWS_CLI_OUTPUT_BYTES, output_too_large.as_ref()))
+}
+
+fn join_command_reader(
+    reader: Option<thread::JoinHandle<io::Result<Vec<u8>>>>,
+) -> io::Result<Vec<u8>> {
+    let reader = reader.ok_or_else(|| io::Error::other("aws cli output reader missing"))?;
+    reader
+        .join()
+        .map_err(|_| io::Error::other("aws cli output reader panicked"))?
+}
+
+#[cfg(unix)]
+fn spawn_bounded_child(mut command: Command) -> io::Result<Child> {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+    command.spawn()
+}
+
+#[cfg(not(unix))]
+fn spawn_bounded_child(_command: Command) -> io::Result<Child> {
+    Err(process_cleanup_unsupported())
+}
+
+#[cfg(unix)]
+fn signal_bounded_process_group(pid: u32, signal: &str) -> io::Result<bool> {
+    let process_group = format!("-{pid}");
+    Command::new("/bin/kill")
+        .args([signal, "--", process_group.as_str()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+}
+
+#[cfg(not(unix))]
+fn signal_bounded_process_group(_pid: u32, _signal: &str) -> io::Result<bool> {
+    Err(process_cleanup_unsupported())
+}
+
+#[cfg(not(unix))]
+fn process_cleanup_unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "aws cli process-tree cleanup is unsupported on this platform",
+    )
+}
+
+fn terminate_and_reap(child: &mut Child) -> io::Result<ExitStatus> {
+    let pid = child.id();
+    let group_result = signal_bounded_process_group(pid, "-KILL").and_then(|killed| {
+        killed
+            .then_some(())
+            .ok_or_else(|| io::Error::other("aws cli process-group termination failed"))
+    });
+    if group_result.is_err() {
+        let _ = child.kill();
+    }
+    let wait_result = child.wait();
+    match group_result {
+        Ok(()) => wait_result,
+        Err(group_error) => match signal_bounded_process_group(pid, "-0") {
+            Ok(false) => wait_result,
+            Ok(true) => wait_result.and(Err(group_error)),
+            Err(error) => Err(error),
+        },
+    }
 }
 
 fn read_capped<R: Read>(
@@ -768,12 +645,6 @@ fn read_capped<R: Read>(
             return Ok(output);
         }
     }
-}
-
-fn join_command_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
-    reader
-        .join()
-        .map_err(|_| io::Error::other("aws cli output reader panicked"))?
 }
 
 enum BoundedFileReadError {
@@ -809,7 +680,7 @@ fn resolve_profile_credentials() -> CredentialProviderResult<Option<ResolvedCred
         command.arg("--profile").arg(profile_name);
     }
 
-    let output = run_bounded_command(command)
+    let output = run_bounded_command(command, AWS_CLI_COMMAND_TIMEOUT)
         .map_err(|_| provider_error_message(CredentialProviderErrorKind::AwsCliRunFailed))?;
     if output.timed_out {
         return Err(provider_error_message(
@@ -827,15 +698,12 @@ fn resolve_profile_credentials() -> CredentialProviderResult<Option<ResolvedCred
         serde_json::from_slice(&output.stdout).map_err(|_| {
             provider_error_message(CredentialProviderErrorKind::InvalidAwsCliCredentialJson)
         })?;
-    metadata_to_credentials(
-        MetadataCredentialsResponse {
-            access_key_id: parsed.access_key_id,
-            secret_access_key: parsed.secret_access_key,
-            token: parsed.session_token,
-            expiration: parsed.expiration,
-        },
-        AWS_CLI_CREDENTIAL_PROVIDER_NAME,
-    )
+    metadata_to_credentials(MetadataCredentialsResponse {
+        access_key_id: parsed.access_key_id,
+        secret_access_key: parsed.secret_access_key,
+        token: parsed.session_token,
+        expiration: parsed.expiration,
+    })
     .map(Some)
 }
 
@@ -855,6 +723,7 @@ fn blocking_metadata_http_client() -> CredentialProviderResult<reqwest::blocking
     reqwest::blocking::Client::builder()
         .connect_timeout(METADATA_CONNECT_TIMEOUT)
         .timeout(METADATA_REQUEST_TIMEOUT)
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| provider_error_message(CredentialProviderErrorKind::ProviderClientInitFailed))
@@ -889,7 +758,7 @@ fn resolve_ecs_task_credentials_with_blocking_client(
         provider_error_message(CredentialProviderErrorKind::MetadataCredentialsJsonInvalid)
     })?;
 
-    metadata_to_credentials(payload, ECS_TASK_METADATA_PROVIDER_NAME).map(Some)
+    metadata_to_credentials(payload).map(Some)
 }
 
 fn resolve_imds_credentials_with_blocking_client(
@@ -975,7 +844,7 @@ fn resolve_imds_credentials_with_blocking_client(
         provider_error_message(CredentialProviderErrorKind::MetadataCredentialsJsonInvalid)
     })?;
 
-    metadata_to_credentials(payload, IMDS_PROVIDER_NAME).map(Some)
+    metadata_to_credentials(payload).map(Some)
 }
 
 fn requested_profile_name() -> Option<String> {
@@ -1091,6 +960,11 @@ pub fn resolve_ecs_task_credentials_uri() -> CredentialProviderResult<Option<Url
 }
 
 pub fn validate_ecs_full_uri(uri: &Url) -> CredentialProviderResult<()> {
+    if !uri.username().is_empty() || uri.password().is_some() {
+        return Err(invalid_configuration_message(
+            CredentialProviderErrorKind::EcsFullUriRejectsUserinfo,
+        ));
+    }
     match uri.scheme() {
         "https" => Ok(()),
         "http" => {
@@ -1158,7 +1032,6 @@ fn ec2_metadata_is_disabled() -> bool {
 
 fn metadata_to_credentials(
     response: MetadataCredentialsResponse,
-    provider_name: &'static str,
 ) -> CredentialProviderResult<ResolvedCredentials> {
     if response.access_key_id.trim().is_empty() || response.secret_access_key.trim().is_empty() {
         return Err(provider_error_message(
@@ -1174,11 +1047,12 @@ fn metadata_to_credentials(
 
     Ok(ResolvedCredentials {
         credentials: Credentials::new(
-            response.access_key_id,
-            response.secret_access_key,
-            response.token,
+            AwsStaticCredentials {
+                access_key_id: response.access_key_id,
+                secret_access_key: response.secret_access_key,
+                session_token: response.token,
+            },
             expires_after,
-            provider_name,
         ),
         refresh_after,
     })
@@ -1197,8 +1071,8 @@ pub fn half_life_refresh_after(
 }
 
 fn parse_expiration_datetime(value: &str) -> Option<SystemTime> {
-    let parsed = DateTime::from_str(value, Format::DateTime).ok()?;
-    SystemTime::try_from(parsed).ok()
+    let parsed = DateTime::parse_from_rfc3339(value).ok()?;
+    Some(parsed.into())
 }
 
 pub(crate) fn metadata_refresh_after(
@@ -1249,11 +1123,5 @@ fn not_loaded_error(kind: CredentialProviderErrorKind) -> CredentialProviderErro
 
 #[must_use]
 pub fn static_credentials(creds: &AwsStaticCredentials) -> Credentials {
-    Credentials::new(
-        creds.access_key_id.clone(),
-        creds.secret_access_key.clone(),
-        creds.session_token.clone(),
-        None,
-        STATIC_PROVIDER_NAME,
-    )
+    Credentials::new(creds.clone(), None)
 }

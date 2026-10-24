@@ -1,14 +1,15 @@
 use std::time::Duration;
 
-use crate::{JwtDecodeError, JwtDecodeErrorKind, PolicyErrorKind, Result, TokenKind};
-
-const DEFAULT_LEEWAY: Duration = Duration::from_secs(30);
+use crate::{
+    JwtDecodeError, JwtDecodeErrorKind, PolicyErrorKind, TokenKind, constants::DEFAULT_LEEWAY,
+    error::Result,
+};
 
 #[derive(Debug, Clone)]
 pub struct VerificationPolicy {
     pub(crate) token_kind: TokenKind,
     pub(crate) issuer: String,
-    pub(crate) audience: Option<String>,
+    pub(crate) audiences: Option<Vec<String>>,
     pub(crate) require_token_type: bool,
     pub(crate) validate_access_typ: bool,
     pub(crate) token_type_claim: String,
@@ -52,11 +53,17 @@ impl VerificationPolicy {
 }
 
 #[derive(Debug, Clone)]
+enum AudienceRequirement {
+    Unconfigured,
+    Unchecked,
+    AnyOf(Vec<String>),
+}
+
+#[derive(Debug, Clone)]
 pub struct VerificationPolicyBuilder {
     token_kind: TokenKind,
     issuer: Option<String>,
-    audience: Option<String>,
-    require_audience: bool,
+    audience_requirement: AudienceRequirement,
     require_token_type: bool,
     validate_access_typ: bool,
     token_type_claim: String,
@@ -74,8 +81,7 @@ impl VerificationPolicyBuilder {
         Self {
             token_kind,
             issuer: None,
-            audience: None,
-            require_audience: true,
+            audience_requirement: AudienceRequirement::Unconfigured,
             require_token_type: true,
             validate_access_typ: token_kind == TokenKind::Access,
             token_type_claim: String::new(),
@@ -94,15 +100,34 @@ impl VerificationPolicyBuilder {
         Ok(self)
     }
 
-    pub fn audience(mut self, audience: impl Into<String>) -> Result<Self> {
-        self.audience = Some(Self::non_empty(audience.into(), "audience")?);
+    pub fn audience(self, audience: impl Into<String>) -> Result<Self> {
+        let audience: String = audience.into();
+        self.audiences([audience])
+    }
+
+    /// Accept a token addressed to any configured audience. The caller owns
+    /// application-specific configuration limits; empty lists or values fail.
+    pub fn audiences<I, S>(mut self, audiences: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let audiences = audiences
+            .into_iter()
+            .map(|value| Self::non_empty(value.into(), "audience"))
+            .collect::<Result<Vec<_>>>()?;
+        if audiences.is_empty() {
+            return Err(JwtDecodeError::new(JwtDecodeErrorKind::PolicyInvalid(
+                PolicyErrorKind::MissingAudience,
+            )));
+        }
+        self.audience_requirement = AudienceRequirement::AnyOf(audiences);
         Ok(self)
     }
 
     #[must_use]
     pub fn without_audience(mut self) -> Self {
-        self.audience = None;
-        self.require_audience = false;
+        self.audience_requirement = AudienceRequirement::Unchecked;
         self
     }
 
@@ -164,11 +189,12 @@ impl VerificationPolicyBuilder {
     }
 
     pub fn build(self) -> Result<VerificationPolicy> {
+        self.validate_duration_ranges()?;
         let (token_type_claim, token_type_value) = self.token_type_policy()?;
         Ok(VerificationPolicy {
             token_kind: self.token_kind,
             issuer: self.required_issuer()?,
-            audience: self.required_audience()?,
+            audiences: self.required_audiences()?,
             require_token_type: self.require_token_type,
             validate_access_typ: self.validate_access_typ,
             token_type_claim,
@@ -180,6 +206,26 @@ impl VerificationPolicyBuilder {
             allowed_header_types: self.allowed_header_types,
             require_issued_at: self.require_issued_at,
         })
+    }
+
+    fn validate_duration_ranges(&self) -> Result<()> {
+        if self.require_token_type
+            && self.token_type_claim == "token_type"
+            && self.token_type_value == "access_token"
+            && self.leeway > Duration::from_secs(oauth_dpop::MAX_ACCESS_TOKEN_EXPIRY_LEEWAY_SECONDS)
+        {
+            return Err(Self::out_of_range("leeway"));
+        }
+        if i64::try_from(self.leeway.as_secs()).is_err() {
+            return Err(Self::out_of_range("leeway"));
+        }
+        if self
+            .max_issued_age
+            .is_some_and(|duration| i64::try_from(duration.as_secs()).is_err())
+        {
+            return Err(Self::out_of_range("max_issued_age"));
+        }
+        Ok(())
     }
 
     fn without_token_type(mut self) -> Self {
@@ -213,15 +259,14 @@ impl VerificationPolicyBuilder {
         })
     }
 
-    fn required_audience(&self) -> Result<Option<String>> {
-        if !self.require_audience {
-            return Ok(None);
+    fn required_audiences(&self) -> Result<Option<Vec<String>>> {
+        match &self.audience_requirement {
+            AudienceRequirement::Unchecked => Ok(None),
+            AudienceRequirement::AnyOf(audiences) => Ok(Some(audiences.clone())),
+            AudienceRequirement::Unconfigured => Err(JwtDecodeError::new(
+                JwtDecodeErrorKind::PolicyInvalid(PolicyErrorKind::MissingAudience),
+            )),
         }
-        self.audience.clone().map(Some).ok_or_else(|| {
-            JwtDecodeError::new(JwtDecodeErrorKind::PolicyInvalid(
-                PolicyErrorKind::MissingAudience,
-            ))
-        })
     }
 
     fn non_empty(value: String, name: &'static str) -> Result<String> {
@@ -231,6 +276,12 @@ impl VerificationPolicyBuilder {
         Err(JwtDecodeError::new(JwtDecodeErrorKind::PolicyInvalid(
             PolicyErrorKind::EmptyValue(name),
         )))
+    }
+
+    fn out_of_range(name: &'static str) -> JwtDecodeError {
+        JwtDecodeError::new(JwtDecodeErrorKind::PolicyInvalid(
+            PolicyErrorKind::OutOfRange(name),
+        ))
     }
 }
 

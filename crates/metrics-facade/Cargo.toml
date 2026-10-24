@@ -13,15 +13,30 @@ categories.workspace = true
 license.workspace = true
 
 [features]
-default = ["request-cost"]
+default = ["buffered-metering", "http-observer", "request-cost"]
+http-observer = ["dep:http-request"]
 request-cost = ["dep:tokio"]
+buffered-metering = ["request-cost", "dep:buffered-writes"]
+buffered-ec2 = ["buffered-metering", "buffered-writes/ec2"]
+buffered-disk = ["buffered-metering", "buffered-writes/disk"]
+buffered-valkey = ["buffered-metering", "buffered-writes/valkey"]
+buffered-lambda = ["buffered-metering", "buffered-writes/lambda", "dep:thiserror"]
+buffered-sqs = ["buffered-metering", "buffered-writes/sqs"]
 
 [dependencies]
 http = { workspace = true }
 metrics = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+buffered-writes = { workspace = true, optional = true }
+http-request = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

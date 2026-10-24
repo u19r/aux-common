@@ -1,11 +1,12 @@
 use std::{
+    cell::Cell,
     fs::OpenOptions,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
-const LOG_DESTINATION_STDOUT: &str = "stdout";
+use super::constants::LOG_DESTINATION_STDOUT;
 
 #[derive(Debug)]
 pub enum WideLogInitError {
@@ -30,12 +31,16 @@ impl std::fmt::Display for WideLogInitError {
 
 impl std::error::Error for WideLogInitError {}
 
-pub(crate) type WideLogSink = Arc<dyn Fn(String) + Send + Sync>;
+pub type WideLogSink = Arc<dyn Fn(String) + Send + Sync>;
+
+thread_local! {
+    static REPORTING_SINK_FAILURE: Cell<bool> = const { Cell::new(false) };
+}
 
 pub(crate) fn build_log_sink(destination: &str) -> Result<WideLogSink, WideLogInitError> {
     let trimmed = destination.trim();
     if trimmed == LOG_DESTINATION_STDOUT {
-        return Ok(Arc::new(|line| println!("{line}")));
+        return Ok(stdout_sink());
     }
     if !Path::new(trimmed).is_absolute() {
         return Err(WideLogInitError::InvalidDestination);
@@ -54,12 +59,43 @@ pub(crate) fn build_log_sink(destination: &str) -> Result<WideLogSink, WideLogIn
     let file = Arc::new(Mutex::new(file));
 
     Ok(Arc::new(move |line| {
-        let Ok(mut handle) = file.lock() else {
-            eprintln!("wide_log file sink lock poisoned");
-            return;
+        let result = match file.lock() {
+            Ok(mut handle) => writeln!(&mut *handle, "{line}"),
+            Err(_) => {
+                report_sink_failure("sink_lock_poisoned");
+                return;
+            }
         };
-        if writeln!(&mut *handle, "{line}").is_err() {
-            eprintln!("wide_log failed to write log line");
+        if result.is_err() {
+            report_sink_failure("sink_write_failed");
         }
     }))
+}
+
+fn stdout_sink() -> WideLogSink {
+    Arc::new(|line| {
+        // This is the explicitly configured telemetry destination.
+        // Initialization and configuration failures are returned to the caller
+        // instead of printed here.
+        let result = {
+            let mut handle = io::stdout().lock();
+            handle
+                .write_all(line.as_bytes())
+                .and_then(|()| handle.write_all(b"\n"))
+        };
+        if result.is_err() {
+            report_sink_failure("sink_write_failed");
+        }
+    })
+}
+
+fn report_sink_failure(error_kind: &'static str) {
+    REPORTING_SINK_FAILURE.with(|reporting| {
+        if reporting.replace(true) {
+            return;
+        }
+
+        tracing::error!(target = "wide_log", error_kind, "wide log sink failed");
+        reporting.set(false);
+    });
 }

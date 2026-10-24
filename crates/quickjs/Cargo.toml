@@ -1,0 +1,36 @@
+[package]
+name = "quickjs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/u19r/aux-common"
+description = "Private Wasm producer for the javascript crate"
+publish = false
+
+[workspace]
+
+[workspace.lints.clippy]
+all = "warn"
+
+[workspace.lints.rust]
+dead_code = "warn"
+unused_imports = "warn"
+unused_variables = "warn"
+unused_must_use = "warn"
+
+[dependencies]
+javascript = { path = "../javascript", default-features = false }
+rquickjs = "=0.14.0"
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+strip = true
+
+[lints]
+workspace = true
+
+[workspace.package]
+rust-version = "1.99.1"

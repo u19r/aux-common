@@ -1,0 +1,31 @@
+[package]
+name = "oauth-dpop"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Storage-free OAuth DPoP proof and presenter validation"
+
+[features]
+test-support = ["dep:p256"]
+docs = ["dep:utoipa"]
+
+[dependencies]
+base64 = { workspace = true }
+http = { workspace = true }
+jose-core = { path = "../jose-core", default-features = false }
+p256 = { workspace = true, features = ["ecdsa"], optional = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+utoipa = { workspace = true, optional = true }
+
+[dev-dependencies]
+p256 = { workspace = true, features = ["ecdsa"] }
+
+[lints]
+workspace = true

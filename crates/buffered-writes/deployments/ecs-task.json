@@ -1,0 +1,16 @@
+{
+  "family": "buffered-writes-demo",
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "cpu": "256",
+  "memory": "512",
+  "runtimePlatform": {"operatingSystemFamily": "LINUX", "cpuArchitecture": "ARM64"},
+  "containerDefinitions": [{
+    "name": "buffered-host",
+    "image": "buffered-writes-host:local",
+    "essential": true,
+    "stopTimeout": 30,
+    "readonlyRootFilesystem": true,
+    "environment": [{"name": "BUFFERED_WRITES_SHUTDOWN_GRACE_MS", "value": "10000"}]
+  }]
+}

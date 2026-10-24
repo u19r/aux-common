@@ -95,6 +95,7 @@ fn given_valid_assertion_when_verifying_then_return_result_and_counter() {
         credential_id: b"credential",
         previous_sign_count: 4,
         policy: &policy,
+        user_handle: None,
     })
     .expect("valid assertion");
 
@@ -132,6 +133,7 @@ fn given_changed_challenge_when_asserting_then_reject_without_success() {
             credential_id: b"credential",
             previous_sign_count: 4,
             policy: &policy,
+            user_handle: None,
         }),
         Err(WebAuthnError::ChallengeMismatch)
     ));
@@ -173,6 +175,7 @@ fn given_each_counter_transition_when_asserting_then_return_status() {
             credential_id: b"credential",
             previous_sign_count: previous,
             policy: &policy,
+            user_handle: None,
         })
         .expect("valid assertion counter transition");
         assert_eq!(result.sign_count_status, expected);

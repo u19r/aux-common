@@ -1,15 +1,19 @@
 [package]
-name = "telemetry"
+rust-version.workspace = true
+name = "aux-telemetry"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
 publish = false
 
+[lib]
+name = "telemetry"
+
 [dependencies]
 axum = { workspace = true }
 axum-prometheus = { workspace = true }
 http = { workspace = true }
-metrics-facade = { workspace = true, features = ["request-cost"] }
+metrics-facade = { workspace = true, features = ["http-observer", "request-cost"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 subtle = { workspace = true }
@@ -21,6 +25,8 @@ uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 alloc-counter = { workspace = true }
+futures-util = { workspace = true }
+metrics-facade = { workspace = true, features = ["buffered-metering"] }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }
 

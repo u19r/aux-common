@@ -1,0 +1,50 @@
+[package]
+publish = false
+autotests = false
+name = "bg-jobs-conformance"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Reusable conformance and fault-injection harnesses for durable job stores."
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[features]
+bdd = []
+
+[dependencies]
+bg-jobs = { workspace = true, features = ["test-support"] }
+bytes = { workspace = true }
+
+[dev-dependencies]
+alloc-counter = { workspace = true }
+aws-credentials = { workspace = true }
+bg-jobs-aws = { workspace = true }
+bg-jobs-http = { workspace = true }
+cucumber = { workspace = true }
+http = { workspace = true }
+http-request = { workspace = true }
+serde = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+quint-connect = { workspace = true }
+quint-connect-guard = { workspace = true }
+quint-rendered-parser = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time"] }
+
+[[test]]
+name = "conformance_tests"
+
+[[test]]
+name = "perf_realistic"
+
+[[test]]
+name = "bdd"
+harness = false
+required-features = ["bdd"]
+
+[lints]
+workspace = true

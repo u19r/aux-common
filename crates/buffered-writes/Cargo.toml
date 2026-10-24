@@ -1,0 +1,76 @@
+[package]
+publish = false
+name = "buffered-writes"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Bounded buffered write delivery, retention, outage fallback, and lifecycle adapters."
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[features]
+default = ["tokio"]
+disk = ["tokio"]
+ec2 = ["tokio", "dep:http", "dep:http-request", "dep:url"]
+lambda = ["tokio", "dep:http", "dep:http-request", "dep:url", "dep:rustix"]
+sqs = [
+    "tokio",
+    "dep:aws-credentials",
+    "dep:aws-sigv4-signing",
+    "dep:http",
+    "dep:http-request",
+    "dep:url",
+]
+tokio = ["dep:tokio"]
+valkey = ["tokio", "dep:redis", "dep:url"]
+
+[dependencies]
+aws-credentials = { workspace = true, optional = true }
+aws-sigv4-signing = { workspace = true, optional = true }
+base64 = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
+chrono = { workspace = true }
+futures-timer = { workspace = true }
+futures-util = { workspace = true }
+http = { workspace = true, optional = true }
+http-request = { workspace = true, optional = true }
+rand = { workspace = true }
+redis = { workspace = true, optional = true }
+serde = { workspace = true, features = ["rc"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+uuid = { workspace = true, features = ["serde", "v4", "v7"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, optional = true }
+
+[dev-dependencies]
+alloc-counter = { workspace = true }
+http = { workspace = true }
+http-request = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+url = { workspace = true }
+
+[lints]
+workspace = true
+
+[[example]]
+name = "persistent-host"
+path = "examples/persistent_host/main.rs"
+required-features = ["tokio"]
+
+[[example]]
+name = "lambda-extension"
+path = "examples/lambda_extension/main.rs"
+required-features = ["lambda"]
+
+[[example]]
+name = "lambda-runtime"
+path = "examples/lambda_runtime/main.rs"
+required-features = ["lambda"]

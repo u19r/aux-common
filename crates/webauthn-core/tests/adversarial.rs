@@ -52,6 +52,7 @@ fn adversarial_deterministic_arbitrary_bytes_never_panic() {
                 credential_id: b"credential",
                 previous_sign_count: 0,
                 policy: &policy,
+                user_handle: None,
             })
         }));
         assert!(

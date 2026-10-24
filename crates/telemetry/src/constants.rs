@@ -1,5 +1,55 @@
 use metrics_facade::{CounterMetric, HistogramMetric};
 
+pub(crate) const DEFAULT_LOG_DESTINATION: &str = "stdout";
+pub(crate) const DEFAULT_LOG_FILTER: &str = "warn";
+pub(crate) const DEFAULT_SLOW_OPERATION_THRESHOLD_MS: u64 = 500;
+pub(crate) const DEFAULT_METRICS_PATH: &str = "/internal/metrics";
+pub(crate) const DEFAULT_TOP_LEVEL_FIELD_ALLOWLIST: &[&str] = &[
+    FIELD_FEATURE,
+    FIELD_OPERATION_NAME,
+    FIELD_REQUEST_ID,
+    FIELD_TRACE_ID,
+    FIELD_SOURCE_IP,
+    FIELD_TENANT_ID,
+    FIELD_ORG_ID,
+    FIELD_USER_ID,
+    "method",
+    "path",
+    "host",
+    "status_code",
+    "duration_ms",
+    "request_bytes",
+    "response_bytes",
+    FIELD_SPAN_ID,
+    FIELD_TRACE_FLAGS,
+];
+pub(crate) const DEFAULT_SENSITIVE_FIELD_BLOCKLIST: &[&str] = &[
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "set_cookie",
+    "x-api-key",
+    "api-key",
+    "api_key",
+    "access_token",
+    "accessToken",
+    "refresh_token",
+    "refreshToken",
+    "id_token",
+    "idToken",
+    "client_secret",
+    "clientSecret",
+    "apiKey",
+    "privateKey",
+    "secretKey",
+    "signingKey",
+    "bearerToken",
+    "password",
+    "secret",
+    "token",
+];
+pub(crate) const UNMATCHED_OPERATION: &str = "_unmatched";
+
 pub const REQUEST_LATENCY_METRIC: HistogramMetric = HistogramMetric::RequestLatencyMetric;
 pub const HTTP_REQUEST_BYTES_TOTAL_METRIC: CounterMetric =
     CounterMetric::HttpRequestBytesTotalMetric;

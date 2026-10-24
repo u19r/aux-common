@@ -26,4 +26,6 @@ pub enum WebAuthnError {
     UnsupportedAttestation,
     #[error("invalid WebAuthn signature")]
     InvalidSignature,
+    #[error("user handle does not match")]
+    UserHandleMismatch,
 }

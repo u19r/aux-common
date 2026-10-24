@@ -1,7 +1,7 @@
 # crypto-hash
 
-`crypto-hash` contains small, model-neutral hashing primitives for
-applications. It implements SHA-256, HMAC-SHA256, salted SHA3-512
+Small, model-neutral hashing primitives for
+applications. Implements SHA-256, HMAC-SHA256, salted SHA3-512
 API-key hashes, and an explicit Argon2id password policy.
 
 The crate does not own persistence, password-reset or rate-limit decisions,

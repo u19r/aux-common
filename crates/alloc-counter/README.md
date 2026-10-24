@@ -3,20 +3,12 @@
 `alloc-counter` is a test-only allocation measurement harness for this workspace.
 
 It provides:
+
 - `#[alloc_counter::count_allocations]` attribute macro for tests (sync and async).
 - A counting global allocator scoped by `AllocationGuard` windows.
 - JSON output suitable for baseline vs experiment comparison.
 
-## Add to a crate
-
-In the target crate's `Cargo.toml`:
-
-```toml
-[dev-dependencies]
-alloc-counter = { workspace = true }
-```
-
-## Use the attribute macro
+## Usage
 
 ```rust
 #[test]
@@ -37,7 +29,7 @@ async fn my_async_hot_path_tests() {
 Place `count_allocations` before the async test attribute so it wraps the async function before
 the test runtime expands it.
 
-Run with output enabled:
+Reports are written only when a report path is configured:
 
 ```bash
 cargo test -p <crate> <test_name> -- --nocapture --test-threads=1
@@ -51,6 +43,8 @@ Set `AUX_ALLOC_COUNTER_REPORT_PATH` to append one JSON object per report:
 AUX_ALLOC_COUNTER_REPORT_PATH=/tmp/alloc.jsonl \
 cargo test -p <crate> <test_name> -- --nocapture --test-threads=1
 ```
+
+The library does not write reports to process stdout or stderr. Read the JSON file.
 
 ## JSON schema
 

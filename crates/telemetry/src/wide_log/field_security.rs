@@ -7,9 +7,8 @@ use serde::{
 use serde_json::Value;
 use tracing::field::{Field, Visit};
 
+use super::constants::DEFAULT_FIELD_CAPACITY;
 use crate::{config::FieldEmissionMode, safe_value::is_safe_recording};
-
-const DEFAULT_FIELD_CAPACITY: usize = 12;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SpanFields {

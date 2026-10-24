@@ -4,21 +4,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::Bytes;
-use futures_util::{StreamExt, future::BoxFuture};
+use futures_util::future::BoxFuture;
 use http::{HeaderMap, header::CACHE_CONTROL};
-use reqwest::{Client, Method, Request, RequestBuilder, Response, StatusCode, Url};
+use reqwest::{Client, Method, Request, RequestBuilder, StatusCode, Url};
 use serde::de::DeserializeOwned;
 use tracing::{debug, warn};
 
 use crate::{
-    constants::{
-        DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_ERROR_BODY_LENGTH_BYTES,
-        DEFAULT_MAX_RESPONSE_LENGTH_BYTES, DEFAULT_REQUEST_TIMEOUT, LABEL_METHOD, LABEL_OUTCOME,
-        LABEL_STATUS_CLASS, OUTCOME_ERROR, OUTCOME_RETRY, OUTCOME_SUCCESS, STATUS_CLASS_2XX,
-        STATUS_CLASS_3XX, STATUS_CLASS_4XX, STATUS_CLASS_5XX, STATUS_CLASS_ERROR,
-    },
+    constants::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT},
     error::{HttpRequestError, HttpRequestErrorKind, Result},
+    observer::{HttpRequestAttempt, HttpRequestObserver, active_http_request_observer},
+    response::HttpResponse,
     retry::RetryConfig,
 };
 
@@ -34,6 +30,25 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
     /// the implementation enforces the same no-redirect boundary as the
     /// built-in reqwest transport.
     fn redirects_disabled(&self) -> bool {
+        false
+    }
+
+    /// Reports whether this transport enforces the caller's approved
+    /// destination policy before dispatch.
+    ///
+    /// Custom transports default to `false`; callers must opt in only when
+    /// the implementation enforces the same destination boundary as the
+    /// built-in tenant client.
+    fn destination_policy_enforced(&self) -> bool {
+        false
+    }
+
+    /// Reports whether this transport enforces the request's total deadline.
+    ///
+    /// Custom transports default to `false`; callers must opt in only when
+    /// the implementation bounds connection, response, and body work by the
+    /// request deadline.
+    fn deadline_enforced(&self) -> bool {
         false
     }
 }
@@ -71,19 +86,20 @@ pub struct HttpClient {
     client: Client,
     retry: RetryConfig,
     transport: Arc<dyn Transport>,
+    observer: Option<Arc<dyn HttpRequestObserver>>,
     redirects_disabled: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct RequestAttemptDiagnostics<'a> {
-    host: &'a str,
+pub(crate) struct RequestAttemptDiagnostics {
+    host_present: bool,
     path_length: usize,
     query_present: bool,
 }
 
-pub(crate) fn request_attempt_diagnostics(url: &Url) -> RequestAttemptDiagnostics<'_> {
+pub(crate) fn request_attempt_diagnostics(url: &Url) -> RequestAttemptDiagnostics {
     RequestAttemptDiagnostics {
-        host: url.host_str().unwrap_or_default(),
+        host_present: url.host_str().is_some(),
         path_length: url.path().len(),
         query_present: url.query().is_some(),
     }
@@ -93,6 +109,7 @@ pub struct HttpClientBuilder {
     builder: reqwest::ClientBuilder,
     retry: RetryConfig,
     transport: Option<Arc<dyn Transport>>,
+    observer: Option<Arc<dyn HttpRequestObserver>>,
 }
 
 impl fmt::Debug for HttpClient {
@@ -102,6 +119,7 @@ impl fmt::Debug for HttpClient {
             .field("client", &"[REDACTED]")
             .field("retry", &self.retry)
             .field("transport", &"[REDACTED]")
+            .field("observer_configured", &self.observer.is_some())
             .field("redirects_disabled", &self.redirects_disabled)
             .finish()
     }
@@ -114,6 +132,7 @@ impl fmt::Debug for HttpClientBuilder {
             .field("builder", &"[REDACTED]")
             .field("retry", &self.retry)
             .field("transport_configured", &self.transport.is_some())
+            .field("observer_configured", &self.observer.is_some())
             .finish()
     }
 }
@@ -127,6 +146,22 @@ impl HttpClientBuilder {
                 .timeout(DEFAULT_REQUEST_TIMEOUT),
             retry: RetryConfig::default(),
             transport: None,
+            observer: None,
+        }
+    }
+
+    /// Keep large downloads streaming with bounded connection and idle reads.
+    /// Unlike the default whole-request deadline, the read deadline resets as
+    /// bytes arrive. Callers own any deadline for the complete operation.
+    #[must_use]
+    pub fn for_streaming() -> Self {
+        Self {
+            builder: Client::builder()
+                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+                .read_timeout(DEFAULT_REQUEST_TIMEOUT),
+            retry: RetryConfig::default(),
+            transport: None,
+            observer: None,
         }
     }
 
@@ -150,6 +185,19 @@ impl HttpClientBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_observer<O>(mut self, observer: O) -> Self
+    where O: HttpRequestObserver {
+        self.observer = Some(Arc::new(observer));
+        self
+    }
+
+    #[must_use]
+    pub fn with_shared_observer(mut self, observer: Arc<dyn HttpRequestObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
     pub fn build(self) -> Result<HttpClient> {
         let client = self
             .builder
@@ -164,6 +212,7 @@ impl HttpClientBuilder {
             client,
             retry: self.retry,
             transport,
+            observer: self.observer,
             redirects_disabled,
         })
     }
@@ -187,11 +236,21 @@ impl HttpClient {
 
     #[must_use]
     pub fn with_client(client: Client, retry: RetryConfig) -> Self {
+        Self::with_client_and_observer(client, retry, None)
+    }
+
+    #[must_use]
+    pub(crate) fn with_client_and_observer(
+        client: Client,
+        retry: RetryConfig,
+        observer: Option<Arc<dyn HttpRequestObserver>>,
+    ) -> Self {
         let transport = Arc::new(ReqwestTransport::new(client.clone()));
         Self {
             client,
             retry,
             transport,
+            observer,
             redirects_disabled: false,
         }
     }
@@ -199,6 +258,13 @@ impl HttpClient {
     #[must_use]
     pub fn redirects_disabled(&self) -> bool {
         self.redirects_disabled
+    }
+
+    /// Whether this client may transparently retry a request with this method.
+    /// Protocol adapters use this capability to keep attempt ownership
+    /// explicit.
+    pub fn can_retry_method(&self, method: &Method) -> bool {
+        self.retry.max_retries > 0 && self.retry.should_retry_method(method)
     }
 
     #[must_use]
@@ -293,135 +359,145 @@ impl HttpClient {
         self.execute(request).await
     }
 
-    #[allow(clippy::too_many_lines)]
     pub async fn execute(&self, request: Request) -> Result<HttpResponse> {
-        let method = request.method().clone();
-        let method_label = method.as_str().to_string();
-        let url = request.url().clone();
-        let diagnostics = request_attempt_diagnostics(&url);
-
-        let can_retry_method = self.retry.should_retry_method(&method);
-        let mut attempt: u32 = 0;
-        let can_retry_body = request.try_clone().is_some();
-        let mut base_request = Some(request);
-        let max_retries = if can_retry_body {
-            self.retry.max_retries
-        } else {
-            0
-        };
-
+        let mut attempts = RequestAttempts::new(request, &self.retry, self.observer.as_ref());
         loop {
-            let request = if attempt == 0 {
-                let Some(base) = base_request.take() else {
-                    return Err(HttpRequestError::RequestNotCloneable);
-                };
-                match base.try_clone() {
-                    Some(clone) => {
-                        base_request = Some(base);
-                        clone
-                    }
-                    None => base,
-                }
-            } else {
-                match base_request.as_ref().and_then(reqwest::Request::try_clone) {
-                    Some(clone) => clone,
-                    None => return Err(HttpRequestError::RequestNotCloneable),
-                }
-            };
-
-            debug!(
-                attempt,
-                method = %method,
-                host = diagnostics.host,
-                path_length = diagnostics.path_length,
-                query_present = diagnostics.query_present,
-                "http request attempt"
-            );
-
+            let request = attempts.next_request()?;
             let start = Instant::now();
-            match self.transport.send(request).await {
-                Ok(response) => {
-                    let status = response.status();
-                    let retrying =
-                        can_retry_method && attempt < max_retries && should_retry_status(status);
-                    record_metrics(
-                        method_label.as_str(),
-                        Some(status),
-                        if retrying {
-                            OUTCOME_RETRY
-                        } else {
-                            OUTCOME_SUCCESS
-                        },
-                        start,
-                    );
-
-                    if retrying {
-                        attempt += 1;
-                        metrics_facade::counter!(
-                            metrics_facade::CounterMetric::MetricHttpRequestRetries,
-                            LABEL_METHOD => method_label.clone()
-                        )
-                        .increment(1);
-                        let delay = retry_delay_for_response(
-                            &self.retry,
-                            &response,
-                            attempt.saturating_sub(1),
-                        );
-                        warn!(
-                            attempt,
-                            method = %method,
-                            status = %status,
-                            delay_ms = delay.as_millis(),
-                            "http request retrying after status"
-                        );
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-
-                    return Ok(response);
-                }
-                Err(error) => {
-                    let retrying =
-                        can_retry_method && attempt < max_retries && should_retry_error(&error);
-                    record_metrics(
-                        method_label.as_str(),
-                        None,
-                        if retrying {
-                            OUTCOME_RETRY
-                        } else {
-                            OUTCOME_ERROR
-                        },
-                        start,
-                    );
-
-                    if retrying {
-                        attempt += 1;
-                        metrics_facade::counter!(
-                            metrics_facade::CounterMetric::MetricHttpRequestRetries,
-                            LABEL_METHOD => method_label.clone()
-                        )
-                        .increment(1);
-                        let delay = self.retry.backoff_delay(attempt.saturating_sub(1));
-                        warn!(
-                            attempt,
-                            method = %method,
-                            error_kind = ?error.kind(),
-                            delay_ms = delay.as_millis(),
-                            "http request retrying after error"
-                        );
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-
-                    metrics_facade::counter!(
-                        metrics_facade::CounterMetric::MetricHttpRequestErrors,
-                        LABEL_METHOD => method_label.clone()
-                    )
-                    .increment(1);
-                    return Err(error);
-                }
+            if let Some(result) = attempts
+                .finish(self.transport.send(request).await, start)
+                .await
+            {
+                return result;
             }
         }
+    }
+}
+
+struct RequestAttempts<'a> {
+    first_request: Option<Request>,
+    base_request: Option<Request>,
+    retry: &'a RetryConfig,
+    observer: Option<&'a Arc<dyn HttpRequestObserver>>,
+    method_label: &'static str,
+    diagnostics: RequestAttemptDiagnostics,
+    max_retries: u32,
+    attempt: u32,
+}
+
+impl<'a> RequestAttempts<'a> {
+    fn new(
+        request: Request,
+        retry: &'a RetryConfig,
+        observer: Option<&'a Arc<dyn HttpRequestObserver>>,
+    ) -> Self {
+        let first_request = request.try_clone();
+        let can_retry = first_request.is_some() && retry.should_retry_method(request.method());
+        let max_retries = if can_retry { retry.max_retries } else { 0 };
+        Self {
+            retry,
+            observer,
+            method_label: method_telemetry_label(request.method()),
+            diagnostics: request_attempt_diagnostics(request.url()),
+            max_retries,
+            attempt: 0,
+            first_request,
+            base_request: Some(request),
+        }
+    }
+
+    fn next_request(&mut self) -> Result<Request> {
+        let request = if self.attempt == 0 {
+            self.first_request
+                .take()
+                .or_else(|| self.base_request.take())
+                .ok_or(HttpRequestError::RequestNotCloneable)?
+        } else {
+            self.base_request
+                .as_ref()
+                .and_then(reqwest::Request::try_clone)
+                .ok_or(HttpRequestError::RequestNotCloneable)?
+        };
+        debug!(
+            attempt = self.attempt,
+            method = self.method_label,
+            host_present = self.diagnostics.host_present,
+            path_length = self.diagnostics.path_length,
+            query_present = self.diagnostics.query_present,
+            "http request attempt"
+        );
+        Ok(request)
+    }
+
+    async fn finish(
+        &mut self,
+        result: Result<HttpResponse>,
+        start: Instant,
+    ) -> Option<Result<HttpResponse>> {
+        let status = result.as_ref().ok().map(HttpResponse::status);
+        let retrying = self.attempt < self.max_retries
+            && (status.is_some_and(should_retry_status)
+                || result.as_ref().is_err_and(should_retry_error));
+        let observation = HttpRequestAttempt::new(
+            self.method_label,
+            status,
+            self.attempt,
+            retrying,
+            start.elapsed(),
+        );
+        match self.observer {
+            Some(observer) => observer.observe_attempt(observation),
+            None => active_http_request_observer().observe_attempt(observation),
+        }
+        if !retrying {
+            return Some(result);
+        }
+
+        self.attempt += 1;
+        let attempt = self.attempt;
+        let (status, error_kind, delay) = match result {
+            Ok(response) => {
+                let status = response.status();
+                let delay =
+                    retry_delay_for_response(self.retry, &response, attempt.saturating_sub(1));
+                (Some(status), None, delay)
+            }
+            Err(error) => (
+                None,
+                Some(error.kind()),
+                self.retry.backoff_delay(attempt.saturating_sub(1)),
+            ),
+        };
+        self.wait_for_retry(attempt, status, error_kind, delay)
+            .await;
+        None
+    }
+
+    async fn wait_for_retry(
+        &self,
+        attempt: u32,
+        status: Option<StatusCode>,
+        error_kind: Option<HttpRequestErrorKind>,
+        delay: Duration,
+    ) {
+        if let Some(status) = status {
+            warn!(
+                attempt,
+                method = self.method_label,
+                status = %status,
+                delay_ms = delay.as_millis(),
+                "http request retrying after status"
+            );
+        } else if let Some(error_kind) = error_kind {
+            warn!(
+                attempt,
+                method = self.method_label,
+                error_kind = ?error_kind,
+                delay_ms = delay.as_millis(),
+                "http request retrying after error"
+            );
+        }
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -524,182 +600,6 @@ impl HttpRequestBuilder {
     }
 }
 
-pub struct HttpResponse {
-    inner: HttpResponseInner,
-    max_body_size: Option<usize>,
-}
-
-enum HttpResponseInner {
-    Reqwest(Response),
-    Mock(MockResponse),
-}
-
-struct MockResponse {
-    status: StatusCode,
-    headers: HeaderMap,
-    url: Url,
-    body: Bytes,
-}
-
-impl HttpResponse {
-    #[must_use]
-    pub fn new(inner: Response, max_body_size: Option<usize>) -> Self {
-        Self::from_reqwest(inner).with_max_body_size(max_body_size)
-    }
-
-    #[must_use]
-    pub fn from_reqwest(inner: Response) -> Self {
-        Self {
-            inner: HttpResponseInner::Reqwest(inner),
-            max_body_size: Some(DEFAULT_MAX_RESPONSE_LENGTH_BYTES),
-        }
-    }
-
-    #[must_use]
-    pub fn from_mock(status: StatusCode, headers: HeaderMap, body: Vec<u8>, url: Url) -> Self {
-        Self {
-            inner: HttpResponseInner::Mock(MockResponse {
-                status,
-                headers,
-                url,
-                body: Bytes::from(body),
-            }),
-            max_body_size: Some(DEFAULT_MAX_RESPONSE_LENGTH_BYTES),
-        }
-    }
-
-    #[must_use]
-    pub fn with_max_body_size(mut self, max_body_size: Option<usize>) -> Self {
-        self.max_body_size = max_body_size;
-        self
-    }
-
-    pub fn status(&self) -> StatusCode {
-        match &self.inner {
-            HttpResponseInner::Reqwest(inner) => inner.status(),
-            HttpResponseInner::Mock(inner) => inner.status,
-        }
-    }
-
-    pub fn headers(&self) -> &HeaderMap {
-        match &self.inner {
-            HttpResponseInner::Reqwest(inner) => inner.headers(),
-            HttpResponseInner::Mock(inner) => &inner.headers,
-        }
-    }
-
-    pub fn url(&self) -> &Url {
-        match &self.inner {
-            HttpResponseInner::Reqwest(inner) => inner.url(),
-            HttpResponseInner::Mock(inner) => &inner.url,
-        }
-    }
-
-    pub fn error_for_status(self) -> Result<Self> {
-        if self.status().is_success() {
-            Ok(self)
-        } else {
-            Err(HttpRequestError::HttpStatus {
-                status: self.status(),
-                body: None,
-            })
-        }
-    }
-
-    pub fn error_for_status_ref(&self) -> Result<&Self> {
-        if self.status().is_success() {
-            Ok(self)
-        } else {
-            Err(HttpRequestError::HttpStatus {
-                status: self.status(),
-                body: None,
-            })
-        }
-    }
-
-    pub async fn error_for_status_with_body(mut self) -> Result<Self> {
-        if self.status().is_success() {
-            return Ok(self);
-        }
-        let status = self.status();
-        if self.max_body_size.is_none() {
-            self.max_body_size = Some(DEFAULT_MAX_ERROR_BODY_LENGTH_BYTES);
-        }
-        let body = match self.text().await {
-            Ok(body) => Some(body),
-            Err(err) => return Err(err),
-        };
-        Err(HttpRequestError::HttpStatus { status, body })
-    }
-
-    /// Extract the underlying response only when no buffered-body limit is set.
-    ///
-    /// A capped response cannot be converted without discarding its safety
-    /// invariant, so callers must stay on `bytes`, `text`, or `json` (or
-    /// explicitly opt out with `with_max_body_size(None)`).
-    pub fn into_reqwest(self) -> Option<Response> {
-        if self.max_body_size.is_some() {
-            return None;
-        }
-        match self.inner {
-            HttpResponseInner::Reqwest(inner) => Some(inner),
-            HttpResponseInner::Mock(_) => None,
-        }
-    }
-
-    pub async fn bytes(self) -> Result<Bytes> {
-        match self.inner {
-            HttpResponseInner::Reqwest(inner) => {
-                read_body_with_limit(inner, self.max_body_size).await
-            }
-            HttpResponseInner::Mock(inner) => read_mock_body(inner, self.max_body_size),
-        }
-    }
-
-    pub async fn text(self) -> Result<String> {
-        let bytes = self.bytes().await?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| HttpRequestError::Decode)
-    }
-
-    pub async fn json<T: DeserializeOwned>(self) -> Result<T> {
-        let bytes = self.bytes().await?;
-        serde_json::from_slice(&bytes).map_err(|_| HttpRequestError::Decode)
-    }
-}
-
-async fn read_body_with_limit(response: Response, limit: Option<usize>) -> Result<Bytes> {
-    if let Some(limit) = limit {
-        let mut stream = response.bytes_stream();
-        let mut bytes = Vec::new();
-        let mut size = 0usize;
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(HttpRequestError::from)?;
-            size = size.saturating_add(chunk.len());
-            if size > limit {
-                return Err(HttpRequestError::ResponseTooLarge { size, max: limit });
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-
-        Ok(Bytes::from(bytes))
-    } else {
-        response.bytes().await.map_err(HttpRequestError::from)
-    }
-}
-
-fn read_mock_body(response: MockResponse, limit: Option<usize>) -> Result<Bytes> {
-    if let Some(limit) = limit
-        && response.body.len() > limit
-    {
-        return Err(HttpRequestError::ResponseTooLarge {
-            size: response.body.len(),
-            max: limit,
-        });
-    }
-    Ok(response.body)
-}
-
 fn should_retry_status(status: StatusCode) -> bool {
     matches!(
         status,
@@ -787,35 +687,31 @@ fn should_retry_error(error: &HttpRequestError) -> bool {
     )
 }
 
-fn status_class(status: StatusCode) -> &'static str {
-    if status.is_success() {
-        STATUS_CLASS_2XX
-    } else if status.is_redirection() {
-        STATUS_CLASS_3XX
-    } else if status.is_client_error() {
-        STATUS_CLASS_4XX
-    } else if status.is_server_error() {
-        STATUS_CLASS_5XX
+/// Returns a bounded, low-cardinality label for an HTTP method.
+///
+/// Standard methods retain their protocol names. Extension methods are
+/// reported as `OTHER` so attacker-controlled method bytes never enter
+/// telemetry or diagnostics.
+pub fn method_telemetry_label(method: &Method) -> &'static str {
+    if *method == Method::GET {
+        "GET"
+    } else if *method == Method::POST {
+        "POST"
+    } else if *method == Method::PUT {
+        "PUT"
+    } else if *method == Method::PATCH {
+        "PATCH"
+    } else if *method == Method::DELETE {
+        "DELETE"
+    } else if *method == Method::HEAD {
+        "HEAD"
+    } else if *method == Method::OPTIONS {
+        "OPTIONS"
+    } else if *method == Method::TRACE {
+        "TRACE"
+    } else if *method == Method::CONNECT {
+        "CONNECT"
     } else {
-        STATUS_CLASS_ERROR
+        "OTHER"
     }
-}
-
-fn record_metrics(method: &str, status: Option<StatusCode>, outcome: &'static str, start: Instant) {
-    let status_label = status.map_or(STATUS_CLASS_ERROR, status_class);
-    let method_label = method.to_string();
-    metrics_facade::counter!(
-        metrics_facade::CounterMetric::MetricHttpRequestAttempts,
-        LABEL_METHOD => method_label.clone(),
-        LABEL_OUTCOME => outcome,
-        LABEL_STATUS_CLASS => status_label
-    )
-    .increment(1);
-    metrics_facade::histogram!(
-        metrics_facade::HistogramMetric::MetricHttpRequestLatencyMs,
-        LABEL_METHOD => method_label,
-        LABEL_OUTCOME => outcome,
-        LABEL_STATUS_CLASS => status_label
-    )
-    .record(start.elapsed().as_secs_f64() * 1000.0);
 }

@@ -4,7 +4,7 @@ use std::{
         Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use http::{
@@ -15,43 +15,26 @@ use serde::{Deserialize, Serialize};
 use tokio::task_local;
 
 use crate::{
+    constants::{
+        HEADER_COST_ANALYTICS_BYTES_WRITTEN, HEADER_COST_ANALYTICS_ROWS_DELETED,
+        HEADER_COST_ANALYTICS_ROWS_INSERTED, HEADER_COST_ANALYTICS_ROWS_UPDATED,
+        HEADER_COST_DATABASE_BREAKDOWN, HEADER_COST_DATABASE_CALLS,
+        HEADER_COST_DATABASE_MAX_PARALLELISM, HEADER_COST_DATABASE_SERIAL_WAVES,
+        HEADER_COST_DB_READ_BYTES, HEADER_COST_DB_READ_OPS, HEADER_COST_DB_WRITE_BYTES,
+        HEADER_COST_DB_WRITE_OPS, HEADER_COST_OPERATION, HEADER_COST_REMOTE_REQUEST_BYTES,
+        HEADER_COST_REMOTE_RESPONSE_BYTES, HEADER_COST_REMOTE_WAIT_MS, HEADER_COST_REQUEST_BYTES,
+        HEADER_COST_STORAGE_BREAKDOWN, HEADER_COST_WALL_MS, MAX_ACTIVE_REQUESTS,
+        MAX_DATABASE_BREAKDOWN_ENTRIES, MAX_OPERATION_BYTES, MAX_REQUEST_ID_BYTES,
+        MAX_STORAGE_BREAKDOWN_ENTRIES, MAX_STORAGE_BREAKDOWN_HEADER_BYTES,
+    },
     metrics::{CounterMetric, GaugeMetric, HistogramMetric},
     recorder::{MetricLabel, labels_are_valid},
 };
 
-const HEADER_COST_WALL_MS: &str = "x-aux-cost-wall-ms";
-const HEADER_COST_REMOTE_WAIT_MS: &str = "x-aux-cost-remote-wait-ms";
-const HEADER_COST_DB_READ_OPS: &str = "x-aux-cost-db-read-ops";
-const HEADER_COST_DB_WRITE_OPS: &str = "x-aux-cost-db-write-ops";
-const HEADER_COST_DB_READ_BYTES: &str = "x-aux-cost-db-read-bytes";
-const HEADER_COST_DB_WRITE_BYTES: &str = "x-aux-cost-db-write-bytes";
-const HEADER_COST_ANALYTICS_ROWS_INSERTED: &str = "x-aux-cost-analytics-rows-inserted";
-const HEADER_COST_ANALYTICS_ROWS_UPDATED: &str = "x-aux-cost-analytics-rows-updated";
-const HEADER_COST_ANALYTICS_ROWS_DELETED: &str = "x-aux-cost-analytics-rows-deleted";
-const HEADER_COST_ANALYTICS_BYTES_WRITTEN: &str = "x-aux-cost-analytics-bytes-written";
-const HEADER_COST_REQUEST_BYTES: &str = "x-aux-cost-request-bytes";
-const HEADER_COST_REMOTE_REQUEST_BYTES: &str = "x-aux-cost-remote-request-bytes";
-const HEADER_COST_REMOTE_RESPONSE_BYTES: &str = "x-aux-cost-remote-response-bytes";
-const HEADER_COST_STORAGE_BREAKDOWN: &str = "x-aux-cost-storage-breakdown";
-const HEADER_COST_DATABASE_CALLS: &str = "x-aux-cost-db-calls";
-const HEADER_COST_DATABASE_SERIAL_WAVES: &str = "x-aux-cost-db-serial-waves";
-const HEADER_COST_DATABASE_MAX_PARALLELISM: &str = "x-aux-cost-db-max-parallelism";
-const HEADER_COST_DATABASE_BREAKDOWN: &str = "x-aux-cost-db-breakdown";
-const HEADER_COST_OPERATION: &str = "x-aux-cost-operation";
-const COST_STABILIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const COST_STABILIZE_IDLE_WINDOW: Duration = Duration::from_millis(250);
-const COST_STABILIZE_TIMEOUT: Duration = Duration::from_secs(5);
-pub(crate) const MAX_REQUEST_ID_BYTES: usize = 256;
-pub(crate) const MAX_ACTIVE_REQUESTS: usize = 1_024;
-pub(crate) const MAX_STORAGE_BREAKDOWN_ENTRIES: usize = 256;
-pub(crate) const MAX_STORAGE_BREAKDOWN_HEADER_BYTES: usize = 16 * 1024;
-pub(crate) const MAX_DATABASE_BREAKDOWN_ENTRIES: usize = 128;
-pub(crate) const MAX_OPERATION_BYTES: usize = 512;
-
-type RequestCostCollectorHandle = Arc<Mutex<RequestCostCollector>>;
+pub(super) type RequestCostCollectorHandle = Arc<Mutex<RequestCostCollector>>;
 
 task_local! {
-    static REQUEST_COST_COLLECTOR: RequestCostCollectorHandle;
+    pub(super) static REQUEST_COST_COLLECTOR: RequestCostCollectorHandle;
 }
 
 #[derive(Clone, Copy)]
@@ -206,7 +189,9 @@ impl CostResponseHeaders {
         {
             insert_header_string(headers, HEADER_COST_DATABASE_BREAKDOWN, &serialized);
         }
-        if let Some(operation) = self.snapshot.operation.as_deref() {
+        if let Some(operation) = self.snapshot.operation.as_deref()
+            && operation.len() <= MAX_OPERATION_BYTES
+        {
             insert_header_string(headers, HEADER_COST_OPERATION, operation);
         }
         if let Ok(serialized) = serde_json::to_string(&self.snapshot.storage_breakdown)
@@ -290,7 +275,7 @@ impl CostResponseHeaders {
 }
 
 #[derive(Default)]
-struct RequestCostCollector {
+pub(super) struct RequestCostCollector {
     registration_id: Option<u64>,
     request_id: Option<String>,
     operation: Option<String>,
@@ -300,6 +285,9 @@ struct RequestCostCollector {
     db_serial_waves: u64,
     db_max_parallelism: u64,
     active_db_calls: u64,
+    active_work: usize,
+    finalized: bool,
+    work_settled: Arc<tokio::sync::Notify>,
     db_call_breakdown: BTreeMap<String, u64>,
     db_read_ops: u64,
     db_write_ops: u64,
@@ -318,6 +306,44 @@ struct RequestCostCollector {
 }
 
 impl RequestCostCollector {
+    pub(super) fn begin_work(&mut self) -> bool {
+        if self.finalized {
+            return false;
+        }
+        self.active_work = self.active_work.saturating_add(1);
+        true
+    }
+
+    pub(super) fn finish_work(&mut self) {
+        self.active_work = self.active_work.saturating_sub(1);
+        self.work_settled.notify_waiters();
+    }
+
+    pub(super) fn is_work_idle(&self) -> bool {
+        self.active_work == 0 && self.active_db_calls == 0
+    }
+
+    pub(super) fn settlement_notification(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.work_settled)
+    }
+
+    pub(super) fn prepare_snapshot(&mut self, wall_ms: f64, response_bytes: Option<u64>) -> bool {
+        self.wall_ms = Some(wall_ms);
+        self.response_bytes = response_bytes;
+        self.mark_updated();
+        self.registration_id.is_some()
+    }
+
+    pub(super) fn take_finished_snapshot(&mut self) -> (RequestCostSnapshot, Option<u64>) {
+        self.finalized = true;
+        (self.snapshot(), self.registration_id.take())
+    }
+
+    pub(super) fn has_settled(&self, idle: std::time::Duration) -> bool {
+        self.last_update_at
+            .is_none_or(|updated| updated.elapsed() >= idle)
+    }
+
     fn mark_updated(&mut self) {
         self.last_update_at = Some(Instant::now());
     }
@@ -412,7 +438,7 @@ fn register_request(
     true
 }
 
-fn unregister_request(registration_id: u64) {
+pub(super) fn unregister_request(registration_id: u64) {
     let Ok(mut requests) = registry().requests.lock() else {
         return;
     };
@@ -543,55 +569,8 @@ impl Drop for DatabaseCallGuard {
             return;
         };
         collector.active_db_calls = collector.active_db_calls.saturating_sub(1);
+        collector.work_settled.notify_waiters();
         collector.mark_updated();
-    }
-}
-
-pub async fn finish_request_cost_collection(
-    request_id: Option<&str>,
-    wall_ms: f64,
-    response_bytes: Option<u64>,
-) -> RequestCostSnapshot {
-    let Ok(collector) = REQUEST_COST_COLLECTOR.try_with(Arc::clone) else {
-        return RequestCostSnapshot::default();
-    };
-    let (snapshot, registration_id) = {
-        let Ok(mut collector) = collector.lock() else {
-            return RequestCostSnapshot::default();
-        };
-        collector.wall_ms = Some(wall_ms);
-        collector.response_bytes = response_bytes;
-        collector.mark_updated();
-        (collector.snapshot(), collector.registration_id)
-    };
-    if request_id.is_some() && registration_id.is_some() {
-        wait_for_cost_settle(&collector).await;
-    }
-    let settled = collector
-        .lock()
-        .map(|collector| collector.snapshot())
-        .unwrap_or(snapshot);
-    if let Some(registration_id) = registration_id {
-        unregister_request(registration_id);
-    }
-    settled
-}
-
-async fn wait_for_cost_settle(collector: &RequestCostCollectorHandle) {
-    let deadline = Instant::now() + COST_STABILIZE_TIMEOUT;
-    loop {
-        let settled = {
-            let Ok(collector) = collector.lock() else {
-                return;
-            };
-            collector
-                .last_update_at
-                .is_none_or(|ts| ts.elapsed() >= COST_STABILIZE_IDLE_WINDOW)
-        };
-        if settled || Instant::now() >= deadline {
-            return;
-        }
-        tokio::time::sleep(COST_STABILIZE_POLL_INTERVAL).await;
     }
 }
 
@@ -774,6 +753,9 @@ fn insert_header_u64(headers: &mut HeaderMap, name: &str, value: u64) {
 }
 
 fn insert_header_f64(headers: &mut HeaderMap, name: &str, value: f64) {
+    if !value.is_finite() || value < 0.0 {
+        return;
+    }
     insert_header_string(headers, name, &format!("{value:.6}"));
 }
 
@@ -799,6 +781,7 @@ fn parse_header_f64(headers: &HeaderMap, name: &str) -> Option<f64> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 #[cfg(test)]
