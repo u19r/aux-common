@@ -10,7 +10,7 @@ readme = "README.md"
 
 [features]
 default = ["runtime"]
-runtime = ["dep:wasmtime", "dep:wasmparser"]
+runtime = ["dep:sha2", "dep:wasmtime", "dep:wasmparser"]
 
 [dependencies]
 serde = { workspace = true }
@@ -19,6 +19,7 @@ wasmparser = { workspace = true, optional = true }
 wasmtime = { workspace = true, optional = true }
 
 [build-dependencies]
+sha2 = { workspace = true, optional = true }
 wasmtime = { workspace = true, optional = true, features = ["cranelift", "all-arch"] }
 
 [dev-dependencies]

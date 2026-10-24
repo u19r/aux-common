@@ -32,8 +32,8 @@
   "schema_version": 1,
   "sources": {
     "Cargo.toml": "76a304ccedb8d24bbf15de93618811d4219c2eb21f7384e4aba4a2ffd5a326a6",
-    "crates/javascript/Cargo.toml": "740a584572ca00fd57c14520f127333af362f85ddbe484032eb39131fe4e07f7",
-    "crates/javascript/build.rs": "021d080f9b7fc7dd14efc4519d287cebe7a07821a78db9a06cf72e27cff290bb",
+    "crates/javascript/Cargo.toml": "5a7df11e0925e55476259fe7776f535bff4508e91903d61105cb6867dd585fe8",
+    "crates/javascript/build.rs": "e274981eee87e6cc0dd13417691c0c6fee0d67c996771f7700579c5669c2259b",
     "crates/javascript/examples/quickjs_artifact.rs": "3ed41b12a9c4d8fe6b5ad8f0dc46bf94cc766f37986b9a247a2916641e717182",
     "crates/javascript/src/bounded_writer.rs": "224e2b29f24d4db0e0a5cecd86b2941af59e48b866f0331dd90dc525ad5e750d",
     "crates/javascript/src/constants.rs": "d678a132faa7e26d7ff803e4b2e9a87742438ff444b95d24a9b6b98c8fcd7cbf",
