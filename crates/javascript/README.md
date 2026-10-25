@@ -113,8 +113,8 @@ The native artifact is generated per target and locked Wasmtime version, then em
 Fuel and epoch instrumentation match the runtime configuration. An incompatible engine fails initialization.
 Cross builds enable compiler backends in the build dependency and use portable target CPU settings.
 Build-script reruns reuse native artifacts in Cargo's output directory when the guest SHA-256 and
-Wasmtime target/compiler compatibility hash match. CI must retain its Cargo target directory to
-reuse these artifacts across fresh checkouts; a cold cache compiles the guest once.
+Wasmtime target/compiler compatibility hash match. CI restores these artifacts into its Cargo
+target directory across fresh runners; a cold cache compiles the guest once.
 
 Wasmtime marks native-artifact deserialization unsafe because arbitrary native artifacts can execute host code.
 The loader accepts only the immutable artifact generated during this package's build; all other crate code denies unsafe operations.

@@ -75,9 +75,10 @@ impl SignatureVerifier for DefaultSignatureVerifier {
 ///
 /// All `ds:Signature` descendants are removed before the value is returned, so
 /// consumers cannot accidentally interpret signature metadata as application
-/// data. If the document has a root signature, the signed element is the root;
-/// otherwise the document must contain exactly one nested signed element and
-/// only that subtree is returned.
+/// data. Without an explicit target ID, a root signature selects the root;
+/// otherwise exactly one nested signed element is required. An explicit target
+/// selects only that element's own signature. Only the verified subtree is
+/// returned.
 #[derive(Clone, Debug)]
 pub struct VerifiedElement(UnverifiedElement);
 
@@ -123,29 +124,32 @@ impl VerifiedXmlDocument {
     }
 
     /// Verify a strict enveloped XML signature while injecting only the
-    /// cryptographic primitive. The XML policy and signed-element selection
-    /// remain fixed.
+    /// cryptographic primitive. The input selects the target; the strict XML
+    /// signature policy remains fixed.
     pub fn verify_enveloped_with<K: AsRef<[u8]>, V: SignatureVerifier>(
         input: EnvelopedSignature<'_, K>,
         verifier: &V,
     ) -> Result<Self, XmlSecurityError> {
-        Self::verify_with(input.xml, input.trusted_public_keys, verifier)
+        Self::verify_with(input, verifier)
     }
 
     fn verify_with<K: AsRef<[u8]>, V: SignatureVerifier>(
-        xml: &str,
-        trusted_public_keys: &[K],
+        input: EnvelopedSignature<'_, K>,
         verifier: &V,
     ) -> Result<Self, XmlSecurityError> {
+        let trusted_public_keys = input.trusted_public_keys;
         if trusted_public_keys.is_empty() {
             return Err(XmlSecurityError::Signature {
                 message: "at least one trusted public key is required".to_string(),
             });
         }
-        let root = parse_xml_to_element(xml)?;
+        let root = parse_xml_to_element(input.xml)?;
         root.reject_xml_encryption()?;
         root.validate_unique_ids()?;
-        let (signed_element, signature) = root.find_signature_target()?;
+        let (signed_element, signature) = match input.target_id {
+            Some(id) => root.find_signature_target_by_id(id)?,
+            None => root.find_signature_target()?,
+        };
         let signed_element_id = signed_element.unique_id(&root)?;
         let signed_info = signature.require_ds_child("SignedInfo")?;
         let signature_value = signature.decode_child_text("SignatureValue", MAX_SIGNATURE_BYTES)?;
@@ -207,6 +211,7 @@ impl VerifiedXmlDocument {
 pub struct EnvelopedSignature<'a, K> {
     xml: &'a str,
     trusted_public_keys: &'a [K],
+    target_id: Option<&'a str>,
 }
 
 impl<'a, K> EnvelopedSignature<'a, K> {
@@ -215,7 +220,19 @@ impl<'a, K> EnvelopedSignature<'a, K> {
         Self {
             xml,
             trusted_public_keys,
+            target_id: None,
         }
+    }
+
+    /// Select the element whose own direct signature must verify.
+    ///
+    /// The ID must be nonempty and unique throughout the original document.
+    /// Ancestor and descendant signatures do not satisfy this selection. Their
+    /// validity is independent; callers requiring both must verify both IDs.
+    #[must_use]
+    pub const fn with_target_id(mut self, target_id: &'a str) -> Self {
+        self.target_id = Some(target_id);
+        self
     }
 }
 
@@ -223,15 +240,36 @@ impl<K: AsRef<[u8]>> TryFrom<EnvelopedSignature<'_, K>> for VerifiedXmlDocument 
     type Error = XmlSecurityError;
 
     fn try_from(input: EnvelopedSignature<'_, K>) -> Result<Self, Self::Error> {
-        Self::verify_with(
-            input.xml,
-            input.trusted_public_keys,
-            &DefaultSignatureVerifier,
-        )
+        Self::verify_with(input, &DefaultSignatureVerifier)
     }
 }
 
 impl UnverifiedElement {
+    fn find_signature_target_by_id(
+        &self,
+        id: &str,
+    ) -> Result<(&UnverifiedElement, &UnverifiedElement), XmlSecurityError> {
+        let element = self
+            .find_element_by_id(id)
+            .ok_or_else(|| XmlSecurityError::Signature {
+                message: "requested signature target was not found".to_string(),
+            })?;
+        let signature = element
+            .direct_signature()?
+            .ok_or_else(|| XmlSecurityError::Signature {
+                message: "requested element does not contain a direct Signature".to_string(),
+            })?;
+        Ok((element, signature))
+    }
+
+    fn find_element_by_id(&self, id: &str) -> Option<&Self> {
+        if self.attr("ID") == Some(id) {
+            return Some(self);
+        }
+        self.child_elements()
+            .find_map(|child| child.find_element_by_id(id))
+    }
+
     fn find_signature_target(
         &self,
     ) -> Result<(&UnverifiedElement, &UnverifiedElement), XmlSecurityError> {

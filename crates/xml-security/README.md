@@ -36,3 +36,12 @@ signature authenticates the root; otherwise exactly one nested signed target is 
 Signature descendants are removed from the returned subtree. Parsing helpers and
 `UnverifiedElement` do not establish authenticity. Callers own key trust, protocol validation,
 and application authorization.
+
+When a protocol requires a specific signed element, use
+`VerifiedXmlDocument::try_from(EnvelopedSignature::new(xml, trusted_keys).with_target_id(id))`.
+Selection uses the original document, preserving namespace context and checking ID uniqueness
+throughout the document. The selected element must have its own valid direct signature; an
+ancestor signature cannot substitute for it. To require both a response and its assertion to
+be signed, verify each ID separately. Each result proves only its selected signature; signature
+metadata inside an authenticated subtree does not prove that a nested signature is valid.
+`verify_enveloped_with` accepts the same selector with a caller-supplied cryptographic provider.

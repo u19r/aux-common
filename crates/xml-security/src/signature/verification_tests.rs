@@ -192,6 +192,128 @@ fn contains_ds_signature(element: &Element) -> bool {
     })
 }
 
+#[test]
+fn given_dual_signed_document_when_verifying_inner_trust_anchor_then_return_inner_element() {
+    let unsigned = r#"<Response xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="response"><Assertion ID="assertion"><Value>trusted</Value></Assertion></Response>"#;
+    let (inner_xml, inner_key) =
+        sign_document_with_direct_signature(unsigned, "assertion", "</Assertion>");
+    super::VerifiedXmlDocument::verify_enveloped(&inner_xml, std::slice::from_ref(&inner_key))
+        .expect("the inner signature is independently valid");
+    let (xml, outer_key) =
+        sign_document_with_direct_signature(&inner_xml, "response", "</Response>");
+    super::VerifiedXmlDocument::verify_enveloped(&xml, &[outer_key])
+        .expect("the outer signature is independently valid");
+
+    let keys = [inner_key];
+    let verified = super::VerifiedXmlDocument::try_from(
+        super::EnvelopedSignature::new(&xml, &keys).with_target_id("assertion"),
+    )
+    .expect("the required inner signature must remain independently verifiable");
+    assert_eq!(verified.signed_element().attr("ID"), Some("assertion"));
+    assert!(!contains_ds_signature(verified.signed_element()));
+}
+
+#[test]
+fn given_invalid_inner_signature_and_valid_outer_when_selecting_inner_then_reject() {
+    let unsigned = r#"<Response xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="response"><Assertion ID="assertion"><Value>trusted</Value></Assertion></Response>"#;
+    let (inner_xml, inner_key) =
+        sign_document_with_direct_signature(unsigned, "assertion", "</Assertion>");
+    let invalid_inner =
+        replace_child_text(&inner_xml, "SignatureValue", &STANDARD.encode([0; 256]));
+    let (xml, outer_key) =
+        sign_document_with_direct_signature(&invalid_inner, "response", "</Response>");
+    let keys = [inner_key, outer_key];
+    super::VerifiedXmlDocument::try_from(
+        super::EnvelopedSignature::new(&xml, &keys).with_target_id("response"),
+    )
+    .expect("the valid outer signature authenticates even invalid inner metadata");
+    assert!(matches!(
+        super::VerifiedXmlDocument::try_from(
+            super::EnvelopedSignature::new(&xml, &keys).with_target_id("assertion"),
+        ),
+        Err(XmlSecurityError::SignatureVerification)
+    ));
+}
+
+#[test]
+fn given_valid_inner_signature_and_invalid_outer_when_selecting_inner_then_verify_only_inner() {
+    let unsigned = r#"<Response xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="response"><Assertion ID="assertion"><Value>trusted</Value></Assertion></Response>"#;
+    let (inner_xml, inner_key) =
+        sign_document_with_direct_signature(unsigned, "assertion", "</Assertion>");
+    let (xml, outer_key) =
+        sign_document_with_direct_signature(&inner_xml, "response", "</Response>");
+    let parsed = parse_xml_to_element(&xml).expect("dual signed XML");
+    let outer_value = parsed
+        .find_child_in_namespace(Some(DS_NS), "Signature")
+        .and_then(|signature| signature.find_child_in_namespace(Some(DS_NS), "SignatureValue"))
+        .and_then(Element::text_content)
+        .expect("outer signature value");
+    let invalid_outer = xml.replace(&outer_value, &STANDARD.encode([0; 256]));
+    let keys = [inner_key, outer_key];
+    super::VerifiedXmlDocument::try_from(
+        super::EnvelopedSignature::new(&invalid_outer, &keys).with_target_id("assertion"),
+    )
+    .expect("inner signature does not authenticate or require the outer signature");
+    assert!(matches!(
+        super::VerifiedXmlDocument::try_from(
+            super::EnvelopedSignature::new(&invalid_outer, &keys).with_target_id("response"),
+        ),
+        Err(XmlSecurityError::SignatureVerification)
+    ));
+}
+
+#[test]
+fn given_nested_inclusive_namespace_signature_when_selecting_inner_then_preserve_context() {
+    let (inner_xml, inner_key) = inclusive_namespace_signed_document();
+    let wrapped = format!("<Wrapper xmlns:ds=\"{DS_NS}\" ID=\"wrapper\">{inner_xml}</Wrapper>");
+    let (xml, outer_key) = sign_document_with_direct_signature(&wrapped, "wrapper", "</Wrapper>");
+    let keys = [inner_key, outer_key];
+    let verified = super::VerifiedXmlDocument::try_from(
+        super::EnvelopedSignature::new(&xml, &keys).with_target_id("root"),
+    )
+    .expect("target selection must preserve inclusive namespace canonicalization");
+    assert_eq!(verified.signed_element().name(), "Envelope");
+}
+
+#[test]
+fn given_injected_verifier_when_selecting_missing_target_then_reject_before_crypto() {
+    let (xml, key) = signed_test_document();
+    let keys = [key];
+    let verifier = TestSignatureVerifier::new([true]);
+    assert!(
+        super::VerifiedXmlDocument::verify_enveloped_with(
+            super::EnvelopedSignature::new(&xml, &keys).with_target_id("missing"),
+            &verifier,
+        )
+        .is_err()
+    );
+    assert_eq!(verifier.verification_calls.get(), 0);
+}
+
+#[test]
+fn given_explicit_target_when_missing_unsigned_or_duplicated_then_reject() {
+    let unsigned = r#"<Envelope xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="envelope"><Payload ID="payload"><Value>trusted</Value></Payload></Envelope>"#;
+    let (xml, key) = sign_document_with_direct_signature(unsigned, "envelope", "</Envelope>");
+    let keys = [key];
+    for id in ["missing", "", "payload"] {
+        assert!(
+            super::VerifiedXmlDocument::try_from(
+                super::EnvelopedSignature::new(&xml, &keys).with_target_id(id),
+            )
+            .is_err(),
+            "missing or unsigned target must not fall back to an ancestor"
+        );
+    }
+    let duplicated = xml.replace("<Value>", "<Value ID=\"payload\">");
+    assert!(
+        super::VerifiedXmlDocument::try_from(
+            super::EnvelopedSignature::new(&duplicated, &keys).with_target_id("payload"),
+        )
+        .is_err(),
+        "IDs must remain unique in the whole document"
+    );
+}
+
 fn replace_child_text(xml: &str, name: &str, text: &str) -> String {
     let opening = format!("<ds:{name}>");
     let closing = format!("</ds:{name}>");
