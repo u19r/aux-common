@@ -954,6 +954,134 @@ fn given_custom_transport_missing_any_policy_capability_when_executor_built_then
     }
 }
 
+/// A transport whose `send` future never resolves and which lies about
+/// enforcing the executor's deadline — the worst-case wedging adversary the
+/// executor must survive (Slowloris-class).
+#[derive(Debug)]
+struct WedgedTransport;
+
+impl Transport for WedgedTransport {
+    fn send(&self, _request: http_request::reqwest::Request) -> TransportFuture {
+        Box::pin(std::future::pending())
+    }
+
+    fn redirects_disabled(&self) -> bool {
+        true
+    }
+
+    fn destination_policy_enforced(&self) -> bool {
+        true
+    }
+
+    // The deliberate lie: the hanging send future proves the executor does
+    // not trust this flag for its own wall-clock bound.
+    fn deadline_enforced(&self) -> bool {
+        true
+    }
+}
+
+impl PolicyBoundTransport for WedgedTransport {}
+
+/// An authorizer future that never resolves (hung upstream token call).
+#[derive(Debug)]
+struct WedgedAuthorizer;
+
+impl RequestAuthorizer for WedgedAuthorizer {
+    fn authorize<'a>(&'a self, _request: AuthorizationRequest<'a>) -> AuthorizationFuture<'a> {
+        Box::pin(std::future::pending())
+    }
+}
+
+fn wedged_policy() -> HttpPolicy {
+    HttpPolicy::builder(HttpPolicyId::try_new("wedged").expect("policy ID"))
+        .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+        .request_timeout(Duration::from_millis(150))
+        .connect_timeout(Duration::from_millis(50))
+        .try_build()
+        .expect("policy")
+}
+
+fn wedged_job() -> HttpJob {
+    let request = HttpRequest::try_new(HttpRequestInput {
+        method: Method::POST,
+        url: Url::parse("https://api.example.com/jobs").expect("request URL"),
+        headers: HeaderMap::new(),
+        body: Bytes::copy_from_slice(b"payload"),
+    })
+    .expect("request");
+    HttpJob::new(wedged_policy().id().clone(), request)
+}
+
+fn unbounded_attempt() -> HttpAttempt {
+    HttpAttempt::new(ExecutionId::from([1; 16]), AttemptId::from([2; 16]), None)
+}
+
+/// A transport that both hangs and lies about enforcing the attempt deadline
+/// must still produce a classification inside the policy's `request_timeout`,
+/// never a hang.
+#[tokio::test]
+async fn given_wedged_transport_when_execute_runs_then_attempt_is_deadline_bounded() {
+    let executor = HttpExecutor::builder()
+        .policy(wedged_policy())
+        .with_transport(WedgedTransport)
+        .try_build()
+        .expect("executor");
+
+    let started = std::time::Instant::now();
+    let outcome = executor
+        .execute(&wedged_job(), unbounded_attempt())
+        .await
+        .expect("classification");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(600),
+        "wedged transport held the attempt past the request deadline: {elapsed:?}"
+    );
+    assert_eq!(
+        outcome.code(),
+        "http_transport_retry",
+        "a wedged transport must classify as a transport retry"
+    );
+}
+
+/// An authorizer future that hangs is bounded by the execution deadline; the
+/// transport is never invoked and the attempt fails closed.
+#[tokio::test]
+async fn given_wedged_authorizer_when_execute_runs_then_attempt_is_deadline_bounded() {
+    let policy = HttpPolicy::builder(HttpPolicyId::try_new("wedged").expect("policy ID"))
+        .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+        .request_timeout(Duration::from_millis(150))
+        .authorizer(WedgedAuthorizer)
+        .try_build()
+        .expect("policy");
+    let executor = HttpExecutor::builder()
+        .policy(policy)
+        .with_transport(WedgedTransport)
+        .try_build()
+        .expect("executor");
+
+    let started = std::time::Instant::now();
+    let result = executor.execute(&wedged_job(), unbounded_attempt()).await;
+    {
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "wedged authorizer held the attempt past the request deadline: {elapsed:?}"
+        );
+    }
+    match result {
+        Ok(outcome) => assert_eq!(outcome.code(), "http_transport_retry"),
+        Err(error) => {
+            let rendered = format!("{error:?}").to_uppercase();
+            assert!(
+                rendered.contains("DEADLINE") || rendered.contains("EXCEEDED"),
+                "a wedged authorizer must fail on the deadline, not wedging: {error:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn given_secret_payload_when_debug_is_rendered_then_no_secret_or_identifier_is_exposed() {
     let secret = "super-secret-body-material";

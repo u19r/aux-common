@@ -25,5 +25,6 @@ pub use invocation::{JsInvocation, JsJob};
 
 #[cfg(all(test, feature = "runtime"))]
 mod invocation_tests;
+#[cfg(all(test, feature = "runtime"))]
 #[cfg(test)]
 mod protocol_tests;

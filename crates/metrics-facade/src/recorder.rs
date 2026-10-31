@@ -185,9 +185,7 @@ where
 
 fn allow_metric_key(key: &Key) -> bool {
     let keys = REGISTERED_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
-    let Ok(mut keys) = keys.lock() else {
-        return false;
-    };
+    let mut keys = keys.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if keys.contains(key) {
         return true;
     }
@@ -197,21 +195,44 @@ fn allow_metric_key(key: &Key) -> bool {
     keys.insert(key.clone())
 }
 
+/// Poisons the registered-metric-key guard (test-only). Regression tests use
+/// this to prove a panicking guarded section cannot disable metric
+/// registration for the process lifetime.
+#[cfg(test)]
+pub(crate) fn poison_registered_keys_for_test() {
+    let keys = REGISTERED_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
+    poison_mutex_for_test(keys);
+}
+
+#[cfg(test)]
+fn poison_mutex_for_test<T>(mutex: &Mutex<T>) {
+    // The deliberate unwind prints through the installed panic hook; the
+    // hook itself is never swapped because swaps are process-global.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = mutex.lock().expect("poison probe must hold the lock");
+        panic!("mutex poison probe");
+    }));
+    assert!(outcome.is_err(), "poison probe must actually unwind");
+}
+
 #[cfg(test)]
 pub(crate) fn reset_registered_metric_keys() {
-    if let Some(keys) = REGISTERED_KEYS.get()
-        && let Ok(mut keys) = keys.lock()
-    {
+    if let Some(keys) = REGISTERED_KEYS.get() {
+        let mut keys = keys.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         keys.clear();
     }
 }
 
 #[cfg(test)]
 pub(crate) fn registered_metric_key_count() -> usize {
-    REGISTERED_KEYS
-        .get()
-        .and_then(|keys| keys.lock().ok().map(|keys| keys.len()))
-        .unwrap_or_default()
+    REGISTERED_KEYS.get().map_or_else(
+        || 0,
+        |keys| {
+            keys.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+        },
+    )
 }
 
 #[cfg(test)]

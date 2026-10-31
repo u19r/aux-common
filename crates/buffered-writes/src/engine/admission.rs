@@ -311,9 +311,10 @@ impl<T: Send + Sync + 'static> Engine<T> {
     pub(super) async fn acquire_sink_permission(&self, deadline: Deadline) -> bool {
         let now = self.cfg.clock.now_instant();
         let probe_due = {
-            let Ok(guard) = self.state.lock() else {
-                return false;
-            };
+            let guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             match guard.health {
                 SinkHealth::Closed => return true,
                 SinkHealth::HalfOpen => return true,

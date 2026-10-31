@@ -97,8 +97,32 @@ path = "fuzz_targets/dpop_proof.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "jwt_cross_decision"
+path = "fuzz_targets/jwt_cross_decision.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "es_cross_decision"
+path = "fuzz_targets/es_cross_decision.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "spki_decision"
+path = "fuzz_targets/spki_decision.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "seal_batch"
+path = "fuzz_targets/seal_batch.rs"
+test = false
+doc = false
 [dependencies]
 libfuzzer-sys = "0.4.13"
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 
 [dependencies.authz-cedar]
 path = "../crates/authz-cedar"
@@ -106,8 +130,10 @@ path = "../crates/authz-cedar"
 path = "../crates/authz-types"
 [dependencies.aws-credentials]
 path = "../crates/aws-credentials"
+[dependencies.buffered-writes]
+path = "../crates/buffered-writes"
 [dependencies.aws-lc-rs]
-version = "1.18.2"
+version = "1.19.0"
 [dependencies.base64]
 version = "0.23.1"
 [dependencies.bg-jobs-http]
@@ -130,6 +156,8 @@ path = "../crates/oauth-dpop"
 [dependencies.p256]
 version = "0.14.0"
 features = ["ecdsa"]
+[dependencies.x509-parser]
+version = "0.18.1"
 [dependencies.saml2]
 path = "../crates/saml2"
 [dependencies.serde_json]

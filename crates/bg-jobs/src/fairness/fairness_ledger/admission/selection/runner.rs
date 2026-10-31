@@ -21,7 +21,7 @@ thread_local! {
 }
 
 pub(in crate::fairness::fairness_ledger::admission) type SelectionScore =
-    (u128, u32, u128, u8, Timestamp, JobId);
+    (u8, u128, u32, u128, Timestamp, JobId);
 
 struct DueCandidateSearch<'a> {
     best: Option<(JobId, &'a CandidatePreparation, SelectionScore)>,

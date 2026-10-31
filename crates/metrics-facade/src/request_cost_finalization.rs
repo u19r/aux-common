@@ -57,10 +57,12 @@ pub async fn finish_request_cost_snapshot(
 async fn wait_for_owned_work(
     collector: &RequestCostCollectorHandle,
 ) -> Result<RequestCostSnapshot, RequestCostSettlementError> {
-    let notify = collector
-        .lock()
-        .map_err(|_| RequestCostSettlementError::CollectorUnavailable)?
-        .settlement_notification();
+    let notify = {
+        let collector = collector
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        collector.settlement_notification()
+    };
     loop {
         let notified = notify.notified();
         tokio::pin!(notified);
@@ -68,7 +70,7 @@ async fn wait_for_owned_work(
         let finished = {
             let mut collector = collector
                 .lock()
-                .map_err(|_| RequestCostSettlementError::CollectorUnavailable)?;
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             collector
                 .is_work_idle()
                 .then(|| collector.take_finished_snapshot())
@@ -88,20 +90,21 @@ fn prepare_snapshot(
     response_bytes: Option<u64>,
 ) -> Option<(RequestCostCollectorHandle, bool)> {
     let collector = REQUEST_COST_COLLECTOR.try_with(Arc::clone).ok()?;
-    let registered = collector
-        .lock()
-        .ok()?
-        .prepare_snapshot(wall_ms, response_bytes);
+    let registered = {
+        let mut guard = collector
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.prepare_snapshot(wall_ms, response_bytes)
+    };
     Some((collector, registered))
 }
 
 fn finish_snapshot(collector: &RequestCostCollectorHandle) -> RequestCostSnapshot {
-    let Ok((snapshot, registration)) = collector
+    let mut collector = collector
         .lock()
-        .map(|mut collector| collector.take_finished_snapshot())
-    else {
-        return RequestCostSnapshot::default();
-    };
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (snapshot, registration) = collector.take_finished_snapshot();
+    drop(collector);
     if let Some(registration) = registration {
         unregister_request(registration);
     }
@@ -111,9 +114,12 @@ fn finish_snapshot(collector: &RequestCostCollectorHandle) -> RequestCostSnapsho
 async fn wait_for_cost_settle(collector: &RequestCostCollectorHandle) {
     let deadline = Instant::now() + COST_STABILIZE_TIMEOUT;
     loop {
-        let settled = collector.lock().map_or(true, |collector| {
+        let settled = {
+            let collector = collector
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             collector.has_settled(COST_STABILIZE_IDLE_WINDOW)
-        });
+        };
         if settled || Instant::now() >= deadline {
             return;
         }

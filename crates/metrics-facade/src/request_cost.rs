@@ -421,9 +421,10 @@ fn register_request(
     request_id: &str,
     collector: &RequestCostCollectorHandle,
 ) -> bool {
-    let Ok(mut requests) = registry().requests.lock() else {
-        return false;
-    };
+    let mut requests = registry()
+        .requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     requests.retain(|_, request| request.collector.strong_count() > 0);
     if requests.len() >= MAX_ACTIVE_REQUESTS {
         return false;
@@ -439,18 +440,20 @@ fn register_request(
 }
 
 pub(super) fn unregister_request(registration_id: u64) {
-    let Ok(mut requests) = registry().requests.lock() else {
-        return;
-    };
+    let mut requests = registry()
+        .requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     requests.remove(&registration_id);
 }
 
 fn with_active_collector<F>(request_id: &str, f: F)
 where F: FnOnce(&mut RequestCostCollector) {
     let collector = {
-        let Ok(mut requests) = registry().requests.lock() else {
-            return;
-        };
+        let mut requests = registry()
+            .requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         requests.retain(|_, request| request.collector.strong_count() > 0);
         let mut matching = requests
             .values()
@@ -465,9 +468,9 @@ where F: FnOnce(&mut RequestCostCollector) {
     let Some(collector) = collector else {
         return;
     };
-    let Ok(mut collector) = collector.lock() else {
-        return;
-    };
+    let mut collector = collector
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     f(&mut collector);
 }
 
@@ -475,10 +478,10 @@ where F: FnOnce(&mut RequestCostCollector) {
 pub fn active_request_id() -> Option<String> {
     REQUEST_COST_COLLECTOR
         .try_with(|collector| {
-            collector
+            let collector = collector
                 .lock()
-                .ok()
-                .and_then(|collector| collector.request_id.clone())
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            collector.request_id.clone()
         })
         .ok()
         .flatten()
@@ -490,16 +493,17 @@ where
     Fut: std::future::Future<Output = T>,
 {
     let request_id = request_id.filter(|request_id| request_id.len() <= MAX_REQUEST_ID_BYTES);
-    let collector = Arc::new(Mutex::new(RequestCostCollector {
+    let collector = Arc::new(std::sync::Mutex::new(RequestCostCollector {
         request_id: request_id.clone(),
         ..RequestCostCollector::default()
     }));
     if let Some(request_id) = request_id.as_deref() {
         let registration_id = next_registration_id();
-        if register_request(registration_id, request_id, &collector)
-            && let Ok(mut collector) = collector.lock()
-        {
-            collector.registration_id = Some(registration_id);
+        if register_request(registration_id, request_id, &collector) {
+            let mut collector_guard = collector
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            collector_guard.registration_id = Some(registration_id);
         }
     }
     REQUEST_COST_COLLECTOR.scope(collector, future()).await
@@ -511,9 +515,9 @@ where
 pub fn set_request_cost_operation(operation: &str) {
     REQUEST_COST_COLLECTOR
         .try_with(|collector| {
-            let Ok(mut collector) = collector.lock() else {
-                return;
-            };
+            let mut collector = collector
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if operation.len() <= MAX_OPERATION_BYTES {
                 collector.operation = Some(operation.to_string());
                 collector.mark_updated();
@@ -529,9 +533,9 @@ pub fn begin_database_call(operation: &str) -> DatabaseCallGuard {
     let Ok(collector) = REQUEST_COST_COLLECTOR.try_with(Arc::clone) else {
         return DatabaseCallGuard { collector: None };
     };
-    let Ok(mut collector_guard) = collector.lock() else {
-        return DatabaseCallGuard { collector: None };
-    };
+    let mut collector_guard = collector
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     collector_guard.db_calls = collector_guard.db_calls.saturating_add(1);
     if collector_guard.active_db_calls == 0 {
         collector_guard.db_serial_waves = collector_guard.db_serial_waves.saturating_add(1);
@@ -565,9 +569,9 @@ impl Drop for DatabaseCallGuard {
         let Some(collector) = self.collector.take() else {
             return;
         };
-        let Ok(mut collector) = collector.lock() else {
-            return;
-        };
+        let mut collector = collector
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         collector.active_db_calls = collector.active_db_calls.saturating_sub(1);
         collector.work_settled.notify_waiters();
         collector.mark_updated();
@@ -577,9 +581,9 @@ impl Drop for DatabaseCallGuard {
 pub(crate) fn record_counter(metric: CounterMetric, labels: &[MetricLabel], value: u64) {
     REQUEST_COST_COLLECTOR
         .try_with(|collector| {
-            let Ok(mut collector) = collector.lock() else {
-                return;
-            };
+            let mut collector = collector
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             match metric {
                 CounterMetric::HttpRequestBytesTotalMetric => {
                     collector.request_bytes = collector.request_bytes.saturating_add(value);
@@ -624,9 +628,9 @@ pub(crate) fn record_counter(metric: CounterMetric, labels: &[MetricLabel], valu
 pub(crate) fn record_gauge(metric: GaugeMetric, _labels: &[MetricLabel], update: GaugeUpdate) {
     REQUEST_COST_COLLECTOR
         .try_with(|collector| {
-            let Ok(mut collector) = collector.lock() else {
-                return;
-            };
+            let mut collector = collector
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let (GaugeMetric::AnalyticsIngestionQueueDepthMetric, GaugeUpdate::Set) =
                 (metric, update)
             {
@@ -639,9 +643,9 @@ pub(crate) fn record_gauge(metric: GaugeMetric, _labels: &[MetricLabel], update:
 pub(crate) fn record_histogram(metric: HistogramMetric, _labels: &[MetricLabel], value: f64) {
     REQUEST_COST_COLLECTOR
         .try_with(|collector| {
-            let Ok(mut collector) = collector.lock() else {
-                return;
-            };
+            let mut collector = collector
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             match metric {
                 HistogramMetric::RequestLatencyMetric => collector.wall_ms = Some(value),
                 HistogramMetric::RemoteStorageRequestLatencyMs => {
@@ -806,4 +810,36 @@ pub(crate) fn active_request_has_registration() -> bool {
                 .unwrap_or(false)
         })
         .unwrap_or(false)
+}
+
+/// Poisons the process-global runtime registry (test-only). Regression tests
+/// use this to prove collection keeps working after a panicking guarded
+/// section, rather than silently disabling registration for the process
+/// lifetime.
+#[cfg(test)]
+pub(crate) fn poison_registry_for_test() {
+    poison_mutex_for_test(&registry().requests);
+}
+
+/// Poisons the active request-cost collector (test-only).
+#[cfg(test)]
+pub(crate) fn poison_current_collector_for_test() {
+    REQUEST_COST_COLLECTOR
+        .try_with(|collector| {
+            // `collector` is `&Arc<Mutex<..>>`; deref to reach the guarded
+            // mutex itself.
+            poison_mutex_for_test(collector.as_ref());
+        })
+        .ok();
+}
+
+#[cfg(test)]
+fn poison_mutex_for_test<T>(mutex: &std::sync::Mutex<T>) {
+    // The deliberate unwind prints through the installed panic hook; the
+    // hook itself is never swapped because swaps are process-global.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = mutex.lock().expect("poison probe must hold the lock");
+        panic!("mutex poison probe");
+    }));
+    assert!(outcome.is_err(), "poison probe must actually unwind");
 }

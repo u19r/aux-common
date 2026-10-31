@@ -1,3 +1,4 @@
+# Versions: software-versions.json; details in software-version-consumers.md.
 [workspace]
 resolver = "2"
 members = ["crates/*"]
@@ -20,7 +21,7 @@ authz-cedar = { path = "crates/authz-cedar" }
 authz-runtime = { path = "crates/authz-runtime" }
 authz-types = { path = "crates/authz-types" }
 aws-credentials = { path = "crates/aws-credentials" }
-aws-lc-rs = "1.18.2"
+aws-lc-rs = "1.19.0"
 aws-sigv4-signing = { path = "crates/aws-sigv4-signing" }
 bg-jobs = { path = "crates/bg-jobs", version = "0.2.0" }
 bg-jobs-aws = { path = "crates/bg-jobs-aws" }
@@ -45,8 +46,8 @@ xml-security = { path = "crates/xml-security" }
 
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "getrandom", "password-hash"] }
 aws-credential-types = "1.3.1"
-aws-sigv4 = "1.6.3"
-aws-smithy-runtime-api = "1.19.1"
+aws-sigv4 = "1.6.4"
+aws-smithy-runtime-api = "1.19.2"
 axum = "0.8.9"
 axum-prometheus = "0.10.1"
 base64 = "0.23.1"
@@ -77,14 +78,14 @@ password-hash = { version = "0.6.1", features = ["rand_core"] }
 pem = "4.0.0"
 proc-macro2 = "1.0.107"
 proptest = { version = "1.12.0", default-features = false, features = ["std", "fork", "timeout"] }
-purecrypto = { version = "0.10.3", default-features = false, features = ["alloc", "rsa"] }
+purecrypto = { version = "0.10.4", default-features = false, features = ["alloc", "rsa"] }
 quint-connect = "=0.1.2"
 quint-connect-guard = { path = "crates/quint-connect-guard" }
 quint-http-connector = { path = "crates/quint-http-connector" }
 quint-rendered-parser = { path = "crates/quint-rendered-parser" }
 quote = "1.0.47"
 rand = "0.10.3"
-redis = { version = "1.8.0", default-features = false, features = ["tokio-rustls-comp", "tls-rustls-webpki-roots", "connection-manager", "script"] }
+redis = { version = "1.8.1", default-features = false, features = ["tokio-rustls-comp", "tls-rustls-webpki-roots", "connection-manager", "script"] }
 regex = "1.13.1"
 reqwest = { version = "0.13.5", default-features = false, features = [
     "blocking",
@@ -95,7 +96,7 @@ reqwest = { version = "0.13.5", default-features = false, features = [
     "rustls",
     "stream",
 ] }
-rustix = { version = "1.1.5", features = ["time"] }
+rustix = { version = "1.1.6", features = ["time"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -124,7 +125,7 @@ zeroize = "1.9.1"
 
 # Match Wasmtime's binary-format generation to avoid duplicate parser/encoder stacks.
 wasmparser = "=0.261.0"
-wasmtime = { version = "=50.0.0", default-features = false, features = ["runtime", "std"] }
+wasmtime = { version = "=50.0.1", default-features = false, features = ["runtime", "std"] }
 wat = "=1.261.0"
 
 [workspace.lints.clippy]

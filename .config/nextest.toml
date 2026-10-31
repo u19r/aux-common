@@ -1,0 +1,6 @@
+# JavaScript tests enforce a 50 ms wall-clock deadline. Reserve the runner's
+# slots so unrelated tests cannot delay a valid recovery job past that deadline.
+# https://nexte.st/docs/configuration/threads-required/
+[[profile.default.overrides]]
+filter = 'package(javascript)'
+threads-required = "num-test-threads"

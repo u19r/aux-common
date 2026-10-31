@@ -14,7 +14,6 @@ mod error;
 mod header;
 #[cfg(feature = "native")]
 mod key_material;
-
 #[cfg(feature = "native")]
 pub use compact_jwe::JweRecipient;
 #[cfg(feature = "native")]

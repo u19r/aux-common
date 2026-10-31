@@ -23,10 +23,10 @@ impl FairnessLedger {
             Priority::Bulk => 2,
         };
         (
+            priority,
             metrics.primary_service,
             metrics.primary_candidate_count,
             metrics.child_service_lag,
-            priority,
             facts.scheduled_at,
             job_id,
         )

@@ -46,6 +46,99 @@ fn parse_policy_set(policies_json: &str) -> PolicySet {
     PolicySet::from_json_str(policies_json).expect("policy set json")
 }
 
+/// The configuration model defines the relationship scopes as "access when
+/// the principal has a relationship to the org/group parent chain". The
+/// generated Cedar guard must therefore compare the principal's org/group
+/// *attribute* against the parent chain, matching the `Scope::Org`/`Group`
+/// guards (`resource.org_id == principal.org_id`) and the property
+/// requirements in `EvaluationProperties::satisfies_scope`.
+///
+/// A guard against `principal.id` (the principal's entity id) instead:
+/// 1. denies legitimate principals whose org/group sits in the parent chain,
+///    and
+/// 2. unexpectedly allows any principal whose entity id collides with an id
+///    inside the parent chain.
+#[test]
+fn relationship_scope_generates_the_full_guarded_policy_text() {
+    // The full generated policy — not a snippet — must encode the documented
+    // semantics: the principal's org/group *attribute* decides the
+    // relationship, every optional attribute access is explicitly `has`-ed,
+    // and the role principal slot stays bound for template linking.
+    for (config, expected) in [
+        (Scope::OrgRelationship, full_org_relationship_policy()),
+        (Scope::GroupRelationship, full_group_relationship_policy()),
+    ] {
+        let config = relationship_scope_configuration(config)
+            .into_validated()
+            .expect("valid config");
+        let policies_json = generate_static_policies(&config).expect("policies");
+        let policy_set = parse_policy_set(&policies_json);
+        let policy_text = template_texts(&policy_set).join("\n");
+        assert_eq!(policy_text, expected, "full generated policy text");
+    }
+}
+
+fn relationship_scope_configuration(scope: authz_types::Scope) -> ConfigurationModel {
+    ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: vec![authz_types::ActionDefinition {
+                name: "read".into(),
+                description: None,
+            }],
+            context_schema: None,
+        }],
+        permissions: vec![authz_types::Permission {
+            id: "document:read".into(),
+            name: "Reader".into(),
+            description: None,
+            actions: permission_actions("document", &["read".into()]),
+            not_actions: vec![],
+        }],
+        roles: vec![authz_types::Role {
+            id: "reader".into(),
+            name: "Reader".into(),
+            description: None,
+            permissions: vec![authz_types::RolePermission {
+                permission_id: PermissionId::new("document:read").expect("permission id"),
+                scopes: vec![scope],
+            }],
+            actions: vec![],
+            not_actions: vec![],
+            assignment_policy: crate::bundle::permanent_assignment_policy(),
+        }],
+        scope_mappings: Vec::new(),
+        description: None,
+        authn_providers: vec![],
+        step_up_rules: Vec::new(),
+        step_up_config: HashMap::new(),
+        default_step_up_rule: None,
+    }
+}
+
+fn full_org_relationship_policy() -> &'static str {
+    r#"permit(
+  principal in ?principal,
+  action == Authz::Action::"document:read",
+  resource is Authz::Document
+) when {
+  (resource has org_parents) && (principal has org_id) && resource.org_parents.contains(principal.org_id) && ((!context._authz.token_present) || (context._authz.token_valid && ((!context._authz.token_resource_filter_enabled) || (resource in context._authz.token_resource_filter)) && (((!context._authz.token_org_id_present) || ((resource has org_id) && ((resource.org_id == context._authz.token_org_id) && context._authz.token_owner_org_ids.contains(context._authz.token_org_id)))) && context._authz.allowed_actions.contains("document:read"))))
+};"#
+}
+
+fn full_group_relationship_policy() -> &'static str {
+    r#"permit(
+  principal in ?principal,
+  action == Authz::Action::"document:read",
+  resource is Authz::Document
+) when {
+  (resource has group_parents) && (principal has group_id) && resource.group_parents.contains(principal.group_id) && ((!context._authz.token_present) || (context._authz.token_valid && ((!context._authz.token_resource_filter_enabled) || (resource in context._authz.token_resource_filter)) && (((!context._authz.token_org_id_present) || ((resource has org_id) && ((resource.org_id == context._authz.token_org_id) && context._authz.token_owner_org_ids.contains(context._authz.token_org_id)))) && context._authz.allowed_actions.contains("document:read"))))
+};"#
+}
+
 fn template_texts(policy_set: &PolicySet) -> Vec<String> {
     policy_set
         .templates()
@@ -491,12 +584,12 @@ fn policy_generation_emits_scope_guards_for_all_scopes() {
     );
     assert!(
         policy_text.contains("resource.org_parents")
-            && policy_text.contains("contains(principal.id)"),
+            && policy_text.contains("contains(principal.org_id)"),
         "org relationship guard should be present"
     );
     assert!(
         policy_text.contains("resource.group_parents")
-            && policy_text.contains("contains(principal.id)"),
+            && policy_text.contains("contains(principal.group_id)"),
         "group relationship guard should be present"
     );
     assert!(
@@ -1309,7 +1402,7 @@ fn relationship_scope_policies_present() {
         .join("\n");
     assert!(
         policy_text.contains("resource.org_parents")
-            && policy_text.contains("contains(principal.id)"),
+            && policy_text.contains("contains(principal.org_id)"),
         "org relationship scope condition rendered"
     );
 }

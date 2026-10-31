@@ -1934,9 +1934,11 @@ fn evaluator_allows_org_relationship_scope() {
     let config = config_with_scope(Scope::OrgRelationship);
     let bundle = compile_policy_bundle(&config, 1).expect("bundle");
     let req = authz_types::EvaluationRequest {
-        subject: Subject::user("u1"),
+        subject: Subject::user("u1").with_properties(serde_json::json!({
+            "org_id": "org_1"
+        })),
         resource: Resource::new("document", "doc1").with_properties(serde_json::json!({
-            "org_parents": ["u1"]
+            "org_parents": ["org_1"]
         })),
         action: Action::new("read"),
         context: Some(context_with_internal(
@@ -1953,7 +1955,7 @@ fn evaluator_allows_org_relationship_scope() {
     let res = evaluate_with_test_trust(&bundle, &req).expect("evaluation");
     assert!(
         res.decision,
-        "org relationship scope should allow when principal is in org_parents"
+        "org relationship scope should allow when the principal's org is in org_parents"
     );
 }
 
@@ -1962,9 +1964,11 @@ fn evaluator_allows_group_relationship_scope() {
     let config = config_with_scope(Scope::GroupRelationship);
     let bundle = compile_policy_bundle(&config, 1).expect("bundle");
     let req = authz_types::EvaluationRequest {
-        subject: Subject::user("u1"),
+        subject: Subject::user("u1").with_properties(serde_json::json!({
+            "group_id": "group_1"
+        })),
         resource: Resource::new("document", "doc1").with_properties(serde_json::json!({
-            "group_parents": ["u1"]
+            "group_parents": ["group_1"]
         })),
         action: Action::new("read"),
         context: Some(context_with_internal(
@@ -1981,7 +1985,7 @@ fn evaluator_allows_group_relationship_scope() {
     let res = evaluate_with_test_trust(&bundle, &req).expect("evaluation");
     assert!(
         res.decision,
-        "group relationship scope should allow when principal is in group_parents"
+        "group relationship scope should allow when the principal's group is in group_parents"
     );
 }
 

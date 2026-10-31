@@ -123,9 +123,9 @@ impl LifecycleEvents for ChannelLifecycle {
             loop {
                 #[cfg(feature = "tokio")]
                 let notified = {
-                    let Ok(mut guard) = state.lock() else {
-                        return None;
-                    };
+                    let mut guard = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let mut notified = Box::pin(Arc::clone(&guard.notify).notified_owned());
                     // Register under the state lock so close cannot fall
                     // between checking the terminal state and registering for
@@ -144,9 +144,9 @@ impl LifecycleEvents for ChannelLifecycle {
 
                 #[cfg(not(feature = "tokio"))]
                 {
-                    let Ok(mut guard) = state.lock() else {
-                        return None;
-                    };
+                    let mut guard = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     return guard.events.take();
                 }
             }

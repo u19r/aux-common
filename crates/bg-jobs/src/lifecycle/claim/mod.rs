@@ -11,7 +11,7 @@ mod transaction;
 mod types;
 #[cfg(test)]
 mod types_tests;
-
+#[cfg(test)]
 #[cfg(all(test, not(target_family = "wasm")))]
 pub(crate) use flow::claim_with_capacity;
 pub(crate) use flow::{claim, claim_record_with_capacity};

@@ -318,9 +318,15 @@ impl JwtVerifier {
         key: &DecodingKey,
         algorithm: SignatureAlgorithm,
     ) -> Result<()> {
+        let signature = if algorithm == SignatureAlgorithm::ES256 {
+            crate::constants::normalize_low_s_encoded(compact.signature)
+                .ok_or_else(|| JwtDecodeError::new(JwtDecodeErrorKind::SignatureInvalid))?
+        } else {
+            compact.signature.to_owned()
+        };
         #[cfg(target_arch = "wasm32")]
         return crate::wasm_signature::verify(
-            compact.signature,
+            &signature,
             compact.message.as_bytes(),
             key,
             algorithm,
@@ -328,7 +334,7 @@ impl JwtVerifier {
 
         #[cfg(not(target_arch = "wasm32"))]
         match jsonwebtoken::crypto::verify(
-            compact.signature,
+            &signature,
             compact.message.as_bytes(),
             key,
             algorithm.to_backend(),

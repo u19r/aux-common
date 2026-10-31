@@ -428,3 +428,24 @@ fn given_valid_labels_when_metrics_crate_facade_records_each_kind_then_handles_a
     assert_eq!(after.gauges - before.gauges, 1);
     assert_eq!(after.histograms - before.histograms, 1);
 }
+
+/// A panicking guarded section (or any future one like it) must not disable
+/// metric-key registration for the process lifetime. The probe temporarily
+/// swaps the process-global panic hook, so it serializes behind the facade
+/// test lock.
+#[test]
+fn given_poisoned_registered_key_registry_then_new_metric_keys_still_register() {
+    let _guard = METRICS_FACADE_TEST_LOCK.lock().unwrap();
+    reset_registered_metric_keys();
+
+    crate::recorder::poison_registered_keys_for_test();
+
+    assert!(
+        allow_test_metric_key("post-poison".to_owned()),
+        "metric key registration must recover from a poisoned guard"
+    );
+    assert_eq!(registered_metric_key_count(), 1);
+
+    reset_registered_metric_keys();
+    assert_eq!(registered_metric_key_count(), 0);
+}

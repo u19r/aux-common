@@ -7,7 +7,7 @@ use crate::{
     client_data::parse_client_data,
     constants::{
         MAX_AUTHENTICATOR_DATA_BYTES, MAX_COSE_KEY_BYTES, MAX_CREDENTIAL_ID_BYTES,
-        MAX_SIGNATURE_BYTES, MAX_USER_HANDLE_BYTES,
+        MAX_SIGNATURE_BYTES, MAX_USER_HANDLE_BYTES, normalize_low_s_signature,
     },
     types::{AssertionInput, AssertionResult, SignCountStatus, UserVerification},
 };
@@ -55,6 +55,7 @@ pub fn verify_assertion(input: AssertionInput<'_>) -> Result<AssertionResult, We
         .map_err(|_| WebAuthnError::UnsupportedCoseKey)?;
     let signature =
         Signature::from_der(input.signature).map_err(|_| WebAuthnError::InvalidSignature)?;
+    let signature = normalize_low_s_signature(&signature);
     let client_hash = Sha256::digest(input.client_data_json);
     let mut signed = Vec::with_capacity(input.authenticator_data.len() + client_hash.len());
     signed.extend_from_slice(input.authenticator_data);

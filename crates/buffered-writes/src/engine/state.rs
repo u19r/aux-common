@@ -109,9 +109,10 @@ impl<T: Send + Sync + 'static> Engine<T> {
     }
 
     pub(crate) fn claim_driver_slot(&self) -> bool {
-        let Ok(mut guard) = self.state.lock() else {
-            return false;
-        };
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if guard.driver_attached {
             return false;
         }

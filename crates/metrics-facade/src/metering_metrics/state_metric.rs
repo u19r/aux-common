@@ -30,9 +30,10 @@ impl StateMetric {
     }
 
     pub(super) fn observe(&self, revision: u64, index: usize) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if revision <= state.0 {
             return;
         }
@@ -51,6 +52,25 @@ impl StateMetric {
             1.0,
         );
     }
+
+    /// Deliberately poisons the guarded state (test-only). Regression tests
+    /// use this to prove a panicking guarded section cannot disable the
+    /// gauge's state transitions for the process lifetime.
+    #[cfg(test)]
+    pub(super) fn poison_state_for_test(&self) {
+        poison_mutex_for_test(&self.state);
+    }
+}
+
+#[cfg(test)]
+fn poison_mutex_for_test<T>(mutex: &Mutex<T>) {
+    // The deliberate unwind prints through the installed panic hook; the
+    // hook itself is never swapped because swaps are process-global.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = mutex.lock().expect("poison probe must hold the lock");
+        panic!("mutex poison probe");
+    }));
+    assert!(outcome.is_err(), "poison probe must actually unwind");
 }
 
 impl Drop for StateMetric {

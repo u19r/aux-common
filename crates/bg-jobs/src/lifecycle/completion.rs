@@ -126,7 +126,7 @@ async fn completion_transaction<S: JobStore>(
 ) -> JobResult<StoreTransaction, S::Error> {
     let job_key = keys::job_key(system.namespace(), &claim.record().job_id)?;
     let lease_value = keys::lease_value(&claim.record().job_id)?;
-    let mut checks = Vec::with_capacity(5 + usize::from(claim.record().deduplication.is_some()));
+    let mut checks = Vec::with_capacity(5);
     checks.push(Check::Value(job_key.clone(), claim.encoded().clone()));
     checks.push(Check::Value(claim.lease_key().clone(), lease_value));
     checks.push(Check::Value(
@@ -150,12 +150,6 @@ async fn completion_transaction<S: JobStore>(
         &mut mutations,
     )
     .await?;
-    if let Some(deduplication) = &claim.record().deduplication {
-        checks.push(Check::Value(
-            keys::dedupe_key(system.namespace(), deduplication.key())?,
-            keys::dedupe_value(&claim.record().job_id, deduplication.retain_until())?,
-        ));
-    }
     if let Some(check) = wake_check {
         checks.push(check);
     }

@@ -51,7 +51,7 @@ fn collect_manifest(root: &Path) -> Result<Value> {
     }
     Ok(json!({
         "schema_version":1, "protocol_version":1, "target":"wasm32-wasip1",
-        "rust":"1.99.1", "wasi_sdk":"24.0", "rquickjs":"0.14.0", "quickjs_ng":"0.16.2", "wasmtime":"50.0.0",
+        "rust":"1.99.1", "wasi_sdk":"24.0", "rquickjs":"0.14.0", "quickjs_ng":"0.16.2", "wasmtime":"50.0.1",
         "profile":{"opt_level":"s","panic":"abort","strip":true},
         "wasm_sha256":hash_bytes(&wasm), "wasm_bytes":wasm.len(),
         "imports":imports, "exports":exports, "sources":source_hashes(root)?,

@@ -50,6 +50,10 @@ impl SigningContext<'_> {
         Ok(headers)
     }
 
+    /// The signed canonical query binds the original request query plus the
+    /// `SigV4` parameters, excluding the signature itself. The delivered
+    /// URL keeps the original query text and appends the signature last, so
+    /// the recipient re-canonicalizes to exactly the signed set.
     pub(crate) fn presign(
         &self,
         request: &SigningRequest<'_>,
@@ -57,18 +61,17 @@ impl SigningContext<'_> {
     ) -> Result<Uri, SigningError> {
         let headers = prepare_headers(request.uri, request.headers)?;
         let canonical_headers = CanonicalHeaders::try_from(&headers)?;
-        let mut params = self.presign_parameters(&canonical_headers.names, expiry);
+        let params = self.presign_parameters(&canonical_headers.names, expiry);
         let hash = request.body.payload_hash()?;
-        let query = canonical_query(request.uri.query(), &params);
+        let signed_query = canonical_query(request.uri.query(), &params);
         let canonical = canonical_headers.request(CanonicalRequest {
             method: request.method,
             uri: request.uri,
-            query: &query,
+            query: &signed_query,
             payload_hash: &hash,
             is_s3: self.is_s3(),
         });
-        params.push(("X-Amz-Signature".to_owned(), self.signature(&canonical)?));
-        let query = canonical_query(None, &params);
+        let signature = self.signature(&canonical)?;
         let original = request
             .uri
             .path_and_query()
@@ -78,9 +81,10 @@ impl SigningContext<'_> {
         } else {
             '?'
         };
+        let params_query = canonical_query(None, &params);
         let mut parts = request.uri.clone().into_parts();
         parts.path_and_query = Some(
-            format!("{original}{separator}{query}")
+            format!("{original}{separator}{params_query}&X-Amz-Signature={signature}")
                 .parse()
                 .map_err(|_| SigningError::InvalidUri)?,
         );

@@ -64,8 +64,10 @@ impl EmbeddedEs256Key {
     }
 
     pub fn verify(&self, signing_input: &[u8], signature: &[u8]) -> Result<(), JoseError> {
+        let normalized =
+            crate::constants::normalize_low_s(signature).ok_or(JoseError::InvalidSignature)?;
         let signature =
-            Signature::from_slice(signature).map_err(|_| JoseError::InvalidSignature)?;
+            Signature::from_slice(&normalized).map_err(|_| JoseError::InvalidSignature)?;
         self.verifier
             .verify(signing_input, &signature)
             .map_err(|_| JoseError::InvalidSignature)

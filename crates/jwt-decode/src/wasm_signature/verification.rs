@@ -93,9 +93,10 @@ fn verify_es256(
     message: &[u8],
     signature: &[u8],
 ) -> std::result::Result<(), ()> {
+    let normalized = crate::constants::normalize_low_s_raw(signature.try_into().map_err(|_| ())?);
     let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(key.try_get_as_bytes().map_err(|_| ())?)
         .map_err(|_| ())?;
-    let signature = p256::ecdsa::Signature::from_slice(signature).map_err(|_| ())?;
+    let signature = p256::ecdsa::Signature::from_slice(&normalized).map_err(|_| ())?;
     key.verify(message, &signature).map_err(|_| ())
 }
 

@@ -105,9 +105,10 @@ impl<T: Send + Sync + 'static> Engine<T> {
         requested: Deadline,
         now: Instant,
     ) -> Result<Deadline, DrainReport> {
-        let Ok(mut guard) = self.state.lock() else {
-            return Err(DrainReport::default());
-        };
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(done) = &guard.completed_drain {
             return Err(done.clone());
         }

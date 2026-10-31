@@ -53,6 +53,14 @@ impl PreparedVerifier {
         {
             return Err(JoseError::InvalidSignature);
         }
+        if self.algorithm == JwsAlgorithm::Es256 {
+            let normalized =
+                crate::constants::normalize_low_s(signature).ok_or(JoseError::InvalidSignature)?;
+            return self
+                .key
+                .verify_sig(message, &normalized)
+                .map_err(|_| JoseError::InvalidSignature);
+        }
         self.key
             .verify_sig(message, signature)
             .map_err(|_| JoseError::InvalidSignature)

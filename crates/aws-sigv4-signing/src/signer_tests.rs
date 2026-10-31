@@ -561,6 +561,69 @@ fn reference_cases() -> [(&'static str, &'static str, &'static str); 11] {
     ]
 }
 
+async fn signature(signer: &AwsRequestSigner, path_and_query: &str) -> String {
+    let uri: Uri = format!("https://api.example.com{path_and_query}")
+        .parse()
+        .unwrap();
+    signer
+        .presign_request(
+            "GET",
+            &uri,
+            &HeaderMap::new(),
+            SignableBody::Bytes(b""),
+            Duration::from_secs(600),
+        )
+        .await
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn presign_signature_covers_existing_query_parameters() {
+    let signer = AwsRequestSigner::new(
+        "us-east-1",
+        CredentialSource::Static(AwsStaticCredentials {
+            access_key_id: "AKIDEXAMPLE".to_owned(),
+            secret_access_key: "example-secret".to_owned(),
+            session_token: None,
+        }),
+        "execute-api",
+    )
+    .unwrap();
+
+    // Distinct original queries must produce distinct signatures so the
+    // delivered URL binds every query pair, including attacker-writable ones.
+    let first = signature(&signer, "/a?z=1").await;
+    let second = signature(&signer, "/a?z=9999&injected=attacker-value").await;
+    let signature_in = |url: &str| -> String {
+        Url::parse(url)
+            .unwrap()
+            .query_pairs()
+            .find(|(name, _)| name == "X-Amz-Signature")
+            .map(|(_, value)| value.into_owned())
+            .expect("signature")
+    };
+    assert_ne!(
+        signature_in(&first),
+        signature_in(&second),
+        "presign must bind original query parameters to the signature"
+    );
+
+    // The original decoded pairs must still be present after delivery so the
+    // recipient re-canonicalizes to the signed set.
+    let delivered_pairs: Vec<String> = Url::parse(&second)
+        .unwrap()
+        .query_pairs()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    for expected in ["injected=attacker-value", "z=9999"] {
+        assert!(
+            delivered_pairs.iter().any(|pair| pair == expected),
+            "presign dropped original query pair {expected}: {delivered_pairs:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn given_existing_query_when_presigned_then_preserve_original_path_and_query() {
     let signer = AwsRequestSigner::new(

@@ -35,9 +35,10 @@ impl BufferMetric {
     }
 
     pub(super) fn observe(&self, revision: u64, stats: Option<BufferStats>) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.terminal || revision <= state.revision {
             return;
         }
@@ -47,10 +48,30 @@ impl BufferMetric {
         self.replace_sample(&mut state, items, bytes, stats.is_none());
     }
 
+    /// Deliberately poisons the guarded state (test-only). Regression tests
+    /// use this to prove a panicking guarded section cannot disable buffer
+    /// gauges for the process lifetime.
+    #[cfg(test)]
+    pub(super) fn poison_state_for_test(&self) {
+        Self::poison_mutex_for_test(&self.state);
+    }
+
+    #[cfg(test)]
+    fn poison_mutex_for_test<T>(mutex: &Mutex<T>) {
+        // The deliberate unwind prints through the installed panic hook; the
+        // hook itself is never swapped because swaps are process-global.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.lock().expect("poison probe must hold the lock");
+            panic!("mutex poison probe");
+        }));
+        assert!(outcome.is_err(), "poison probe must actually unwind");
+    }
+
     pub(super) fn finish(&self, unknown: bool, clean: bool) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.terminal {
             return;
         }

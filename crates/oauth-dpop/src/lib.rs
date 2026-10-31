@@ -27,6 +27,7 @@ mod presenter_tests;
 #[cfg(test)]
 mod proof_tests;
 #[cfg(test)]
+#[cfg(test)]
 mod target_uri_tests;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

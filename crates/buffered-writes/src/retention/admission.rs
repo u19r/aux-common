@@ -74,9 +74,9 @@ impl RetentionState {
             });
         }
         let protected = self
-            .total_accounted_bytes()
+            .active_admission_bytes()
             .saturating_sub(self.completed_receipt_bytes());
-        if self.total_accounted_items().saturating_add(1) > request.capacity.item_limit()
+        if self.active_admission_items().saturating_add(1) > request.capacity.item_limit()
             || protected
                 .checked_add(item_bytes)
                 .is_none_or(|bytes| bytes > request.capacity.byte_limit())

@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use crate::{
-    JwtDecodeError, JwtDecodeErrorKind, PolicyErrorKind, TokenKind, constants::DEFAULT_LEEWAY,
+    JwtDecodeError, JwtDecodeErrorKind, PolicyErrorKind, TokenKind,
+    constants::{DEFAULT_LEEWAY, DPOP_ACCESS_TOKEN_TYPE_VALUES},
     error::Result,
 };
 
@@ -209,9 +210,7 @@ impl VerificationPolicyBuilder {
     }
 
     fn validate_duration_ranges(&self) -> Result<()> {
-        if self.require_token_type
-            && self.token_type_claim == "token_type"
-            && self.token_type_value == "access_token"
+        if self.dpop_access_token_policy()
             && self.leeway > Duration::from_secs(oauth_dpop::MAX_ACCESS_TOKEN_EXPIRY_LEEWAY_SECONDS)
         {
             return Err(Self::out_of_range("leeway"));
@@ -226,6 +225,18 @@ impl VerificationPolicyBuilder {
             return Err(Self::out_of_range("max_issued_age"));
         }
         Ok(())
+    }
+
+    /// A policy carrying the standard access-token type claim is intended to
+    /// verify DPoP-bound access tokens. RFC 9449 deployments keep leeway
+    /// small so proof-bound tokens cannot outlive their `exp` window by
+    /// much; both OAuth access-token claim conventions are covered so the
+    /// preset (`access`) and explicit overrides (`access_token`) enforce the
+    /// same ceiling.
+    fn dpop_access_token_policy(&self) -> bool {
+        self.require_token_type
+            && self.token_type_claim == "token_type"
+            && DPOP_ACCESS_TOKEN_TYPE_VALUES.contains(&self.token_type_value.as_str())
     }
 
     fn without_token_type(mut self) -> Self {

@@ -460,10 +460,12 @@ fn scope_expr(scope: &Scope) -> &'static str {
         Scope::Shared => "resource has shared_with && resource.shared_with.contains(principal.id)",
         Scope::Public => "resource has is_public && resource.is_public == true",
         Scope::OrgRelationship => {
-            "resource has org_parents && resource.org_parents.contains(principal.id)"
+            "resource has org_parents && principal has org_id && \
+             resource.org_parents.contains(principal.org_id)"
         }
         Scope::GroupRelationship => {
-            "resource has group_parents && resource.group_parents.contains(principal.id)"
+            "resource has group_parents && principal has group_id && \
+             resource.group_parents.contains(principal.group_id)"
         }
         Scope::Resource { .. } => "",
     }

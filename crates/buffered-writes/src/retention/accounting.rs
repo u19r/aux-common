@@ -63,6 +63,36 @@ impl RetentionState {
             .saturating_add(self.receipt_bytes())
     }
 
+    /// Bytes and items that consume buffer capacity for admission purposes.
+    /// Quarantined items are excluded: they are already lost and must not
+    /// prevent new admissions from being accepted.
+    pub(crate) fn active_admission_bytes(&self) -> usize {
+        self.total_accounted_bytes()
+            .saturating_sub(self.quarantined_accounted_bytes())
+    }
+
+    pub(crate) fn active_admission_items(&self) -> usize {
+        self.total_accounted_items()
+            .saturating_sub(self.quarantine_count())
+    }
+
+    fn quarantined_accounted_bytes(&self) -> usize {
+        self.quarantined_items
+            .iter()
+            .map(|(id, record)| {
+                record
+                    .accounted_bytes()
+                    .saturating_add(id.accounted_bytes())
+                    .saturating_add(RETENTION_ENTRY_OVERHEAD_BYTES)
+            })
+            .chain(
+                self.quarantined_batches
+                    .values()
+                    .map(SealedBatchEntry::accounted_bytes),
+            )
+            .fold(0usize, usize::saturating_add)
+    }
+
     pub(crate) fn oldest_age(&self, now_instant: Instant, now_utc_ms: i64) -> Duration {
         let open_max = self
             .open_records

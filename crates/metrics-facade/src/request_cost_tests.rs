@@ -22,6 +22,55 @@ use crate::{
 
 static REQUEST_COST_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// A panicking guarded section (or any future one like it) must not disable
+/// process-global registration: collection keeps recording once the poisoned
+/// registry guard is unwound.
+#[tokio::test]
+async fn given_poisoned_registry_when_collection_runs_then_registration_and_attribution_recovers() {
+    let _guard = REQUEST_COST_TEST_LOCK.lock().await;
+    crate::request_cost::poison_registry_for_test();
+
+    let snapshot = begin_request_cost_collection(Some("poisoned-registry".to_owned()), || async {
+        assert!(
+            active_request_has_registration(),
+            "registration must survive a poisoned registry"
+        );
+        drop(begin_database_call("poison.recovery"));
+        record_counter(CounterMetric::HttpRequestBytesTotalMetric, &[], 123);
+        crate::finish_request_cost_snapshot(1.0, None)
+            .await
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(snapshot.db_calls, 1);
+    assert_eq!(snapshot.db_call_breakdown[0].operation, "poison.recovery");
+    assert_eq!(snapshot.request_bytes, 123);
+}
+
+/// Poisoning the collector itself must not change its outcome bookkeeping:
+/// later records and the finish snapshot still agree.
+#[tokio::test]
+async fn given_poisoned_collector_when_records_follow_then_they_still_accumulate() {
+    let _guard = REQUEST_COST_TEST_LOCK.lock().await;
+
+    let snapshot = begin_request_cost_collection(Some("poisoned-collector".to_owned()), || async {
+        crate::request_cost::poison_current_collector_for_test();
+        record_counter(CounterMetric::HttpRequestBytesTotalMetric, &[], 77);
+        assert_eq!(
+            crate::request_cost::active_request_id(),
+            Some("poisoned-collector".to_owned())
+        );
+        crate::finish_request_cost_snapshot(2.0, None)
+            .await
+            .unwrap()
+    })
+    .await;
+
+    assert_eq!(snapshot.request_bytes, 77);
+    assert_eq!(snapshot.wall_ms, 2.0);
+}
+
 #[tokio::test]
 async fn given_registered_costs_when_operational_snapshot_finishes_then_completed_facts_are_captured_and_late_correlation_reports_are_excluded()
  {
