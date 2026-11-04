@@ -195,6 +195,7 @@ pub struct Job {
 #[serde(rename_all = "camelCase")]
 pub struct Meta {
     pub now: i64,
+    pub fence_high_water: i64,
     pub paused: bool,
     pub dedupe_active: bool,
     pub dedupe_job: JobId,

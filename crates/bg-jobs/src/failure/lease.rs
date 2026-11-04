@@ -13,9 +13,7 @@ use crate::{
     model::{JobState, Lease},
     store::{JobStore, StoreTransaction},
     time::Timestamp,
-    transition::{
-        commit_record, current_lease, fresh_operation, lease_record_transaction, next_revision,
-    },
+    transition::{current_lease, fresh_operation, lease_record_transaction, next_revision},
 };
 
 /// Extends a lease while preserving its owner, token, generation, and fence.
@@ -48,7 +46,13 @@ pub(crate) async fn renew<S: JobStore>(
         encoded,
         transaction,
     } = prepared;
-    match commit_record(system, transaction, claim, &encoded).await {
+    match system
+        .commit_transition(
+            transaction,
+            crate::transition::TransitionConflict::LeaseLost,
+        )
+        .await
+    {
         Ok(()) => Ok(complete_renewal(
             system,
             claim,
@@ -247,7 +251,13 @@ async fn commit_checkpoint<S: JobStore>(
         encoded,
         transaction,
     } = prepared;
-    if let Err(error) = commit_record(system, transaction, claim, &encoded).await {
+    if let Err(error) = system
+        .commit_transition(
+            transaction,
+            crate::transition::TransitionConflict::LeaseLost,
+        )
+        .await
+    {
         previous.restore(claim);
         claim.lose_authority();
         return Err(error);

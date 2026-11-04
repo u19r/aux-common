@@ -512,13 +512,6 @@ pub(super) fn operation_key(namespace: &Namespace, job: &ModelJobId) -> Result<S
         .map_err(|error| error.to_string())
 }
 
-pub(super) fn receipt_key(namespace: &Namespace, job: &ModelJobId) -> Result<StoreKey, String> {
-    // Kept as a test-only compatibility name for the focused deletion test.
-    // The key is the narrow operation metadata value, never a model-record
-    // receipt.
-    operation_key(namespace, job)
-}
-
 pub(super) fn read_operation(
     store: &impl JobStore<Error = FakeStoreError>,
     namespace: &Namespace,

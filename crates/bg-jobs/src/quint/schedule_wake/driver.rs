@@ -435,37 +435,21 @@ impl ScheduleWakeDriver {
                 occurrence,
             );
         }
-        let mut target_cursor = ScheduleCursor::new(Some(evidence.actual.intended_at), true);
-        let target_schedule = schedule_definition_with_options(
-            self.schedule.cadence.clone(),
-            MisfirePolicy::FireOnce,
-            self.schedule.overlap,
-            true,
-        )?;
-        let materialization = crate::test_helper::block_on(self.system.materialize_schedule(
-            &target_schedule,
-            &target_cursor,
-            evidence.actual.intended_at,
-        ));
+        // This model exercises pure evaluation, selection and wake delivery.
+        // Evaluation has already advanced its volatile cursor and may select
+        // individual occurrences out of order. Admit that selected job through
+        // the ordinary enqueue boundary. Durable cursor/admission atomicity is
+        // covered separately by the catalog recovery and concurrency tests.
+        let job = self
+            .schedule
+            .job_template
+            .occurrence_job(&evidence.actual, self.schedule.overlap)?;
+        let materialization =
+            crate::test_helper::block_on(self.system.enqueue_raw(job, evidence.actual.intended_at));
         match materialization {
-            Ok(materialization) if materialization.occurrences.len() == 1 => {
-                target_cursor = materialization.cursor;
-                let actual = materialization
-                    .occurrences
-                    .first()
-                    .map(|entry| entry.occurrence)
-                    .ok_or_else(|| std::io::Error::other("missing materialized occurrence"))?;
-                if actual != evidence.actual {
-                    return Err(std::io::Error::other(
-                        "materialization changed deterministic occurrence identity",
-                    )
-                    .into());
-                }
+            Ok(_) => {
                 self.pending_selection = None;
                 self.progress_counter = self.progress_counter.saturating_add(1);
-                // The returned cursor is caller-owned evidence. The schedule
-                // cursor itself remains the authority for the next evaluation.
-                let _ = target_cursor;
                 self.wake_pending = true;
                 self.wake_token = self.wake_token.saturating_add(1);
                 self.record(
@@ -475,7 +459,7 @@ impl ScheduleWakeDriver {
                     occurrence,
                 )
             }
-            Ok(_) | Err(_) => {
+            Err(_) => {
                 self.pending_selection = None;
                 self.record(
                     command,
@@ -887,7 +871,7 @@ impl ScheduleWakeDriver {
     }
 
     /// Rebuild the complete model state from the caller-owned cursor, actual
-    /// operation receipts, and the FakeStore's durable job/owner values.  The
+    /// operation markers, and the FakeStore's durable job/owner values.  The
     /// small occurrence map retains only the opaque `ScheduleOccurrence`
     /// returned by the production evaluator; it is not a second reducer.
     fn project_state(&self) -> Result<ScheduleState> {

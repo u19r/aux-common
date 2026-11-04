@@ -601,11 +601,15 @@ fn given_an_active_empty_batch_when_owner_decodes_then_it_is_rejected() {
 }
 
 #[test]
-fn given_unknown_owner_save_before_commit_then_retry_commits_with_three_store_calls() {
+fn given_unknown_owner_save_before_application_when_retried_then_five_native_calls_finish_it() {
     let store = CountingOwnerStore::new();
     store
         .inner
-        .queue_unknown_before_commit()
+        .queue_commit_for_key(
+            crate::keys::fair_state_key(&Namespace::try_new(b"jobs").unwrap()).unwrap(),
+            crate::store::CommitOutcome::Unknown,
+            false,
+        )
         .expect("unknown outcome is queued");
     let system = owner_system(store.clone());
     let mut owner = FairDispatchOwner::try_new(crate::fairness::FairnessBudget::tiny())
@@ -613,15 +617,23 @@ fn given_unknown_owner_save_before_commit_then_retry_commits_with_three_store_ca
 
     crate::test_helper::block_on(owner.save(&system)).expect("owner retry commits");
 
-    assert_eq!(store.calls(), 3, "unknown, reconcile get, retry commit");
+    assert_eq!(
+        store.calls(),
+        5,
+        "slot read, unknown atomic attempt, pending admission, application, retirement"
+    );
 }
 
 #[test]
-fn given_unknown_owner_save_after_commit_then_reconciliation_observes_the_value_with_two_calls() {
+fn given_unknown_owner_save_after_application_when_reconciled_then_four_native_calls_finish_it() {
     let store = CountingOwnerStore::new();
     store
         .inner
-        .queue_unknown_after_commit()
+        .queue_commit_for_key(
+            crate::keys::fair_state_key(&Namespace::try_new(b"jobs").unwrap()).unwrap(),
+            crate::store::CommitOutcome::Unknown,
+            true,
+        )
         .expect("unknown outcome is queued");
     let system = owner_system(store.clone());
     let mut owner = FairDispatchOwner::try_new(crate::fairness::FairnessBudget::tiny())
@@ -629,20 +641,41 @@ fn given_unknown_owner_save_after_commit_then_reconciliation_observes_the_value_
 
     crate::test_helper::block_on(owner.save(&system)).expect("owner reconciliation succeeds");
 
-    assert_eq!(store.calls(), 2, "unknown commit, reconciliation get");
+    assert_eq!(
+        store.calls(),
+        4,
+        "slot read, unknown atomic attempt, rejected pending admission, witness read"
+    );
 }
 
 #[test]
-fn given_two_unresolved_unknown_owner_saves_then_reconciliation_stops_at_four_calls() {
+fn given_three_unknown_owner_application_attempts_when_unresolved_then_seven_calls_preserve_the_input()
+ {
     let store = CountingOwnerStore::new();
     store
         .inner
-        .queue_unknown_before_commit()
+        .queue_commit_for_key(
+            crate::keys::fair_state_key(&Namespace::try_new(b"jobs").unwrap()).unwrap(),
+            crate::store::CommitOutcome::Unknown,
+            false,
+        )
         .expect("first unknown outcome is queued");
     store
         .inner
-        .queue_unknown_before_commit()
+        .queue_commit_for_key(
+            crate::keys::fair_state_key(&Namespace::try_new(b"jobs").unwrap()).unwrap(),
+            crate::store::CommitOutcome::Unknown,
+            false,
+        )
         .expect("second unknown outcome is queued");
+    store
+        .inner
+        .queue_commit_for_key(
+            crate::keys::fair_state_key(&Namespace::try_new(b"jobs").unwrap()).unwrap(),
+            crate::store::CommitOutcome::Unknown,
+            false,
+        )
+        .unwrap();
     let system = owner_system(store.clone());
     let mut owner = FairDispatchOwner::try_new(crate::fairness::FairnessBudget::tiny())
         .expect("tiny budget is valid");
@@ -650,7 +683,11 @@ fn given_two_unresolved_unknown_owner_saves_then_reconciliation_stops_at_four_ca
     let result = crate::test_helper::block_on(owner.save(&system));
 
     assert!(matches!(result, Err(JobSystemError::UnknownCommit)));
-    assert_eq!(store.calls(), 4, "two unknown commit/reconciliation pairs");
+    assert_eq!(
+        store.calls(),
+        7,
+        "slot read, unknown atomic attempt, admission, two application and head-read pairs"
+    );
 }
 
 #[test]
@@ -699,7 +736,11 @@ fn given_an_existing_owner_when_unknown_precedes_commit_then_loaded_value_is_rec
     owner.record_hol_escape();
     store
         .inner
-        .queue_unknown_before_commit()
+        .queue_commit_for_key(
+            crate::keys::fair_state_key(&Namespace::try_new(b"jobs").unwrap()).unwrap(),
+            crate::store::CommitOutcome::Unknown,
+            false,
+        )
         .expect("unknown outcome is queued");
 
     crate::test_helper::block_on(owner.save(&system))
@@ -851,12 +892,12 @@ impl crate::store::JobStore for CountingOwnerStore {
         self.inner.read_range(request).await
     }
 
-    async fn commit(
+    async fn transact(
         &self,
         transaction: &crate::store::StoreTransaction,
     ) -> Result<crate::store::CommitOutcome, Self::Error> {
         self.count_call();
-        self.inner.commit(transaction).await
+        self.inner.transact(transaction).await
     }
 }
 

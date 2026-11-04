@@ -14,8 +14,8 @@ use crate::{
     store::{Check, JobStore, Mutation},
     time::Timestamp,
     transition::{
-        TerminalTransition, checked_transaction, code, commit_record, commit_record_without_claim,
-        current_lease, fresh_operation, next_revision, terminal_transaction, wake_mutation,
+        TerminalTransition, checked_transaction, code, current_lease, fresh_operation,
+        next_revision, terminal_transaction, wake_mutation,
     },
 };
 
@@ -45,14 +45,12 @@ pub(crate) async fn dead_letter_by_id<S: JobStore>(
         dlq_key,
     )
     .await?;
-    commit_record_without_claim(
-        system,
-        transaction,
-        &job_id,
-        &authority.encoded,
-        &new_encoded,
-    )
-    .await
+    system
+        .commit_terminal_transition(
+            transaction,
+            crate::transition::TransitionConflict::LeaseLost,
+        )
+        .await
 }
 
 struct PayloadAuthority {
@@ -186,7 +184,12 @@ pub(crate) async fn cancel_claim_commit<S: JobStore>(
         },
     )
     .await?;
-    commit_record(system, transaction, &claim, &new_encoded).await?;
+    system
+        .commit_terminal_transition(
+            transaction,
+            crate::transition::TransitionConflict::LeaseLost,
+        )
+        .await?;
     claim.lose_authority();
     system.observe(crate::observer::JobEvent::Cancelled {
         queue: claim.record().queue.clone(),
@@ -242,7 +245,12 @@ pub(crate) async fn cancel_claim<S: JobStore>(
         TerminalTransition::CancellationAcknowledgement,
     )
     .await?;
-    commit_record(system, transaction, &claim, &new_encoded).await?;
+    system
+        .commit_terminal_transition(
+            transaction,
+            crate::transition::TransitionConflict::LeaseLost,
+        )
+        .await?;
     system.observe(crate::observer::JobEvent::Cancelled {
         queue: claim.record().queue.clone(),
     });
@@ -281,7 +289,12 @@ pub(crate) async fn dead_letter_claim<S: JobStore>(
         TerminalTransition::DeadLetter(dlq_key),
     )
     .await?;
-    commit_record(system, transaction, &claim, &new_encoded).await?;
+    system
+        .commit_terminal_transition(
+            transaction,
+            crate::transition::TransitionConflict::LeaseLost,
+        )
+        .await?;
     system.observe(crate::observer::JobEvent::DeadLettered {
         queue: claim.record().queue.clone(),
         outcome: code.clone(),

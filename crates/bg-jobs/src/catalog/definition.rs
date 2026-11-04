@@ -1,3 +1,4 @@
+use super::CatalogManifest;
 use crate::{
     error::ValidationError,
     model::{HandlerDefinition, JobHandle, JobHandler, JobSeed, JobSpec, NewJob},
@@ -11,6 +12,7 @@ use crate::{
 /// effects remain owned by the consuming application.
 #[derive(Clone, Debug, Default)]
 pub struct JobCatalog {
+    manifest: Option<CatalogManifest>,
     registry: HandlerRegistry,
     seeds: Vec<NewJob>,
 }
@@ -19,6 +21,7 @@ impl JobCatalog {
     #[cfg(test)]
     pub(crate) fn from_registry(registry: HandlerRegistry) -> Self {
         Self {
+            manifest: None,
             registry,
             seeds: Vec::new(),
         }
@@ -26,6 +29,20 @@ impl JobCatalog {
     /// Creates an empty catalog.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Supplies the complete namespace manifest independently of this worker's
+    /// handler subset. Every worker for the namespace must use the same
+    /// revision.
+    pub fn with_manifest(mut self, manifest: CatalogManifest) -> Self {
+        self.manifest = Some(manifest);
+        self
+    }
+
+    /// Returns the complete namespace manifest for composition with provider
+    /// contributions.
+    pub fn manifest(&self) -> Option<&CatalogManifest> {
+        self.manifest.as_ref()
     }
 
     /// Registers a typed handler specification and returns its enqueue handle.
@@ -122,12 +139,17 @@ impl JobCatalog {
         self.registry.test_handler_identities()
     }
 
-    pub(crate) fn into_parts(self) -> (HandlerRegistry, Vec<NewJob>) {
-        (self.registry, self.seeds)
+    pub(crate) fn into_parts(self) -> (HandlerRegistry, Vec<NewJob>, Option<CatalogManifest>) {
+        (self.registry, self.seeds, self.manifest)
     }
 
     fn validate_new_seed(&self, seed: &NewJob) -> Result<(), ValidationError> {
         seed.validate()?;
+        if seed.deduplication.is_some() {
+            return Err(ValidationError::InvalidValue {
+                field: "configured seed deduplication",
+            });
+        }
         if self
             .seeds
             .iter()

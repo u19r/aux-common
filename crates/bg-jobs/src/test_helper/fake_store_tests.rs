@@ -2,10 +2,7 @@ use std::num::{NonZeroU32, NonZeroUsize};
 
 use bytes::Bytes;
 
-use super::{
-    block_on,
-    fake_store::{FakeStore, FakeStoreError},
-};
+use super::{block_on, fake_store::FakeStore};
 use crate::{
     CommitOperationId, JobSystem, Namespace, OwnerId,
     store::{
@@ -92,7 +89,7 @@ fn given_a_checked_multi_key_commit_when_one_check_conflicts_then_no_mutation_is
     .expect("transaction is valid");
 
     assert_eq!(
-        block_on(store.commit(&transaction)).expect("commit succeeds"),
+        block_on(store.transact(&transaction)).expect("commit succeeds"),
         CommitOutcome::Conflict
     );
     assert!(!store.contains(&new_key).expect("contains succeeds"));
@@ -118,14 +115,14 @@ fn given_an_atomic_unknown_before_commit_when_reading_state_then_no_mutation_is_
     .expect("transaction is valid");
 
     assert_eq!(
-        block_on(store.commit(&transaction)).expect("commit succeeds"),
+        block_on(store.transact(&transaction)).expect("commit succeeds"),
         CommitOutcome::Unknown
     );
     assert!(!store.contains(&key).expect("contains succeeds"));
 }
 
 #[test]
-fn given_the_same_commit_when_retried_then_the_established_outcome_is_replayed() {
+fn given_an_applied_conditional_transaction_when_retried_then_current_checks_conflict() {
     let store = FakeStore::new();
     let key = StoreKey::try_from(&b"retry"[..]).expect("key is valid");
     let transaction = StoreTransaction::try_from(StoreTransactionInput {
@@ -140,15 +137,15 @@ fn given_the_same_commit_when_retried_then_the_established_outcome_is_replayed()
     })
     .expect("transaction is valid");
 
-    let first = block_on(store.commit(&transaction)).expect("first commit succeeds");
-    let retry = block_on(store.commit(&transaction)).expect("retry succeeds");
+    let first = block_on(store.transact(&transaction)).expect("first commit succeeds");
+    let retry = block_on(store.transact(&transaction)).expect("retry succeeds");
 
     assert_eq!(first, CommitOutcome::Committed);
-    assert_eq!(retry, CommitOutcome::Committed);
+    assert_eq!(retry, CommitOutcome::Conflict);
 }
 
 #[test]
-fn given_an_unknown_after_commit_when_retried_then_committed_is_reconciled_by_operation_id() {
+fn given_an_unknown_after_application_when_retried_then_the_native_check_rejects_reapplication() {
     let store = FakeStore::new();
     let key = StoreKey::try_from(&b"unknown-retry"[..]).expect("key is valid");
     store
@@ -166,11 +163,11 @@ fn given_an_unknown_after_commit_when_retried_then_committed_is_reconciled_by_op
     })
     .expect("transaction is valid");
 
-    let first = block_on(store.commit(&transaction)).expect("first commit responds");
-    let retry = block_on(store.commit(&transaction)).expect("retry reconciles");
+    let first = block_on(store.transact(&transaction)).expect("first commit responds");
+    let retry = block_on(store.transact(&transaction)).expect("retry reconciles");
 
     assert_eq!(first, CommitOutcome::Unknown);
-    assert_eq!(retry, CommitOutcome::Committed);
+    assert_eq!(retry, CommitOutcome::Conflict);
     assert_eq!(
         block_on(store.get(key)).expect("value read succeeds"),
         Some(Bytes::from_static(b"value"))
@@ -178,7 +175,8 @@ fn given_an_unknown_after_commit_when_retried_then_committed_is_reconciled_by_op
 }
 
 #[test]
-fn given_a_commit_operation_id_when_reused_with_different_content_then_it_is_rejected() {
+fn given_native_transactions_with_one_logical_identity_when_content_differs_then_each_evaluates_its_checks()
+ {
     let store = FakeStore::new();
     let operation_id = CommitOperationId::from([5; 16]);
     let first_key = StoreKey::try_from(&b"first"[..]).expect("first key is valid");
@@ -197,12 +195,15 @@ fn given_a_commit_operation_id_when_reused_with_different_content_then_it_is_rej
         .expect("transaction is valid")
     };
 
-    let first = block_on(store.commit(&transaction(first_key))).expect("first commit succeeds");
-    let reused = block_on(store.commit(&transaction(second_key.clone())));
+    let first = block_on(store.transact(&transaction(first_key))).expect("first commit succeeds");
+    let reused = block_on(store.transact(&transaction(second_key.clone())));
 
     assert_eq!(first, CommitOutcome::Committed);
-    assert!(matches!(reused, Err(FakeStoreError::CommitOperationReused)));
-    assert!(!store.contains(&second_key).expect("contains succeeds"));
+    assert_eq!(
+        reused.expect("independent native request succeeds"),
+        CommitOutcome::Committed
+    );
+    assert!(store.contains(&second_key).expect("contains succeeds"));
 }
 
 #[test]

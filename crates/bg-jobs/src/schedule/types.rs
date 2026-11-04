@@ -132,7 +132,7 @@ impl JobTemplate {
         })
     }
 
-    pub(super) fn occurrence_job(
+    pub(crate) fn occurrence_job(
         &self,
         occurrence: &ScheduleOccurrence,
         overlap: OverlapPolicy,

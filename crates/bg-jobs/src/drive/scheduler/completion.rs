@@ -1,4 +1,4 @@
-use super::super::{candidate::CandidateResult, constants::initial_completion_capacity};
+use super::super::candidate::CandidateResult;
 #[cfg(test)]
 use crate::{
     budget::CompletionDetails,
@@ -6,7 +6,7 @@ use crate::{
     policy::{EffectMode, OutcomeCode},
 };
 use crate::{
-    budget::{DriveCounts, DriveReport, DriveStopReason},
+    budget::{DriveCounts, DriveReport, DriveStopReason, initial_completion_capacity},
     engine::JobSystem,
     error::JobResult,
     fairness::{FairDispatchOwner, FairPermit, FairRelease},
@@ -49,16 +49,23 @@ impl<E> CompletionBookkeeping<E> {
         active_payload_bytes: &mut usize,
         completed_candidate: super::CompletedCandidate<E>,
         permit: FairPermit,
-    ) {
+    ) -> JobResult<(), E> {
         self.stop_starting |= completed_candidate.result.is_err();
-        // Release the local reservation so this drive can fill another lane.
-        // The durable owner was already committed before the effect began;
-        // intentionally do not save this post-effect projection.
+        let terminal = matches!(
+            &completed_candidate.result,
+            Ok(CandidateResult::Completed(_)
+                | CandidateResult::DeadLettered
+                | CandidateResult::Cancelled)
+        );
         settle_ledger_result(owner, permit, &completed_candidate.result);
+        if terminal {
+            owner.acknowledge_terminal_projection()?;
+        }
         *active_payload_bytes =
             active_payload_bytes.saturating_sub(completed_candidate.payload_bytes);
         let order = completed_candidate.order;
         self.completed[order] = Some(completed_candidate);
+        Ok(())
     }
 
     pub(super) fn apply(

@@ -13,6 +13,7 @@ use crate::{
 };
 
 pub(super) struct ValidatedEnqueue<'a> {
+    pub(super) catalog: Option<crate::catalog::CatalogAdmission>,
     pub(super) job: NewJob,
     pub(super) registration: &'a HandlerRegistration,
     pub(super) digest: [u8; 32],
@@ -25,22 +26,12 @@ impl ValidatedEnqueue<'_> {
         &'a self,
         namespace: &'a crate::ids::Namespace,
     ) -> Result<crate::model::JobDefinition<'a>, crate::error::StoreDataError> {
-        Ok(crate::model::JobDefinition {
-            job_id: self.job.job_id,
+        crate::model::JobDefinition::try_from_request(
+            &self.job,
             namespace,
-            queue: self.registration.queue(),
-            kind: &self.job.kind,
-            schema_version: self.job.schema_version,
-            payload_length: u32::try_from(self.job.payload.len())
-                .map_err(|_| crate::error::StoreDataError::LengthOverflow)?,
-            payload_digest: self.digest,
-            fairness: &self.job.fairness,
-            ordering_key: self.job.ordering_key.as_ref(),
-            priority: self.job.priority,
-            expires_at: self.job.expires_at,
-            policy: super::state::build_policy(&self.job, self.registration),
-            deduplication: self.job.deduplication.as_ref(),
-        })
+            self.registration,
+            self.digest,
+        )
     }
 }
 
@@ -49,7 +40,14 @@ pub(crate) async fn enqueue<S: JobStore>(
     job: NewJob,
     now: Timestamp,
 ) -> JobResult<EnqueueResult, S::Error> {
-    enqueue_with_match(system, job, now, authority::ExistingJobMatch::ExactRequest).await
+    EnqueueInput {
+        job,
+        now,
+        existing_match: authority::ExistingJobMatch::ExactRequest,
+        catalog: None,
+    }
+    .enqueue(system)
+    .await
 }
 
 pub(crate) async fn ensure_seed<S: JobStore>(
@@ -57,38 +55,126 @@ pub(crate) async fn ensure_seed<S: JobStore>(
     job: NewJob,
     now: Timestamp,
 ) -> JobResult<EnqueueResult, S::Error> {
-    enqueue_with_match(system, job, now, authority::ExistingJobMatch::StableSeed).await
+    EnqueueInput {
+        job,
+        now,
+        existing_match: authority::ExistingJobMatch::StableSeed,
+        catalog: None,
+    }
+    .enqueue(system)
+    .await
 }
 
-async fn enqueue_with_match<S: JobStore>(
+pub(crate) async fn ensure_configured_seed<S: JobStore>(
     system: &JobSystem<S>,
     job: NewJob,
     now: Timestamp,
-    existing_match: authority::ExistingJobMatch,
 ) -> JobResult<EnqueueResult, S::Error> {
-    let registration = system
-        .registry()
-        .get_ref(&job.kind, job.schema_version)
-        .ok_or(JobSystemError::UnregisteredHandler)?;
-    job.validate()?;
-    validate_fairness(&job.fairness, registration.fairness_policy())?;
-    let digest: [u8; 32] = Sha256::digest(&job.payload).into();
-    let queue = registration.queue().clone();
-    let request = ValidatedEnqueue {
+    EnqueueInput {
         job,
-        registration,
-        digest,
         now,
-        existing_match,
-    };
-    let result = enqueue_validated(system, request).await;
-    if let Ok(result) = &result {
+        existing_match: authority::ExistingJobMatch::ConfiguredSeed,
+        catalog: None,
+    }
+    .enqueue(system)
+    .await
+}
+
+pub(crate) async fn enqueue_scheduled_occurrence<S: JobStore>(
+    system: &JobSystem<S>,
+    job: NewJob,
+    now: Timestamp,
+    catalog: crate::catalog::CatalogAdmission,
+) -> JobResult<EnqueueResult, S::Error> {
+    EnqueueInput {
+        job,
+        now,
+        existing_match: authority::ExistingJobMatch::StableSeed,
+        catalog: Some(catalog),
+    }
+    .enqueue(system)
+    .await
+}
+
+struct EnqueueInput {
+    job: NewJob,
+    now: Timestamp,
+    existing_match: authority::ExistingJobMatch,
+    catalog: Option<crate::catalog::CatalogAdmission>,
+}
+
+impl EnqueueInput {
+    async fn enqueue<S: JobStore>(
+        self,
+        system: &JobSystem<S>,
+    ) -> JobResult<EnqueueResult, S::Error> {
+        let (registration, digest) = system.validate_enqueue_job(&self.job)?;
+        let request = ValidatedEnqueue {
+            job: self.job,
+            now: self.now,
+            existing_match: self.existing_match,
+            catalog: self.catalog,
+            registration,
+            digest,
+        };
+        let result = request.enqueue_with_catalog(system).await?;
         system.observe(crate::observer::JobEvent::Enqueued {
-            queue,
+            queue: registration.queue().clone(),
             disposition: result.disposition,
         });
+        Ok(result)
     }
-    result
+}
+
+impl ValidatedEnqueue<'_> {
+    async fn enqueue_with_catalog<S: JobStore>(
+        mut self,
+        system: &JobSystem<S>,
+    ) -> JobResult<EnqueueResult, S::Error> {
+        if matches!(
+            self.existing_match,
+            authority::ExistingJobMatch::ConfiguredSeed
+        ) {
+            let Some(catalog) = system
+                .prepare_catalog_seed(&self.definition(system.namespace())?)
+                .await?
+            else {
+                return Ok(EnqueueResult {
+                    job_id: self.job.job_id,
+                    disposition: EnqueueDisposition::AlreadyPresent,
+                    wake: crate::time::WakeHint::None,
+                });
+            };
+            self.catalog = Some(catalog);
+        }
+        enqueue_validated(system, self).await
+    }
+}
+
+impl<S: JobStore> JobSystem<S> {
+    fn validate_enqueue_job(
+        &self,
+        job: &NewJob,
+    ) -> JobResult<(&HandlerRegistration, [u8; 32]), S::Error> {
+        let registration = self
+            .registry()
+            .get_ref(&job.kind, job.schema_version)
+            .ok_or(JobSystemError::UnregisteredHandler)?;
+        job.validate()?;
+        validate_fairness(&job.fairness, registration.fairness_policy())?;
+        Ok((registration, Sha256::digest(&job.payload).into()))
+    }
+
+    pub(crate) fn enqueue_definition_digest(&self, job: &NewJob) -> JobResult<[u8; 32], S::Error> {
+        let (registration, digest) = self.validate_enqueue_job(job)?;
+        let definition = crate::model::JobDefinition::try_from_request(
+            job,
+            self.namespace(),
+            registration,
+            digest,
+        )?;
+        crate::codec::job_definition_digest(&definition).map_err(Into::into)
+    }
 }
 
 async fn enqueue_validated<S: JobStore>(
@@ -99,41 +185,29 @@ async fn enqueue_validated<S: JobStore>(
     let authority =
         authority::read_enqueue_authority(system, &request.job, &job_key, request.now).await?;
     match authority {
-        authority::EnqueueAuthority::Existing(encoded) => authority::reconcile_record(
-            system,
-            &request,
-            &encoded,
-            EnqueueDisposition::AlreadyPresent,
-        ),
+        authority::EnqueueAuthority::Existing(encoded) => {
+            let result = authority::reconcile_record(
+                system,
+                &request,
+                &encoded,
+                EnqueueDisposition::AlreadyPresent,
+            )?;
+            if let Some(catalog) = &request.catalog {
+                catalog
+                    .confirm_existing(system, crate::store::Check::Value(job_key, encoded))
+                    .await?;
+            }
+            Ok(result)
+        }
         authority::EnqueueAuthority::Deduplicated { job_id } => Ok(EnqueueResult {
             job_id,
             disposition: EnqueueDisposition::Deduplicated,
             wake: crate::time::WakeHint::from_timestamp(request.job.scheduled_at, request.now),
         }),
-        authority::EnqueueAuthority::Missing {
-            expected_dedupe,
-            prior_fence,
-        } => enqueue_missing_job(system, request, expected_dedupe, prior_fence).await,
+        authority::EnqueueAuthority::Missing { expected_dedupe } => {
+            transaction::enqueue_new(system, request, expected_dedupe).await
+        }
     }
-}
-
-async fn enqueue_missing_job<S: JobStore>(
-    system: &JobSystem<S>,
-    request: ValidatedEnqueue<'_>,
-    expected_dedupe: Option<bytes::Bytes>,
-    prior_fence: Option<authority::PriorFenceAuthority>,
-) -> JobResult<EnqueueResult, S::Error> {
-    if let Some(prior) = &prior_fence
-        && let Some(result) = authority::reconcile_completed_seed(
-            &request,
-            system.namespace(),
-            prior,
-            EnqueueDisposition::AlreadyPresent,
-        )?
-    {
-        return Ok(result);
-    }
-    transaction::enqueue_new(system, request, expected_dedupe, prior_fence).await
 }
 
 fn validate_fairness(

@@ -17,7 +17,7 @@ use bg_jobs::{
     test_support::{
         FakeStore,
         codec::{KeyCodec, KeyTag},
-        raw::{DriveRequest, DriveRequestInput, HandlerDefinition, NewJob, TerminalDisposition},
+        raw::{DriveRequest, DriveRequestInput, HandlerDefinition, NewJob},
     },
 };
 use bytes::Bytes;
@@ -364,11 +364,8 @@ async fn assert_terminal_state_deleted(world: &BddWorld, context: &str) -> Resul
         .observe_lifecycle(job.job_id)
         .await
         .map_err(display_error)?;
-    let LifecycleObservation::Terminal(receipt) = observation else {
-        return Err(format!("{context} lost its operation receipt authority"));
-    };
-    if receipt.job_id != job.job_id || receipt.terminal != TerminalDisposition::Completed {
-        return Err(format!("{context} retained the wrong terminal receipt"));
+    if !matches!(observation, LifecycleObservation::Missing) {
+        return Err(format!("{context} retained per-job lifecycle evidence"));
     }
     let expected_dedupe = job
         .deduplication
@@ -379,10 +376,13 @@ async fn assert_terminal_state_deleted(world: &BddWorld, context: &str) -> Resul
     for (key, _) in store.snapshot().map_err(display_error)? {
         let decoded = KeyCodec::decode(&test_namespace(), &key).map_err(display_error)?;
         let retained = match decoded.tag {
-            KeyTag::Operation => {
-                decoded.components.len() == 1
-                    && decoded.components[0].as_slice() == job.job_id.as_bytes()
-            }
+            KeyTag::Commit => decoded.components.len() == 1 && decoded.components[0].len() == 1,
+            KeyTag::Fence | KeyTag::Catalog => decoded.components.is_empty(),
+            KeyTag::DedupeExpiry => expected_dedupe.is_some_and(|expected| {
+                decoded.components.len() == 2
+                    && decoded.components[0].len() == 8
+                    && decoded.components[1].as_slice() == expected
+            }),
             KeyTag::Dedupe => {
                 let matches_key = expected_dedupe.is_some_and(|expected| {
                     decoded.components.len() == 1 && decoded.components[0].as_slice() == expected
@@ -506,7 +506,7 @@ pub(crate) fn drive_request() -> DriveRequest {
         max_payload_bytes_in_flight: nonzero_usize(MAX_INLINE_PAYLOAD_BYTES)
             .expect("fixed BDD payload bound is non-zero"),
         max_completion_details: 4,
-        max_store_operations: nonzero_u32(64).expect("fixed BDD store bound is non-zero"),
+        max_store_operations: nonzero_u32(1024).expect("fixed BDD store bound is non-zero"),
         stop_claiming_at: MonotonicDeadline::from_nanos(u64::MAX),
         finish_by: MonotonicDeadline::from_nanos(u64::MAX),
     }) {

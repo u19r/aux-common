@@ -107,6 +107,9 @@ pub(crate) async fn fair_dispatch_configure<S: JobStore>(
                 .complete(claim, JobOutcome::Complete(code), now)
                 .await?;
             system.enqueue_impl(job, now).await?;
+            owner = FairDispatchOwner::load(system)
+                .await?
+                .unwrap_or(FairDispatchOwner::try_new(budget)?);
         }
         Err(error) => return Err(error),
     }

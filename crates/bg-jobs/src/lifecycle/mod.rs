@@ -5,10 +5,15 @@ mod claim;
 mod completion;
 #[cfg(test)]
 mod completion_tests;
+mod fence;
 mod identity;
 mod observation;
 mod payload;
+mod terminal_effect;
 mod terminal_projection;
+mod terminal_settlement;
+#[cfg(test)]
+mod terminal_settlement_tests;
 
 #[cfg(test)]
 mod observation_tests;
@@ -25,3 +30,4 @@ pub(crate) use completion::complete;
 pub(crate) use identity::validate_persisted_identity;
 pub(crate) use observation::observe;
 pub(crate) use payload::scan_payload;
+pub(crate) use terminal_effect::{TerminalEffect, TerminalEffectKind};

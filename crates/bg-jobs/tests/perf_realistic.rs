@@ -815,11 +815,11 @@ impl JobStore for OverlapStore {
         }
     }
 
-    fn commit<'a>(
+    fn transact<'a>(
         &'a self,
         transaction: &'a StoreTransaction,
     ) -> impl Future<Output = Result<CommitOutcome, Self::Error>> + Send + 'a {
-        let future = self.inner.commit(transaction);
+        let future = self.inner.transact(transaction);
         let state = Arc::clone(&self.state);
         async move {
             state.enter_store();
@@ -1343,7 +1343,7 @@ impl JobStore for MeasuredStore {
         }
     }
 
-    fn commit<'a>(
+    fn transact<'a>(
         &'a self,
         transaction: &'a StoreTransaction,
     ) -> impl Future<Output = Result<CommitOutcome, Self::Error>> + Send + 'a {
@@ -1351,7 +1351,7 @@ impl JobStore for MeasuredStore {
         self.counters
             .transaction_bytes
             .fetch_add(transaction.encoded_bytes() as u64, Ordering::Relaxed);
-        let future = self.inner.commit(transaction);
+        let future = self.inner.transact(transaction);
         let counters = Arc::clone(&self.counters);
         async move {
             let outcome = future.await?;

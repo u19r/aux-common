@@ -125,7 +125,7 @@ fn given_a_due_job_when_the_claim_deadline_is_reached_then_drive_does_not_claim_
         max_payload_bytes_in_flight: std::num::NonZeroUsize::new(1024)
             .expect("payload budget is non-zero"),
         max_completion_details: 1,
-        max_store_operations: one(64),
+        max_store_operations: one(512),
         stop_claiming_at: MonotonicDeadline::ZERO,
         finish_by: MonotonicDeadline::from_nanos(1),
     })

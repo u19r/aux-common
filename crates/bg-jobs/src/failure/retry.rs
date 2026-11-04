@@ -13,8 +13,7 @@ use crate::{
     store::JobStore,
     time::Timestamp,
     transition::{
-        code, commit_record, current_lease, fresh_operation, jitter_duration, next_revision,
-        scheduled_transaction,
+        code, current_lease, fresh_operation, jitter_duration, next_revision, scheduled_transaction,
     },
 };
 
@@ -134,7 +133,12 @@ async fn commit_scheduled_transition<S: JobStore>(
         due_key,
     )
     .await?;
-    commit_record(system, transaction, &claim, &new_encoded).await
+    system
+        .commit_transition(
+            transaction,
+            crate::transition::TransitionConflict::LeaseLost,
+        )
+        .await
 }
 
 pub(crate) async fn retry_claim<S: JobStore>(

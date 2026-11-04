@@ -48,6 +48,10 @@ const KEY_VECTORS: &[(KeyTag, &str)] = &[
         "01000000046a6f627355000000036a6f62000000023432",
     ),
     (
+        KeyTag::DedupeExpiry,
+        "01000000046a6f627345000000036a6f62000000023432",
+    ),
+    (
         KeyTag::Wake,
         "01000000046a6f627357000000036a6f62000000023432",
     ),
@@ -224,9 +228,6 @@ fn given_a_queue_when_building_lease_authority_keys_then_the_queue_prefix_is_can
             job_id.as_bytes().to_vec()
         ]
     );
-    let old_shape = KeyCodec::encode(&namespace, KeyTag::Lease, &[job_id.as_bytes()])
-        .expect("legacy-shaped key still encodes for comparison");
-    assert_ne!(key, old_shape);
 }
 
 #[test]

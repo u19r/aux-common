@@ -954,7 +954,7 @@ impl<S: JobStore> JobStore for OutcomeStore<S> {
         }
     }
 
-    fn commit<'a>(
+    fn transact<'a>(
         &'a self,
         transaction: &'a StoreTransaction,
     ) -> impl Future<Output = Result<CommitOutcome, Self::Error>> + Send + 'a {
@@ -968,7 +968,7 @@ impl<S: JobStore> JobStore for OutcomeStore<S> {
         self.counters
             .transaction_mutations
             .fetch_add(transaction.mutations().len() as u64, Ordering::Relaxed);
-        let future = self.inner.commit(transaction);
+        let future = self.inner.transact(transaction);
         let counters = Arc::clone(&self.counters);
         async move {
             let result = future.await;

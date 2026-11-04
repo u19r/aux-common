@@ -66,7 +66,7 @@ fn handler_system_with_scheduler(
 }
 
 fn drive_request() -> DriveRequest {
-    drive_request_with_store_operations(64)
+    drive_request_with_store_operations(512)
 }
 
 fn drive_request_with_store_operations(max_store_operations: u32) -> DriveRequest {
@@ -199,7 +199,7 @@ fn advancing_request(claims: u32) -> DriveRequest {
         max_concurrency: std::num::NonZeroU16::new(1).expect("concurrency"),
         max_payload_bytes_in_flight: std::num::NonZeroUsize::new(1024).expect("payload"),
         max_completion_details: claims,
-        max_store_operations: one(128),
+        max_store_operations: one(512),
         stop_claiming_at: MonotonicDeadline::from_nanos(100_000_000),
         finish_by: MonotonicDeadline::from_nanos(200_000_000),
     })
@@ -263,7 +263,7 @@ fn given_a_handler_exceeds_the_drive_deadline_when_driving_again_then_the_live_l
         max_concurrency: std::num::NonZeroU16::MIN,
         max_payload_bytes_in_flight: std::num::NonZeroUsize::new(1024).expect("payload"),
         max_completion_details: 1,
-        max_store_operations: one(128),
+        max_store_operations: one(512),
         stop_claiming_at: MonotonicDeadline::from_nanos(3_000_000),
         finish_by: MonotonicDeadline::from_nanos(5_000_000),
     })

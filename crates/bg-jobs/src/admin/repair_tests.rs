@@ -98,6 +98,9 @@ fn given_failed_or_ambiguous_repairs_when_repairing_then_no_repaired_event_is_ob
     store
         .queue_unknown_before_commit()
         .expect("second ambiguous commit queues");
+    store
+        .queue_unknown_before_commit()
+        .expect("ambiguous pending admission queues");
     let ambiguous = block_on(system.repair_job(id, revision, operation));
 
     assert!(matches!(stale, Err(JobSystemError::LeaseConflict)));

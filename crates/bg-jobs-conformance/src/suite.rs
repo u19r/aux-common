@@ -185,7 +185,7 @@ pub async fn run_basic<S: JobStore>(
     let report = basic_range(store, config, &keys, report).await?;
     let report = basic_atomic_conflict(store, &keys, report).await?;
     let report = basic_conflict(store, &keys[0], report).await?;
-    let report = basic_exact_commit_reuse(store, &keys[8], &keys[9], report).await?;
+    let report = basic_conditional_retries(store, &keys[8], &keys[9], report).await?;
     cleanup(store, &keys).await?;
     Ok(report)
 }
@@ -211,7 +211,10 @@ async fn basic_insert<S: JobStore>(
             Mutation::Put(present_b.clone(), Bytes::from_static(b"b")),
         ],
     )?;
-    let committed = store.commit(&put).await.map_err(ConformanceError::Store)?;
+    let committed = store
+        .transact(&put)
+        .await
+        .map_err(ConformanceError::Store)?;
     report.commits += 1;
     report = report.assertion(
         committed == CommitOutcome::Committed,
@@ -285,7 +288,10 @@ async fn seed_range<S: JobStore>(
             Mutation::Put(keys[6].clone(), Bytes::from_static(b"after")),
         ],
     )?;
-    let committed = store.commit(&seed).await.map_err(ConformanceError::Store)?;
+    let committed = store
+        .transact(&seed)
+        .await
+        .map_err(ConformanceError::Store)?;
     report.commits += 1;
     report.assertion(
         committed == CommitOutcome::Committed,
@@ -414,7 +420,7 @@ async fn basic_atomic_conflict<S: JobStore>(
         ],
     )?;
     let result = store
-        .commit(&transaction)
+        .transact(&transaction)
         .await
         .map_err(ConformanceError::Store)?;
     report.commits += 1;
@@ -445,7 +451,7 @@ async fn basic_conflict<S: JobStore>(
         vec![Mutation::Put(key.clone(), Bytes::from_static(b"wrong"))],
     )?;
     let result = store
-        .commit(&conflict)
+        .transact(&conflict)
         .await
         .map_err(ConformanceError::Store)?;
     report.commits += 1;
@@ -465,7 +471,7 @@ async fn basic_conflict<S: JobStore>(
     )
 }
 
-async fn basic_exact_commit_reuse<S: JobStore>(
+async fn basic_conditional_retries<S: JobStore>(
     store: &S,
     replay_key: &StoreKey,
     conflict_key: &StoreKey,
@@ -481,15 +487,16 @@ async fn basic_exact_commit_reuse<S: JobStore>(
             Bytes::from_static(b"committed"),
         )],
     )?;
-    for _ in 0..2 {
+    for expected in [CommitOutcome::Committed, CommitOutcome::Conflict] {
         let outcome = store
-            .commit(&committed)
+            .transact(&committed)
             .await
             .map_err(ConformanceError::Store)?;
         report.commits += 1;
+        report.conflicts += u32::from(outcome == CommitOutcome::Conflict);
         report = report.assertion(
-            outcome == CommitOutcome::Committed,
-            "committed operation replay changed outcome",
+            outcome == expected,
+            "native retry did not evaluate the current check",
         )?;
     }
     let mismatched = transaction_with_operation_id(
@@ -501,9 +508,14 @@ async fn basic_exact_commit_reuse<S: JobStore>(
             Bytes::from_static(b"mismatch"),
         )],
     )?;
+    let independent = store
+        .transact(&mismatched)
+        .await
+        .map_err(ConformanceError::Store)?;
+    report.commits += 1;
     report = report.assertion(
-        store.commit(&mismatched).await.is_err(),
-        "commit operation ID accepted different transaction content",
+        independent == CommitOutcome::Committed,
+        "logical identity incorrectly bypassed current native checks",
     )?;
 
     let conflict = transaction(
@@ -515,7 +527,7 @@ async fn basic_exact_commit_reuse<S: JobStore>(
         )],
     )?;
     let first_conflict = store
-        .commit(&conflict)
+        .transact(&conflict)
         .await
         .map_err(ConformanceError::Store)?;
     report.commits += 1;
@@ -533,7 +545,7 @@ async fn basic_exact_commit_reuse<S: JobStore>(
         vec![Mutation::Delete(replay_key.clone())],
     )?;
     let deleted = store
-        .commit(&delete)
+        .transact(&delete)
         .await
         .map_err(ConformanceError::Store)?;
     report.commits += 1;
@@ -542,14 +554,13 @@ async fn basic_exact_commit_reuse<S: JobStore>(
         "exact-reuse fixture deletion did not commit",
     )?;
     let replayed_conflict = store
-        .commit(&conflict)
+        .transact(&conflict)
         .await
         .map_err(ConformanceError::Store)?;
     report.commits += 1;
-    report.conflicts += 1;
     report = report.assertion(
-        replayed_conflict == CommitOutcome::Conflict,
-        "conflict operation replay changed outcome",
+        replayed_conflict == CommitOutcome::Committed,
+        "native retry did not observe the deleted precondition",
     )?;
     let values = store
         .get_many(&[replay_key.clone(), conflict_key.clone()])
@@ -557,8 +568,8 @@ async fn basic_exact_commit_reuse<S: JobStore>(
         .map_err(ConformanceError::Store)?;
     report.get_many += 1;
     report.assertion(
-        values == vec![None, None],
-        "commit operation replay applied a mutation more than once",
+        values == vec![None, Some(Bytes::from_static(b"wrong"))],
+        "native retry did not apply its exact mutations",
     )
 }
 
@@ -584,7 +595,7 @@ pub(crate) async fn cleanup<S: JobStore>(
         keys.iter().cloned().map(Mutation::Delete).collect(),
     )?;
     let outcome = store
-        .commit(&transaction)
+        .transact(&transaction)
         .await
         .map_err(ConformanceError::Store)?;
     if outcome == CommitOutcome::Conflict {

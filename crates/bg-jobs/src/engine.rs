@@ -26,9 +26,11 @@ use crate::{
 
 /// The runtime-neutral durable job engine over a caller-owned `JobStore`.
 pub struct JobSystem<S: JobStore> {
+    pub(crate) journal: crate::journal::CommitJournal,
     store: crate::store::ObservedStore<S>,
     registry: HandlerRegistry,
     seeds: Vec<NewJob>,
+    pub(crate) configured_catalog: Option<crate::catalog::CatalogManifest>,
     namespace: Namespace,
     owner: OwnerId,
     observer: Arc<dyn JobObserver>,
@@ -85,14 +87,16 @@ impl<S: JobStore> JobSystem<S> {
         owner: OwnerId,
         scheduler: Arc<dyn WakeScheduler>,
     ) -> Self {
-        let (registry, seeds) = catalog.into_parts();
+        let (registry, seeds, configured_catalog) = catalog.into_parts();
         Self {
+            journal: crate::journal::CommitJournal::default(),
             store: crate::store::ObservedStore {
                 inner: store,
                 observer: Arc::new(NoopObserver),
             },
             registry,
             seeds,
+            configured_catalog,
             namespace,
             owner,
             observer: Arc::new(NoopObserver),
@@ -431,50 +435,65 @@ impl<S: JobStore> JobSystem<S> {
         &self,
         now: Timestamp,
     ) -> JobResult<Vec<crate::model::EnqueueResult>, S::Error> {
+        match self.ensure_catalog_seeds(now).await {
+            Err(JobSystemError::StoreContract(
+                crate::error::StoreContractError::CommitCapacity,
+            )) => {
+                // Capacity means no input was accepted. Recovery can free
+                // abandoned slots before one bounded startup retry.
+                self.recover_commits().await?;
+                self.ensure_catalog_seeds(now).await
+            }
+            result => result,
+        }
+    }
+
+    async fn ensure_catalog_seeds(
+        &self,
+        now: Timestamp,
+    ) -> JobResult<Vec<crate::model::EnqueueResult>, S::Error> {
+        self.initialize_catalog().await?;
         let mut results = Vec::with_capacity(self.seeds.len());
         for seed in &self.seeds {
-            results.push(self.ensure_seed_impl(seed.clone(), now).await?);
+            let result = crate::enqueue::ensure_configured_seed(self, seed.clone(), now).await?;
+            results.push(result);
         }
         Ok(results)
     }
 
-    /// Evaluates and durably enqueues a bounded set of occurrences visible at
-    /// `now`.  The caller persists the returned cursor with its schedule
-    /// record using the same revision/generation checks used for pause and
-    /// resume.  Catch-up work is capped by the default materialisation budget
-    /// and can be resumed from the returned cursor.
+    /// Materializes configured occurrences with atomic cursor advancement.
+    /// Initialize the complete namespace manifest first. The supplied cursor
+    /// is used only when this schedule has no durable progress.
     pub async fn materialize_schedule(
         &self,
         schedule: &crate::schedule::RecurringSchedule,
-        cursor: &crate::schedule::ScheduleCursor,
+        initial: &crate::schedule::ScheduleCursor,
         now: Timestamp,
     ) -> JobResult<crate::schedule::ScheduleMaterialization, S::Error> {
         self.materialize_schedule_with_budget(
-            schedule,
-            cursor,
-            now,
-            crate::schedule::ScheduleMaterializationBudget::default(),
+            crate::schedule::ScheduleMaterializationRequest::new(
+                schedule,
+                initial,
+                now,
+                crate::schedule::ScheduleMaterializationBudget::default(),
+            ),
             || crate::time::MonotonicDeadline::ZERO,
         )
         .await
     }
 
-    /// Evaluates and durably enqueues occurrences under explicit item, store
-    /// operation, and monotonic deadline bounds.  If the deadline or item
-    /// bound stops a CatchUp call, the returned cursor remains at the last
-    /// materialised occurrence and `complete` is false.
+    /// Applies item, native-operation and monotonic deadline bounds. A
+    /// replacement always resumes the stored cursor, including after the
+    /// original materializer permanently disappears.
     pub async fn materialize_schedule_with_budget<C>(
         &self,
-        schedule: &crate::schedule::RecurringSchedule,
-        cursor: &crate::schedule::ScheduleCursor,
-        now: Timestamp,
-        budget: crate::schedule::ScheduleMaterializationBudget,
+        request: crate::schedule::ScheduleMaterializationRequest<'_>,
         monotonic_now: C,
     ) -> JobResult<crate::schedule::ScheduleMaterialization, S::Error>
     where
         C: FnMut() -> crate::time::MonotonicDeadline,
     {
-        crate::schedule::materialize(self, schedule, cursor, now, budget, monotonic_now).await
+        request.execute(self, monotonic_now).await
     }
 
     pub async fn claim(
@@ -635,15 +654,8 @@ impl<S: JobStore> JobSystem<S> {
         crate::admin::redrive_job(self, job_id, request).await
     }
 
-    pub async fn reconcile(
-        &self,
-        job_id: JobId,
-        operation: crate::ids::OperationId,
-    ) -> JobResult<crate::transition::ReconciliationOutcome, S::Error> {
-        crate::transition::reconcile(self, job_id, operation).await
-    }
-
-    /// Reads the authoritative job or its persisted terminal receipt.
+    /// Reads current job state. Missing state
+    /// does not establish whether an application operation succeeded.
     pub async fn observe_lifecycle(
         &self,
         job_id: JobId,

@@ -74,3 +74,9 @@ pub const FIELD_TENANT_ID: &str = "tenant_id";
 pub const FIELD_TRACE_FLAGS: &str = "trace_flags";
 pub const FIELD_TRACE_ID: &str = "trace_id";
 pub const FIELD_USER_ID: &str = "user_id";
+
+// Cover sub-millisecond reads through long provider calls without per-request
+// labels.
+pub(crate) const REQUEST_STORAGE_DURATION_BUCKETS_SECONDS: &[f64] =
+    &[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0];
+pub(crate) const METRICS_UPKEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);

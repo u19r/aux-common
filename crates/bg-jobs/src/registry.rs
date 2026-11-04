@@ -26,24 +26,24 @@ impl HandlerRegistration {
         &self.queue
     }
 
-    pub(crate) const fn effect_mode(&self) -> EffectMode {
-        self.effect_mode
-    }
-
-    pub(crate) const fn cost_units(&self) -> NonZeroU16 {
-        self.cost_units
-    }
-
     pub(crate) const fn fairness_policy(&self) -> FairnessPolicy {
         self.fairness_policy
     }
 
-    pub(crate) const fn default_retry(&self) -> RetrySelection {
-        self.default_retry
-    }
-
     pub(crate) const fn default_timeout(&self) -> Duration {
         self.default_timeout
+    }
+
+    pub(crate) fn policy_with_retry(
+        &self,
+        retry: Option<RetrySelection>,
+    ) -> crate::model::JobPolicySnapshot {
+        crate::model::JobPolicySnapshot {
+            effect_mode: self.effect_mode,
+            cost_units: self.cost_units,
+            execution_timeout: Some(self.default_timeout),
+            retry_policy: retry.unwrap_or(self.default_retry).into(),
+        }
     }
 
     pub(crate) fn handler(&self) -> &Arc<dyn JobHandler> {

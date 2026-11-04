@@ -73,7 +73,7 @@ fn given_distributed_fake_store_when_running_basic_then_get_range_commit_and_lim
     assert_eq!(report.reads, 3);
     assert_eq!(report.get_many, 4);
     assert_eq!(report.ranges, 4);
-    assert_eq!(report.commits, 9);
+    assert_eq!(report.commits, 10);
     assert_eq!(report.conflicts, 4);
     assert!(report.assertions >= 22);
 
@@ -87,7 +87,7 @@ fn given_distributed_fake_store_when_running_basic_then_get_range_commit_and_lim
     })
     .expect("transaction envelope is within its byte limit");
     assert!(
-        block_on(store.commit(&transaction)).is_err(),
+        block_on(store.transact(&transaction)).is_err(),
         "store value capability must be enforced at commit"
     );
 }
@@ -147,7 +147,7 @@ fn given_tiny_advertised_capabilities_when_limits_are_exceeded_then_operations_a
         },
     })
     .expect("value probe envelope is valid");
-    assert!(block_on(store.commit(&value_transaction)).is_err());
+    assert!(block_on(store.transact(&value_transaction)).is_err());
 
     let key_transaction = StoreTransaction::try_from(StoreTransactionInput {
         operation_id: commit_operation_id(),
@@ -162,7 +162,7 @@ fn given_tiny_advertised_capabilities_when_limits_are_exceeded_then_operations_a
         },
     })
     .expect("transaction-key probe envelope is valid");
-    assert!(block_on(store.commit(&key_transaction)).is_err());
+    assert!(block_on(store.transact(&key_transaction)).is_err());
 
     let bytes_transaction = StoreTransaction::try_from(StoreTransactionInput {
         operation_id: commit_operation_id(),
@@ -178,7 +178,7 @@ fn given_tiny_advertised_capabilities_when_limits_are_exceeded_then_operations_a
         },
     })
     .expect("transaction-byte probe envelope is valid");
-    assert!(block_on(store.commit(&bytes_transaction)).is_err());
+    assert!(block_on(store.transact(&bytes_transaction)).is_err());
 
     let item_request = RangeRequest::try_from(RangeRequestInput {
         start: None,
@@ -307,7 +307,7 @@ fn given_faults_at_each_store_operation_when_exercised_then_outcomes_are_explici
                 Bytes::from_static(b"not-applied"),
             )],
         );
-        let result = block_on(store.commit(&transaction));
+        let result = block_on(store.transact(&transaction));
         assert!(result.is_err());
         assert!(
             block_on(store.get(key.clone()))
@@ -338,13 +338,13 @@ fn given_interleaved_typed_faults_when_operations_match_then_each_one_shot_fault
         )],
     );
     assert!(matches!(
-        block_on(store.commit(&transaction)),
+        block_on(store.transact(&transaction)),
         Ok(CommitOutcome::Conflict)
     ));
     assert_eq!(store.pending_faults().expect("fault queue length"), 1);
     assert!(matches!(
-        block_on(store.commit(&transaction)),
-        Ok(CommitOutcome::Conflict)
+        block_on(store.transact(&transaction)),
+        Ok(CommitOutcome::Committed)
     ));
     assert_eq!(store.pending_faults().expect("fault queue length"), 1);
     assert!(matches!(
@@ -442,7 +442,7 @@ fn given_reference_fake_when_constructing_runtime_neutral_components_then_public
 }
 
 #[test]
-fn given_reference_model_commit_identity_when_retried_or_reused_then_exact_semantics_hold() {
+fn given_reference_model_transactions_when_retried_then_current_checks_determine_the_outcome() {
     let store = FakeStore::local();
     let mut model = StoreModel::new(store.capabilities());
     let operation_id = CommitOperationId::from([0x41; 16]);
@@ -460,18 +460,70 @@ fn given_reference_model_commit_identity_when_retried_or_reused_then_exact_seman
     let committed = model_transaction(first_key);
 
     assert_eq!(
-        model.commit(&committed).expect("first commit succeeds"),
+        model.transact(&committed).expect("first commit succeeds"),
         CommitOutcome::Committed
     );
     assert_eq!(
-        model.commit(&committed).expect("commit replay succeeds"),
+        model.transact(&committed).expect("native retry responds"),
+        CommitOutcome::Conflict
+    );
+    let mut limits = committed.limits();
+    limits.max_bytes = nonzero_usize(limits.max_bytes.get() + 1);
+    let resized = StoreTransaction::try_from(StoreTransactionInput {
+        operation_id,
+        checks: committed.checks().to_vec(),
+        mutations: committed.mutations().to_vec(),
+        limits,
+    })
+    .unwrap();
+    assert_eq!(model.transact(&resized).unwrap(), CommitOutcome::Conflict);
+    assert_eq!(
+        model
+            .transact(&model_transaction(second_key.clone()))
+            .unwrap(),
         CommitOutcome::Committed
     );
-    assert!(matches!(
-        model.commit(&model_transaction(second_key.clone())),
-        Err(bg_jobs_conformance::StoreModelError::CommitOperationReused)
-    ));
-    assert!(model.get(&second_key).is_none());
+    assert_eq!(
+        model.get(&second_key).map(Bytes::as_ref),
+        Some(b"value".as_slice())
+    );
+}
+
+#[test]
+fn given_an_injected_native_conflict_when_retried_then_the_fault_is_consumed_and_current_checks_apply()
+ {
+    let store = FaultStore::new(FakeStore::local());
+    store.queue_commit_fault(CommitFaultKind::Conflict).unwrap();
+    let mut input = StoreTransactionInput {
+        operation_id: CommitOperationId::from([0x42; 16]),
+        checks: vec![Check::Absent(key(b"fault/limits"))],
+        mutations: vec![Mutation::Put(
+            key(b"fault/limits"),
+            Bytes::from_static(b"value"),
+        )],
+        limits: transaction_limits(store.capabilities()),
+    };
+    let original = StoreTransaction::try_from(input.clone()).unwrap();
+    assert_eq!(
+        block_on(store.transact(&original)).unwrap(),
+        CommitOutcome::Conflict
+    );
+    input.limits.max_bytes = nonzero_usize(input.limits.max_bytes.get() + 1);
+    let retry = StoreTransaction::try_from(input.clone()).unwrap();
+    assert_eq!(
+        block_on(store.transact(&retry)).unwrap(),
+        CommitOutcome::Committed
+    );
+    input.mutations[0] = Mutation::Put(key(b"fault/limits"), Bytes::from_static(b"different"));
+    let changed = StoreTransaction::try_from(input).unwrap();
+    assert_eq!(
+        block_on(store.transact(&changed)).unwrap(),
+        CommitOutcome::Conflict
+    );
+    assert_eq!(
+        block_on(store.get(key(b"fault/limits"))).unwrap(),
+        Some(Bytes::from_static(b"value"))
+    );
 }
 
 #[test]
@@ -516,7 +568,7 @@ fn given_healthy_empty_conflict_and_retry_runs_when_counted_then_store_operation
     let config = ConformanceConfig::default();
     let counted = bg_jobs_conformance::CountingStore::new(FakeStore::distributed());
     let profile = block_on(run_operation_profile(&counted, &config)).expect("profile should pass");
-    assert_eq!(profile.report.commits, 9);
+    assert_eq!(profile.report.commits, 10);
     assert_eq!(profile.report.reads, 3);
     assert_eq!(profile.report.get_many, 4);
     assert_eq!(profile.report.ranges, 4);
@@ -560,7 +612,7 @@ fn given_healthy_empty_conflict_and_retry_runs_when_counted_then_store_operation
         CommitOutcome::Committed
     );
     assert_eq!(
-        block_on(counted.commit(&stale)).expect("conflict result"),
+        block_on(counted.transact(&stale)).expect("conflict result"),
         CommitOutcome::Conflict
     );
     assert!(counted.snapshot().commits <= 3);
@@ -753,8 +805,8 @@ impl JobStore for MalformedRangeStore {
         Ok(page)
     }
 
-    async fn commit(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
-        self.inner.commit(transaction).await
+    async fn transact(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
+        self.inner.transact(transaction).await
     }
 }
 
@@ -790,7 +842,7 @@ impl JobStore for PartialCommitStore {
         self.inner.read_range(request).await
     }
 
-    async fn commit(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
+    async fn transact(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
         if transaction.checks().len() >= 2 && transaction.mutations().len() >= 2 {
             let partial = StoreTransaction::try_from(StoreTransactionInput {
                 operation_id: commit_operation_id(),
@@ -799,10 +851,10 @@ impl JobStore for PartialCommitStore {
                 limits: transaction.limits(),
             })
             .expect("partial transaction is within the original limits");
-            self.inner.commit(&partial).await?;
+            self.inner.transact(&partial).await?;
             return Ok(CommitOutcome::Conflict);
         }
-        self.inner.commit(transaction).await
+        self.inner.transact(transaction).await
     }
 }
 
@@ -838,7 +890,7 @@ impl JobStore for DeleteNoopStore {
         self.inner.read_range(request).await
     }
 
-    async fn commit(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
+    async fn transact(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
         let delete_only = !transaction.mutations().is_empty()
             && transaction
                 .mutations()
@@ -847,7 +899,7 @@ impl JobStore for DeleteNoopStore {
         if delete_only {
             return Ok(CommitOutcome::Committed);
         }
-        self.inner.commit(transaction).await
+        self.inner.transact(transaction).await
     }
 }
 
@@ -944,8 +996,8 @@ impl JobStore for NativeBatchStore {
         self.inner.read_range(request).await
     }
 
-    async fn commit(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
-        self.inner.commit(transaction).await
+    async fn transact(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
+        self.inner.transact(transaction).await
     }
 }
 
@@ -986,7 +1038,7 @@ fn commit_operation_id() -> CommitOperationId {
 
 fn commit<S: JobStore>(store: &S, checks: Vec<Check>, mutations: Vec<Mutation>) -> CommitOutcome {
     let transaction = transaction(store, checks, mutations);
-    block_on(store.commit(&transaction)).expect("test commit result")
+    block_on(store.transact(&transaction)).expect("test commit result")
 }
 
 fn transaction_limits(capabilities: StoreCapabilities) -> TransactionLimits {
@@ -1027,4 +1079,49 @@ fn nonzero_u32(value: u32) -> NonZeroU32 {
 
 fn nonzero_usize(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).expect("test value is non-zero")
+}
+
+#[test]
+fn given_accepted_enqueue_and_completion_when_both_producers_are_dropped_then_replacements_finish_the_work()
+ {
+    let store = FakeStore::local();
+    let namespace = bg_jobs::Namespace::try_new(b"producer-death-proof").unwrap();
+    let report = block_on(bg_jobs_conformance::run_recovery(
+        store.clone(),
+        store,
+        namespace,
+    ))
+    .unwrap();
+    assert_eq!(report.recovered_enqueues, 1);
+    assert_eq!(report.recovered_completions, 1);
+    assert_eq!(report.recovered_schedules, 1);
+    assert_eq!(report.handler_executions, 1);
+}
+
+#[test]
+fn given_recurring_work_when_twenty_thousand_occurrences_complete_then_rows_bytes_and_idle_writes_are_bounded()
+ {
+    let report = block_on(bg_jobs_conformance::run_lifecycle_growth(
+        FakeStore::local(),
+        bg_jobs::Namespace::try_new(b"completed-growth").unwrap(),
+        NonZeroU32::new(10_000).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(report.completed, 20_000);
+    assert_eq!(report.after_first_batch, report.after_second_batch);
+    assert_eq!(report.idle_mutations, 0);
+}
+
+#[test]
+fn given_unique_deduplicated_jobs_when_twenty_thousand_complete_and_expire_then_no_identity_archive_remains()
+ {
+    let report = block_on(bg_jobs_conformance::run_deduplication_growth(
+        FakeStore::local(),
+        bg_jobs::Namespace::try_new(b"dedupe-growth").unwrap(),
+        NonZeroU32::new(10_000).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(report.completed, 20_000);
+    assert_eq!(report.after_first_batch, report.after_second_batch);
+    assert_eq!(report.idle_mutations, 0);
 }

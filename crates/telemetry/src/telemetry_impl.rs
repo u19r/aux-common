@@ -7,7 +7,7 @@ use axum::{
 };
 use axum_prometheus::{
     PrometheusMetricLayer, PrometheusMetricLayerBuilder,
-    metrics_exporter_prometheus::PrometheusHandle,
+    metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle},
 };
 use subtle::ConstantTimeEq;
 use tracing::warn;
@@ -15,6 +15,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberI
 
 use crate::{
     MetricsConfig, TracingConfig,
+    constants::{METRICS_UPKEEP_INTERVAL, REQUEST_STORAGE_DURATION_BUCKETS_SECONDS},
     wide_log::{WideLogInitError, WideLogLayer},
 };
 
@@ -28,6 +29,8 @@ pub enum TelemetryError {
     WideLogInit(WideLogInitError),
     #[error("Prometheus metrics enabled but bearer token missing")]
     MetricsTokenMissing,
+    #[error("failed to configure Prometheus recorder")]
+    MetricsRecorder,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -131,12 +134,43 @@ pub fn setup_metrics(cfg: &MetricsConfig) -> Result<Option<MetricsComponents>, T
     let ignore_patterns: &'static [&'static str] = Box::leak(Box::new([metrics_path]));
     let builder = PrometheusMetricLayerBuilder::new().with_ignore_patterns(ignore_patterns);
 
-    let (layer, handle) = builder.with_default_metrics().build_pair();
+    let handle = install_metrics_recorder()?;
+    let (layer, handle) = builder.with_metrics_from_fn(|| handle).build_pair();
 
     Ok(Some(MetricsComponents {
         layer,
         state: Arc::new(MetricsState::new(handle, token)),
     }))
+}
+
+fn install_metrics_recorder() -> Result<PrometheusHandle, TelemetryError> {
+    let handle = PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full(axum_prometheus::utils::requests_duration_name().to_owned()),
+            axum_prometheus::utils::SECONDS_DURATION_BUCKETS,
+        )
+        .and_then(|builder| {
+            builder.set_buckets_for_metric(
+                Matcher::Full(
+                    metrics_facade::HistogramMetric::HttpStorageOperationDurationSeconds
+                        .name()
+                        .to_owned(),
+                ),
+                REQUEST_STORAGE_DURATION_BUCKETS_SECONDS,
+            )
+        })
+        .map_err(|_| TelemetryError::MetricsRecorder)?
+        .install_recorder()
+        .map_err(|_| TelemetryError::MetricsRecorder)?;
+    let upkeep = handle.clone();
+    // Preserve the upkeep performed by axum-prometheus's default recorder.
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(METRICS_UPKEEP_INTERVAL).await;
+            upkeep.run_upkeep();
+        }
+    });
+    Ok(handle)
 }
 
 pub async fn metrics_handler(

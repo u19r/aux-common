@@ -54,7 +54,14 @@ fn given_a_typed_spec_and_seed_when_registering_then_the_catalog_owns_both() {
     assert_eq!(handle.kind().as_str(), "typed.seeded");
     let system = JobSystem::new(
         crate::FakeStore::new(),
-        catalog,
+        catalog.with_manifest(
+            super::CatalogManifest::try_new(
+                super::CatalogRevision::from(std::num::NonZeroU64::MIN),
+                vec![JobId::from([7; 16])],
+                Vec::new(),
+            )
+            .unwrap(),
+        ),
         Namespace::try_new(b"jobs").expect("test namespace is valid"),
         OwnerId::from([7; OwnerId::BYTE_LENGTH]),
         wake_scheduler(),
@@ -165,7 +172,14 @@ fn given_a_continued_seed_when_catalog_ensures_it_then_schedule_and_checkpoint_a
         .expect("catalog registration is valid");
     let system = JobSystem::new(
         crate::FakeStore::new(),
-        catalog,
+        catalog.with_manifest(
+            super::CatalogManifest::try_new(
+                super::CatalogRevision::from(std::num::NonZeroU64::MIN),
+                vec![seed.job_id],
+                Vec::new(),
+            )
+            .unwrap(),
+        ),
         Namespace::try_new(b"jobs").expect("test namespace is valid"),
         OwnerId::from([1; OwnerId::BYTE_LENGTH]),
         wake_scheduler(),

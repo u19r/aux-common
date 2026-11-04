@@ -198,6 +198,15 @@ impl<S: JobStore> JobRuntime<S> {
         self.system.terminal_authority(job_id).await
     }
 
+    /// Retires an exact terminal snapshot after durable business
+    /// reconciliation.
+    pub async fn settle_terminal(
+        &self,
+        authority: bg_jobs::JobTerminalAuthority,
+    ) -> JobResult<(), S::Error> {
+        self.system.settle_terminal(authority).await
+    }
+
     /// Observes durable completion, including recovery after a lost response.
     pub async fn observe_lifecycle(
         &self,
@@ -217,7 +226,6 @@ impl<S: JobStore> JobRuntime<S> {
     ) -> JobResult<crate::QueueOutcome, S::Error> {
         use bg_jobs::{JobState, JobSystemError, LifecycleObservation};
         let deadline = match self.observe_lifecycle(job_id).await? {
-            LifecycleObservation::Terminal(_) => return Ok(crate::QueueOutcome::Complete),
             LifecycleObservation::Current { record, .. } => match record.state {
                 JobState::Scheduled => record.scheduled_at,
                 JobState::Leased(lease) => lease.expires_at,
@@ -239,6 +247,14 @@ impl<S: JobStore> JobRuntime<S> {
         Ok(crate::QueueOutcome::RetryAfter(Duration::from_millis(
             u64::try_from(remaining).unwrap_or_default().max(1),
         )))
+    }
+
+    /// Recovers accepted input before event-driven admission, without running
+    /// handlers. Exclusive access prevents an overlapping drive on this
+    /// runtime. This separately bounded bootstrap pass is outside drive
+    /// budgets; backend futures must enforce their own deadlines.
+    pub async fn recover_commits(&mut self) -> JobResult<u32, S::Error> {
+        self.system.recover_commits().await
     }
 
     /// Ensures every seed declared in the catalog.

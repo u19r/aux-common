@@ -24,7 +24,7 @@ fn request() -> DriveRequest {
         max_concurrency: NonZeroU16::MIN,
         max_payload_bytes_in_flight: NonZeroUsize::new(1024).expect("bytes are non-zero"),
         max_completion_details: 1,
-        max_store_operations: NonZeroU32::new(64).expect("operations are non-zero"),
+        max_store_operations: NonZeroU32::new(512).expect("operations are non-zero"),
         stop_claiming_at: MonotonicDeadline::from_nanos(u64::MAX),
         finish_by: MonotonicDeadline::from_nanos(u64::MAX),
     })
@@ -175,10 +175,10 @@ fn fixed_bulk_seed_uses_real_enqueue_and_owner_projection() {
 #[test]
 fn fixed_primary_batch_resolves_real_claims_and_clears_scratch() {
     let mut driver = FairDispatchDriver::default();
-    for _ in 0..5 {
+    for step in 0..5 {
         driver
             .apply_action_for_test("fixedPrimaryBatchTrace")
-            .expect("primary batch action crosses real boundaries");
+            .unwrap_or_else(|error| panic!("primary batch step {step}: {error}"));
     }
     let projection = driver.projection_for_test();
     assert!(!projection.meta.batch_active);

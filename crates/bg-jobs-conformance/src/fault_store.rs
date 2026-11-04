@@ -1,13 +1,12 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     fmt,
     future::Future,
     sync::{Arc, Mutex},
 };
 
 use bg_jobs::store::{
-    CommitOperationId, CommitOutcome, JobStore, RangePage, RangeRequest, StoreCapabilities,
-    StoreKey, StoreTransaction,
+    CommitOutcome, JobStore, RangePage, RangeRequest, StoreCapabilities, StoreKey, StoreTransaction,
 };
 use bytes::Bytes;
 
@@ -49,7 +48,6 @@ pub enum FaultStoreError<E> {
     Inner(E),
     Unavailable,
     Timeout,
-    CommitOperationReused,
     Poisoned,
 }
 
@@ -59,9 +57,6 @@ impl<E: fmt::Display> fmt::Display for FaultStoreError<E> {
             Self::Inner(error) => error.fmt(formatter),
             Self::Unavailable => formatter.write_str("injected store unavailability"),
             Self::Timeout => formatter.write_str("injected store timeout"),
-            Self::CommitOperationReused => {
-                formatter.write_str("commit operation ID was reused with different content")
-            }
             Self::Poisoned => formatter.write_str("fault store state is poisoned"),
         }
     }
@@ -85,7 +80,6 @@ pub struct FaultStore<S: JobStore> {
 #[derive(Default)]
 struct FaultState {
     queued: VecDeque<QueuedFault>,
-    commits: BTreeMap<CommitOperationId, StoreTransaction>,
 }
 
 impl<S: JobStore> Clone for FaultStore<S> {
@@ -152,29 +146,6 @@ impl<S: JobStore> FaultStore<S> {
             });
         Ok(index.and_then(|index| state.queued.remove(index)))
     }
-
-    fn replay_injected_conflict(
-        &self,
-        transaction: &StoreTransaction,
-    ) -> Result<bool, FaultStoreError<S::Error>> {
-        let state = self.state.lock().map_err(|_| FaultStoreError::Poisoned)?;
-        match state.commits.get(&transaction.operation_id()) {
-            Some(recorded) if recorded == transaction => Ok(true),
-            Some(_) => Err(FaultStoreError::CommitOperationReused),
-            None => Ok(false),
-        }
-    }
-
-    fn record_injected_conflict(
-        &self,
-        transaction: &StoreTransaction,
-    ) -> Result<(), FaultStoreError<S::Error>> {
-        let mut state = self.state.lock().map_err(|_| FaultStoreError::Poisoned)?;
-        state
-            .commits
-            .insert(transaction.operation_id(), transaction.clone());
-        Ok(())
-    }
 }
 
 impl<S: JobStore> JobStore for FaultStore<S> {
@@ -235,27 +206,21 @@ impl<S: JobStore> JobStore for FaultStore<S> {
         }
     }
 
-    fn commit<'a>(
+    fn transact<'a>(
         &'a self,
         transaction: &'a StoreTransaction,
     ) -> impl Future<Output = Result<CommitOutcome, Self::Error>> + Send + 'a {
         let store = self.clone();
         async move {
-            if store.replay_injected_conflict(transaction)? {
-                return Ok(CommitOutcome::Conflict);
-            }
             match store.take_fault(None)? {
                 Some(QueuedFault::Commit(kind)) => match kind {
                     CommitFaultKind::Transient(kind) => Err(read_fault(kind)),
-                    CommitFaultKind::Conflict => {
-                        store.record_injected_conflict(transaction)?;
-                        Ok(CommitOutcome::Conflict)
-                    }
+                    CommitFaultKind::Conflict => Ok(CommitOutcome::Conflict),
                     CommitFaultKind::UnknownBeforeCommit => Ok(CommitOutcome::Unknown),
                     CommitFaultKind::UnknownAfterCommit => {
                         let result = store
                             .inner
-                            .commit(transaction)
+                            .transact(transaction)
                             .await
                             .map_err(FaultStoreError::Inner)?;
                         Ok(if result == CommitOutcome::Committed {
@@ -270,7 +235,7 @@ impl<S: JobStore> JobStore for FaultStore<S> {
                 }
                 None => store
                     .inner
-                    .commit(transaction)
+                    .transact(transaction)
                     .await
                     .map_err(FaultStoreError::Inner),
             }
@@ -413,7 +378,7 @@ impl<S: JobStore> JobStore for CountingStore<S> {
         }
     }
 
-    fn commit<'a>(
+    fn transact<'a>(
         &'a self,
         transaction: &'a StoreTransaction,
     ) -> impl Future<Output = Result<CommitOutcome, Self::Error>> + Send + 'a {
@@ -428,7 +393,7 @@ impl<S: JobStore> JobStore for CountingStore<S> {
                 counts.transaction_checks += checks;
                 counts.transaction_mutations += mutations;
             });
-            store.inner.commit(transaction).await
+            store.inner.transact(transaction).await
         }
     }
 }

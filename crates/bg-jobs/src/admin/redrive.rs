@@ -10,10 +10,7 @@ use crate::{
     keys,
     model::{JobRecordV1, JobState},
     store::{Check, JobStore, Mutation},
-    transition::{
-        checked_transaction, commit_record_without_claim, fresh_operation, next_revision,
-        wake_mutation,
-    },
+    transition::{checked_transaction, fresh_operation, next_revision, wake_mutation},
 };
 
 /// Redrives a dead-lettered job with explicit generation and execution identity
@@ -85,10 +82,15 @@ async fn commit_redrive<S: JobStore>(
     request: RedriveRequest,
     fence_high_water: u64,
 ) -> JobResult<RedriveResult, S::Error> {
-    let (transaction, new_encoded) =
+    let transaction =
         redrive_transaction(system, &encoded, &next, &request, fence_high_water).await?;
     let job_id = next.job_id;
-    commit_record_without_claim(system, transaction, &job_id, &encoded, &new_encoded).await?;
+    system
+        .commit_transition(
+            transaction,
+            crate::transition::TransitionConflict::LeaseLost,
+        )
+        .await?;
     let reused_execution = request.execution == RedriveExecution::ReuseExecutionId;
     system.observe(crate::observer::JobEvent::Redriven {
         queue: next.queue,
@@ -108,7 +110,7 @@ async fn redrive_transaction<S: JobStore>(
     next: &JobRecordV1,
     request: &RedriveRequest,
     fence_high_water: u64,
-) -> JobResult<(crate::store::StoreTransaction, Bytes), S::Error> {
+) -> JobResult<crate::store::StoreTransaction, S::Error> {
     let job_id = next.job_id;
     let job_key = keys::job_key(system.namespace(), &job_id)?;
     let operation_key = keys::operation_key(system.namespace(), &job_id)?;
@@ -132,7 +134,7 @@ async fn redrive_transaction<S: JobStore>(
     if let Some(check) = wake_check {
         checks.push(check);
     }
-    Ok((checked_transaction(system, checks, mutations)?, new_encoded))
+    checked_transaction(system, checks, mutations)
 }
 
 fn redrive_mutations<S: JobStore>(

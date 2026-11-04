@@ -312,7 +312,7 @@ fn given_a_malformed_cancellation_marker_when_expiring_a_lease_then_no_state_is_
 }
 
 #[test]
-fn given_a_cancellation_recovery_conflict_when_expiring_a_lease_then_the_marker_and_authority_survive()
+fn given_an_aborted_cancellation_recovery_with_valid_authority_when_expiring_then_cancellation_finishes_atomically()
  {
     let store = FakeStore::local();
     let system = system(store.clone(), FairnessPolicy::low_volume(), 1);
@@ -321,15 +321,25 @@ fn given_a_cancellation_recovery_conflict_when_expiring_a_lease_then_the_marker_
         .expect("enqueue");
     block_on(system.claim(id, Timestamp::ZERO)).expect("claim");
     block_on(system.cancel_job(id, Timestamp::from_millis(1))).expect("cancel");
-    let before = store.snapshot().expect("snapshot");
     store
-        .queue_commit_outcome(CommitOutcome::Conflict)
+        .queue_commit_for_key(
+            crate::keys::job_key(system.namespace(), &id).unwrap(),
+            CommitOutcome::Conflict,
+            false,
+        )
         .expect("queue conflict");
     assert!(matches!(
         block_on(system.expire_job(id, Timestamp::from_millis(1000))),
-        Err(JobSystemError::LeaseLost)
+        Ok(ExpiryResult::Cancelled)
     ));
-    assert_eq!(store.snapshot().expect("snapshot"), before);
+    assert!(
+        block_on(store.get(crate::keys::cancellation_key(system.namespace(), &id).unwrap()))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        matches!(block_on(system.observe_lifecycle(id)).unwrap(), LifecycleObservation::Current { record, .. } if record.state == JobState::Cancelled)
+    );
 }
 
 #[test]

@@ -22,6 +22,9 @@ mod request_cost_context_tests;
 mod request_cost_finalization;
 #[cfg(all(test, feature = "request-cost"))]
 mod request_cost_tests;
+mod request_operation;
+#[cfg(all(test, feature = "request-cost"))]
+mod request_operation_tests;
 
 #[cfg(feature = "request-cost")]
 pub use crate::request_cost::{
@@ -33,6 +36,7 @@ pub use crate::request_cost::{
 #[cfg(not(feature = "request-cost"))]
 mod request_cost_disabled;
 pub use request_cost_context::{RequestCostContext, inherit_request_cost};
+pub use request_operation::{RequestOperation, request_storage_operation_histogram};
 
 #[cfg(all(feature = "http-observer", not(target_arch = "wasm32")))]
 pub use crate::http_request_observer::{

@@ -4,8 +4,8 @@ use std::{
 };
 
 use bg_jobs::store::{
-    Check, CommitOperationId, CommitOutcome, Mutation, RangeDirection, RangeEntry, RangePage,
-    RangeRequest, StoreCapabilities, StoreContractError, StoreKey, StoreTransaction,
+    Check, CommitOutcome, Mutation, RangeDirection, RangeEntry, RangePage, RangeRequest,
+    StoreCapabilities, StoreContractError, StoreKey, StoreTransaction,
 };
 use bytes::Bytes;
 
@@ -19,13 +19,6 @@ use bytes::Bytes;
 pub struct StoreModel {
     capabilities: StoreCapabilities,
     entries: BTreeMap<StoreKey, Bytes>,
-    commits: BTreeMap<CommitOperationId, ModelCommit>,
-}
-
-#[derive(Clone, Debug)]
-struct ModelCommit {
-    transaction: StoreTransaction,
-    outcome: CommitOutcome,
 }
 
 impl StoreModel {
@@ -33,7 +26,6 @@ impl StoreModel {
         Self {
             capabilities,
             entries: BTreeMap::new(),
-            commits: BTreeMap::new(),
         }
     }
 
@@ -96,26 +88,12 @@ impl StoreModel {
         RangePage::new(entries, continuation).map_err(StoreModelError::Contract)
     }
 
-    pub fn commit(
+    pub fn transact(
         &mut self,
         transaction: &StoreTransaction,
     ) -> Result<CommitOutcome, StoreModelError> {
         self.capabilities.validate_transaction(transaction)?;
-        if let Some(recorded) = self.commits.get(&transaction.operation_id()) {
-            return if recorded.transaction == *transaction {
-                Ok(recorded.outcome)
-            } else {
-                Err(StoreModelError::CommitOperationReused)
-            };
-        }
         if !checks_match(&self.entries, transaction.checks()) {
-            self.commits.insert(
-                transaction.operation_id(),
-                ModelCommit {
-                    transaction: transaction.clone(),
-                    outcome: CommitOutcome::Conflict,
-                },
-            );
             return Ok(CommitOutcome::Conflict);
         }
         let mut next = self.entries.clone();
@@ -130,13 +108,6 @@ impl StoreModel {
             }
         }
         self.entries = next;
-        self.commits.insert(
-            transaction.operation_id(),
-            ModelCommit {
-                transaction: transaction.clone(),
-                outcome: CommitOutcome::Committed,
-            },
-        );
         Ok(CommitOutcome::Committed)
     }
 
@@ -235,7 +206,6 @@ pub enum StoreModelError {
     Contract(StoreContractError),
     Capability(&'static str),
     RangeItemTooLarge,
-    CommitOperationReused,
 }
 
 impl std::fmt::Display for StoreModelError {
@@ -244,9 +214,6 @@ impl std::fmt::Display for StoreModelError {
             Self::Contract(error) => error.fmt(formatter),
             Self::Capability(field) => write!(formatter, "model capability exceeded: {field}"),
             Self::RangeItemTooLarge => formatter.write_str("model range item exceeds limit"),
-            Self::CommitOperationReused => {
-                formatter.write_str("commit operation ID was reused with different content")
-            }
         }
     }
 }

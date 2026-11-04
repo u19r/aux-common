@@ -8,7 +8,7 @@ use crate::{
 };
 
 /// Immutable enqueue identity, excluding the schedule that a controller can
-/// change. Its bounded digest remains in terminal receipts after payload
+/// change. The current catalog retains its bounded digest after payload
 /// cleanup.
 #[derive(PartialEq, Eq)]
 pub(crate) struct JobDefinition<'a> {
@@ -25,6 +25,32 @@ pub(crate) struct JobDefinition<'a> {
     pub expires_at: Option<Timestamp>,
     pub policy: JobPolicySnapshot,
     pub deduplication: Option<&'a Deduplication>,
+}
+
+impl<'a> JobDefinition<'a> {
+    pub(crate) fn try_from_request(
+        job: &'a super::NewJob,
+        namespace: &'a Namespace,
+        registration: &'a crate::registry::HandlerRegistration,
+        payload_digest: [u8; 32],
+    ) -> Result<Self, crate::error::StoreDataError> {
+        Ok(Self {
+            job_id: job.job_id,
+            namespace,
+            queue: registration.queue(),
+            kind: &job.kind,
+            schema_version: job.schema_version,
+            payload_length: u32::try_from(job.payload.len())
+                .map_err(|_| crate::error::StoreDataError::LengthOverflow)?,
+            payload_digest,
+            fairness: &job.fairness,
+            ordering_key: job.ordering_key.as_ref(),
+            priority: job.priority,
+            expires_at: job.expires_at,
+            policy: registration.policy_with_retry(job.retry_override),
+            deduplication: job.deduplication.as_ref(),
+        })
+    }
 }
 
 impl<'a> From<&'a JobRecordV1> for JobDefinition<'a> {

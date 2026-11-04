@@ -76,49 +76,153 @@ fn given_fixed_workload_when_running_lifecycle_then_reports_metrics() {
     let mode = std::env::var("BG_JOBS_PERF_MODE").unwrap_or_else(|_| "manual".to_owned());
     assert!(matches!(mode.as_str(), "baseline" | "candidate" | "manual"));
     for round in 0..ROUNDS {
-        let (store, counters) = CountingStore::new();
-        let system = build_system(store.clone());
-        let jobs = workload(round);
-        let guard = AllocationGuard::start(
-            module_path!(),
-            "given_fixed_workload_when_running_lifecycle_then_reports_metrics",
-            file!(),
-            line!(),
-            Some(mode.as_str()),
-        );
-        let started = Instant::now();
-        let report = block_on(run_workload(&system, jobs));
-        let elapsed_nanos = started.elapsed().as_nanos();
-        let allocations = guard.finish();
-        let counts = counters.snapshot();
-        println!(
-            concat!(
-                "bg_jobs_perf mode={} round={} seed={} jobs={} ",
-                "payload_bytes={} gets={} ranges={} commits={} get_key_bytes={} ",
-                "range_request_key_bytes={} range_result_bytes={} transaction_bytes={} ",
-                "allocations={} allocated_bytes={} elapsed_nanos={} succeeded={}"
-            ),
-            mode,
-            round,
-            SEED,
-            JOBS,
-            report.payload_bytes,
-            counts.gets,
-            counts.ranges,
-            counts.commits,
-            counts.get_key_bytes,
-            counts.range_request_key_bytes,
-            counts.range_result_bytes,
-            counts.transaction_bytes,
-            allocations.allocation_count,
-            allocations.allocated_bytes,
-            elapsed_nanos,
-            report.succeeded,
-        );
+        measure_lifecycle(&mode, round);
         run_recovery_workload(&mode, round);
         run_fair_batch_workload(&mode, round);
         run_schedule_wake_workload(&mode, round);
     }
+}
+
+fn measure_lifecycle(mode: &str, round: usize) {
+    let (store, counters) = CountingStore::new();
+    let system = build_system(store.clone(), JobCatalog::new());
+    let jobs = workload(round);
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "given_fixed_workload_when_running_lifecycle_then_reports_metrics",
+        file!(),
+        line!(),
+        Some(mode),
+    );
+    let started = Instant::now();
+    let report = block_on(run_workload(&system, jobs));
+    let elapsed_nanos = started.elapsed().as_nanos();
+    let allocations = guard.finish();
+    let counts = counters.snapshot();
+    println!(
+        concat!(
+            "bg_jobs_perf mode={} round={} seed={} jobs={} ",
+            "payload_bytes={} gets={} ranges={} commits={} committed={} conflicts={} unknown={} \
+             get_key_bytes={} ",
+            "range_request_key_bytes={} range_result_bytes={} transaction_bytes={} ",
+            "allocations={} allocated_bytes={} elapsed_nanos={} succeeded={}"
+        ),
+        mode,
+        round,
+        SEED,
+        JOBS,
+        report.payload_bytes,
+        counts.gets,
+        counts.ranges,
+        counts.commits,
+        counts.committed,
+        counts.conflicts,
+        counts.unknown,
+        counts.get_key_bytes,
+        counts.range_request_key_bytes,
+        counts.range_result_bytes,
+        counts.transaction_bytes,
+        allocations.allocation_count,
+        allocations.allocated_bytes,
+        elapsed_nanos,
+        report.succeeded,
+    );
+}
+
+#[test]
+#[ignore = "equal-work lifecycle and durable schedule measurement"]
+fn given_equal_completed_work_when_measuring_storage_lifecycle_then_reports_three_samples() {
+    let mode = std::env::var("BG_JOBS_PERF_MODE").unwrap_or_else(|_| "manual".to_owned());
+    for round in 0..ROUNDS {
+        measure_lifecycle(&mode, round);
+        run_schedule_wake_workload(&mode, round);
+    }
+}
+
+#[test]
+#[ignore = "stage-level write attribution; run with the equal-work performance measurement"]
+fn given_one_uncontended_job_when_tracing_lifecycle_then_native_calls_and_row_operations_are_reported()
+ {
+    for payload_size in [64, 65_536] {
+        for mode in ["direct", "drive", "drive-low-volume", "drive-conflict"] {
+            let (store, counters) = CountingStore::new();
+            let low_volume = mode == "drive-low-volume";
+            let fairness_policy = if low_volume {
+                FairnessPolicy::low_volume()
+            } else {
+                FairnessPolicy::from(nonzero_u16(1))
+            };
+            let system =
+                build_system_with_policy(store.clone(), JobCatalog::new(), fairness_policy);
+            let mut job = workload(0).remove(0);
+            if low_volume {
+                job.fairness = FairnessClass::low_volume();
+            }
+            job.payload = payload(0, payload_size);
+            let job_id = job.job_id;
+            if mode == "drive-conflict" {
+                store
+                    .inner
+                    .queue_commit_outcome(CommitOutcome::Conflict)
+                    .unwrap();
+            }
+            block_on(system.enqueue_raw(job, NOW)).unwrap();
+            print_write_stage(mode, payload_size, "enqueue", &counters);
+            if mode == "direct" {
+                let claim = block_on(system.claim(job_id, NOW)).unwrap();
+                print_write_stage(mode, payload_size, "claim", &counters);
+                let outcome =
+                    block_on(system.execute_claimed(&claim, NOW, || MonotonicDeadline::ZERO))
+                        .unwrap();
+                print_write_stage(mode, payload_size, "handler", &counters);
+                block_on(system.apply_outcome(claim, outcome, NOW)).unwrap();
+                print_write_stage(mode, payload_size, "completion", &counters);
+            } else {
+                let request = DriveRequest::try_from(DriveRequestInput {
+                    queues: QueueSelection::all(),
+                    max_claims: nonzero_u32(1),
+                    max_concurrency: nonzero_u16(1),
+                    max_payload_bytes_in_flight: nonzero_usize(128 * 1024),
+                    max_completion_details: 1,
+                    max_store_operations: nonzero_u32(512),
+                    stop_claiming_at: MonotonicDeadline::from_nanos(u64::MAX / 2),
+                    finish_by: MonotonicDeadline::from_nanos(u64::MAX),
+                })
+                .unwrap();
+                let report =
+                    block_on(system.drive(request, NOW, || MonotonicDeadline::ZERO)).unwrap();
+                assert_eq!(report.counts.succeeded, 1);
+                print_write_stage(mode, payload_size, "drive", &counters);
+            }
+        }
+    }
+}
+
+fn print_write_stage(mode: &str, payload_bytes: usize, stage: &str, counters: &StoreCounters) {
+    let counts = counters.snapshot();
+    println!(
+        "bg_jobs_write_trace mode={mode} payload_bytes={payload_bytes} stage={stage} commits={} \
+         committed={} conflicts={} unknown={} puts={} deletes={} transaction_bytes={}",
+        counts.commits,
+        counts.committed,
+        counts.conflicts,
+        counts.unknown,
+        counts.put_operations,
+        counts.delete_operations,
+        counts.transaction_bytes
+    );
+    assert_eq!(counts.unknown, 0);
+    if mode != "drive-conflict" {
+        let expected = match stage {
+            "handler" => 0,
+            "drive" => 3,
+            _ => 1,
+        };
+        assert_eq!(counts.commits, expected, "normal lifecycle write budget");
+        assert_eq!(counts.committed, expected);
+        assert_eq!(counts.conflicts, 0);
+    }
+    counters.reset();
 }
 
 struct WorkloadReport {
@@ -144,7 +248,7 @@ async fn run_workload(
         max_concurrency: nonzero_u16(1),
         max_payload_bytes_in_flight: nonzero_usize(384 * 1024),
         max_completion_details: JOBS as u32,
-        max_store_operations: nonzero_u32((JOBS * 24) as u32),
+        max_store_operations: nonzero_u32((JOBS * 256) as u32),
         stop_claiming_at: MonotonicDeadline::from_nanos(u64::MAX / 2),
         finish_by: MonotonicDeadline::from_nanos(u64::MAX),
     })
@@ -226,8 +330,15 @@ impl JobHandler for CompletingHandler {
     }
 }
 
-fn build_system(store: CountingStore) -> JobSystem<CountingStore> {
-    let mut catalog = JobCatalog::new();
+fn build_system(store: CountingStore, catalog: JobCatalog) -> JobSystem<CountingStore> {
+    build_system_with_policy(store, catalog, FairnessPolicy::from(nonzero_u16(1)))
+}
+
+fn build_system_with_policy(
+    store: CountingStore,
+    mut catalog: JobCatalog,
+    fairness_policy: FairnessPolicy,
+) -> JobSystem<CountingStore> {
     catalog
         .register_raw(
             HandlerDefinition {
@@ -236,7 +347,7 @@ fn build_system(store: CountingStore) -> JobSystem<CountingStore> {
                 queue: QueueName::try_new("perf").expect("fixed queue is valid"),
                 effect_mode: EffectMode::Idempotent,
                 cost_units: nonzero_u16(1),
-                fairness_policy: FairnessPolicy::from(nonzero_u16(1)),
+                fairness_policy,
                 default_retry: RetrySelection::Preset(RetryPreset::Interactive),
                 default_timeout: Duration::from_secs(1),
                 handler: CompletingHandler {
@@ -991,7 +1102,7 @@ struct IdleMeasurement {
 
 fn measure_idle_drives() -> IdleMeasurement {
     let (store, counters) = CountingStore::new();
-    let system = build_system(store);
+    let system = build_system(store, JobCatalog::new());
     let request = p04_drive_request();
     let guard = AllocationGuard::start(
         module_path!(),
@@ -1216,8 +1327,16 @@ fn measure_materialization(
     expected_occurrences: usize,
 ) {
     let (store, counters) = CountingStore::new();
-    let system = build_system(store);
     let (schedule, cursor, now) = p04_schedule(round, index, policy);
+    let manifest = bg_jobs::CatalogManifest::try_new(
+        bg_jobs::CatalogRevision::from(std::num::NonZeroU64::MIN),
+        Vec::new(),
+        vec![schedule.schedule_id],
+    )
+    .expect("performance schedule manifest");
+    let system = build_system(store, JobCatalog::new().with_manifest(manifest));
+    block_on(system.initialize_catalog()).expect("performance catalog bootstrap");
+    counters.reset();
     let guard = AllocationGuard::start(
         module_path!(),
         "given_fixed_workload_when_running_lifecycle_then_reports_metrics",
@@ -1345,7 +1464,7 @@ fn per_unit_milli_u128(value: u128, units: usize) -> u128 {
 
 fn run_retry_phase(mode: &str, round: usize) {
     let (store, counters) = CountingStore::new();
-    let system = build_system(store);
+    let system = build_system(store, JobCatalog::new());
     let jobs = recovery_jobs(round, 1);
     let payload_bytes = jobs.iter().map(|job| job.payload.len()).sum::<usize>();
     let guard = AllocationGuard::start(
@@ -1380,7 +1499,7 @@ fn run_retry_phase(mode: &str, round: usize) {
 
 fn run_renewal_phase(mode: &str, round: usize) {
     let (store, counters) = CountingStore::new();
-    let system = build_system(store);
+    let system = build_system(store, JobCatalog::new());
     let jobs = recovery_jobs(round, 2);
     let payload_bytes = jobs.iter().map(|job| job.payload.len()).sum::<usize>();
     let guard = AllocationGuard::start(
@@ -1417,7 +1536,7 @@ fn run_renewal_phase(mode: &str, round: usize) {
 fn run_crash_phase(mode: &str, round: usize) {
     let (store, counters) = CountingStore::new();
     let fault_store = store.inner.clone();
-    let system = build_system(store);
+    let system = build_system(store, JobCatalog::new());
     let jobs = recovery_jobs(round, 3);
     let payload_bytes = jobs.iter().map(|job| job.payload.len()).sum::<usize>();
     let guard = AllocationGuard::start(
@@ -1810,7 +1929,7 @@ impl JobStore for CountingStore {
         }
     }
 
-    fn commit<'a>(
+    fn transact<'a>(
         &'a self,
         transaction: &'a StoreTransaction,
     ) -> impl Future<Output = Result<CommitOutcome, Self::Error>> + Send + 'a {
@@ -1818,10 +1937,22 @@ impl JobStore for CountingStore {
         self.counters
             .transaction_bytes
             .fetch_add(transaction.encoded_bytes() as u64, Ordering::Relaxed);
-        let future = self.inner.commit(transaction);
+        let puts = transaction
+            .mutations()
+            .iter()
+            .filter(|mutation| matches!(mutation, bg_jobs::store::Mutation::Put(_, _)))
+            .count() as u64;
+        let deletes = transaction.mutations().len() as u64 - puts;
+        let future = self.inner.transact(transaction);
         let counters = Arc::clone(&self.counters);
         async move {
             let outcome = future.await?;
+            if outcome == CommitOutcome::Committed {
+                counters.put_operations.fetch_add(puts, Ordering::Relaxed);
+                counters
+                    .delete_operations
+                    .fetch_add(deletes, Ordering::Relaxed);
+            }
             match outcome {
                 CommitOutcome::Committed => counters.committed.fetch_add(1, Ordering::Relaxed),
                 CommitOutcome::Conflict => counters.conflicts.fetch_add(1, Ordering::Relaxed),
@@ -1844,6 +1975,8 @@ struct StoreCounters {
     range_request_key_bytes: AtomicU64,
     range_result_bytes: AtomicU64,
     transaction_bytes: AtomicU64,
+    put_operations: AtomicU64,
+    delete_operations: AtomicU64,
 }
 
 struct StoreSnapshot {
@@ -1857,9 +1990,30 @@ struct StoreSnapshot {
     range_request_key_bytes: u64,
     range_result_bytes: u64,
     transaction_bytes: u64,
+    put_operations: u64,
+    delete_operations: u64,
 }
 
 impl StoreCounters {
+    fn reset(&self) {
+        for counter in [
+            &self.gets,
+            &self.ranges,
+            &self.commits,
+            &self.committed,
+            &self.conflicts,
+            &self.unknown,
+            &self.get_key_bytes,
+            &self.range_request_key_bytes,
+            &self.range_result_bytes,
+            &self.transaction_bytes,
+            &self.put_operations,
+            &self.delete_operations,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
     fn snapshot(&self) -> StoreSnapshot {
         StoreSnapshot {
             gets: self.gets.load(Ordering::Relaxed),
@@ -1872,6 +2026,8 @@ impl StoreCounters {
             range_request_key_bytes: self.range_request_key_bytes.load(Ordering::Relaxed),
             range_result_bytes: self.range_result_bytes.load(Ordering::Relaxed),
             transaction_bytes: self.transaction_bytes.load(Ordering::Relaxed),
+            put_operations: self.put_operations.load(Ordering::Relaxed),
+            delete_operations: self.delete_operations.load(Ordering::Relaxed),
         }
     }
 }

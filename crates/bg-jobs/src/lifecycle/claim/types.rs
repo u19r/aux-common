@@ -205,6 +205,7 @@ impl ClaimRoute {
 }
 
 pub(super) struct ClaimTransactionInput<'a> {
+    pub(super) fence: crate::lifecycle::fence::FenceReservation,
     pub(super) record: &'a JobRecordV1,
     pub(super) encoded: &'a Bytes,
     pub(super) route: ClaimRoute,

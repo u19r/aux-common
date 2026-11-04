@@ -2,13 +2,13 @@ use std::num::NonZeroU16;
 
 use crate::{
     codec::{
-        DecodedOperation, KeyCodec, KeyTag, LiveOperationAuthority, ValueCodec, ValueTag,
-        decode_operation, encode_operation_marker, encode_operation_receipt,
+        KeyCodec, KeyTag, LiveOperationAuthority, ValueCodec, ValueTag, decode_operation,
+        encode_operation_marker,
     },
     error::StoreDataError,
-    ids::{DeduplicationKey, JobId, Namespace, OperationId, OrderingKey, QueueName},
+    ids::{JobId, Namespace, OperationId, OrderingKey, QueueName},
     keys::constants::MAX_DURABLE_PERMIT_SLOTS,
-    model::{JobRecordV1, JobState, OperationReceipt},
+    model::{JobRecordV1, JobState},
     policy::FairnessClass,
     store::StoreKey,
     time::Timestamp,
@@ -81,13 +81,6 @@ pub(crate) fn lease_queue_prefix(
     queue: &QueueName,
 ) -> Result<StoreKey, StoreDataError> {
     KeyCodec::encode(namespace, KeyTag::Lease, &[queue.as_str().as_bytes()])
-}
-
-pub(crate) fn dedupe_key(
-    namespace: &Namespace,
-    key: &DeduplicationKey,
-) -> Result<StoreKey, StoreDataError> {
-    KeyCodec::encode(namespace, KeyTag::Dedupe, &[key.as_bytes()])
 }
 
 pub(crate) fn wake_key(
@@ -216,13 +209,11 @@ pub(crate) fn decode_operation_authority(
     encoded: &[u8],
     expected_job_id: &JobId,
 ) -> Result<LiveOperationAuthority, StoreDataError> {
-    match decode_operation(encoded)? {
-        DecodedOperation::Live(authority) if authority.matches_job(*expected_job_id) => {
-            Ok(authority)
-        }
-        DecodedOperation::Live(_) => Err(StoreDataError::Malformed("operation job identity")),
-        DecodedOperation::Receipt(_) => Err(StoreDataError::Malformed("operation marker")),
+    let authority = decode_operation(encoded)?;
+    if !authority.matches_job(*expected_job_id) {
+        return Err(StoreDataError::Malformed("operation job identity"));
     }
+    Ok(authority)
 }
 
 pub(crate) fn decode_active_operation(
@@ -230,40 +221,7 @@ pub(crate) fn decode_active_operation(
     expected_job_id: &JobId,
 ) -> Result<(OperationId, u64), StoreDataError> {
     let authority = decode_operation_authority(encoded, expected_job_id)?;
-    let operation = authority
-        .operation_id()
-        .ok_or(StoreDataError::Malformed("operation marker"))?;
-    Ok((operation, authority.fence_high_water()))
-}
-
-pub(crate) fn operation_watermark_value(
-    job_id: &JobId,
-    fence_high_water: u64,
-) -> Result<bytes::Bytes, StoreDataError> {
-    crate::codec::encode_operation_watermark(job_id, fence_high_water)
-}
-
-pub(crate) fn decode_operation_fence_high_water(
-    encoded: &[u8],
-    expected_job_id: &JobId,
-) -> Result<u64, StoreDataError> {
-    match decode_operation(encoded)? {
-        DecodedOperation::Live(authority) if authority.matches_job(*expected_job_id) => {
-            Ok(authority.fence_high_water())
-        }
-        DecodedOperation::Receipt(receipt) if receipt.job_id == *expected_job_id => {
-            Ok(receipt.fence.get())
-        }
-        DecodedOperation::Live(_) | DecodedOperation::Receipt(_) => {
-            Err(StoreDataError::Malformed("operation job identity"))
-        }
-    }
-}
-
-pub(crate) fn operation_receipt_value(
-    receipt: &OperationReceipt,
-) -> Result<bytes::Bytes, StoreDataError> {
-    encode_operation_receipt(receipt)
+    Ok((authority.operation_id(), authority.fence_high_water()))
 }
 
 /// Encodes the exact lease authority owning a durable permit.  The value is
@@ -375,30 +333,6 @@ pub(crate) fn fair_value(job_id: &JobId) -> Result<bytes::Bytes, StoreDataError>
 
 pub(crate) fn lease_value(job_id: &JobId) -> Result<bytes::Bytes, StoreDataError> {
     ValueCodec::encode(ValueTag::Lease, job_id.as_bytes())
-}
-
-pub(crate) fn dedupe_value(
-    job_id: &JobId,
-    retain_until: Timestamp,
-) -> Result<bytes::Bytes, StoreDataError> {
-    let mut body = Vec::with_capacity(JobId::BYTE_LENGTH + 8);
-    body.extend_from_slice(job_id.as_bytes());
-    body.extend_from_slice(&retain_until.as_millis().to_be_bytes());
-    ValueCodec::encode(ValueTag::Dedupe, &body)
-}
-
-pub(crate) fn decode_dedupe_value(encoded: &[u8]) -> Result<(JobId, Timestamp), StoreDataError> {
-    let (tag, body) = ValueCodec::decode_body(encoded)?;
-    if tag != ValueTag::Dedupe || body.len() != JobId::BYTE_LENGTH + 8 {
-        return Err(StoreDataError::Malformed("dedupe marker"));
-    }
-    let job_id = JobId::try_from_slice(&body[..JobId::BYTE_LENGTH])?;
-    let retain_until = Timestamp::from_millis(i64::from_be_bytes(
-        body[JobId::BYTE_LENGTH..]
-            .try_into()
-            .map_err(|_| StoreDataError::Malformed("dedupe retention"))?,
-    ));
-    Ok((job_id, retain_until))
 }
 
 pub(crate) fn validate_job_marker(

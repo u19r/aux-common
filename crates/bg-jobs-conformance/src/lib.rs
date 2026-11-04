@@ -14,7 +14,11 @@
 mod constants;
 mod fault_store;
 mod fault_suite;
+mod lifecycle_growth;
 mod model;
+mod recovery_fixture;
+mod recovery_store;
+mod recovery_suite;
 mod suite;
 
 pub use fault_store::{
@@ -22,9 +26,13 @@ pub use fault_store::{
     ReadFaultKind,
 };
 pub use fault_suite::run_faults;
+pub use lifecycle_growth::{
+    LifecycleGrowthReport, RetainedJobStorage, run_deduplication_growth, run_lifecycle_growth,
+};
 pub use model::{
     RepairAction, RepairBudget, RepairEntry, RepairPlan, RepairReason, StoreModel, StoreModelError,
 };
+pub use recovery_suite::{RecoveryReport, run_recovery};
 pub use suite::{
     ConformanceConfig, ConformanceConfigError, ConformanceError, ConformanceReport,
     OperationProfile, run_basic, run_operation_profile,

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 
 use crate::{
-    codec::{DecodedOperation, KeyCodec, KeyTag, ValueTag, decode_operation},
+    codec::{KeyCodec, KeyTag, ValueTag},
     store::Check,
     test_helper::{block_on, completion, dedupe, job, low_volume_job, system},
     *,
@@ -15,6 +15,7 @@ fn tags(store: &FakeStore, namespace: &Namespace) -> Vec<KeyTag> {
         .expect("snapshot succeeds")
         .iter()
         .map(|(key, _)| KeyCodec::decode(namespace, key).expect("key decodes").tag)
+        .filter(|tag| !matches!(tag, KeyTag::Commit | KeyTag::CommitInput))
         .collect()
 }
 
@@ -72,27 +73,58 @@ impl JobStore for CommitRecordingStore {
         self.inner.read_range(request).await
     }
 
-    async fn commit(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
+    async fn transact(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
+        let namespace = Namespace::try_new(b"jobs").unwrap();
+        let is_journal = |key: &StoreKey| {
+            matches!(
+                KeyCodec::decode(&namespace, key).unwrap().tag,
+                KeyTag::Commit | KeyTag::CommitInput
+            )
+        };
+        if transaction
+            .mutations()
+            .iter()
+            .all(|mutation| is_journal(mutation.key()))
+        {
+            return self.inner.transact(transaction).await;
+        }
+        let logical = StoreTransaction::try_from(crate::store::StoreTransactionInput {
+            operation_id: transaction.operation_id(),
+            checks: transaction
+                .checks()
+                .iter()
+                .filter(|check| !is_journal(check.key()))
+                .cloned()
+                .collect(),
+            mutations: transaction
+                .mutations()
+                .iter()
+                .filter(|mutation| !is_journal(mutation.key()))
+                .cloned()
+                .collect(),
+            limits: transaction.limits(),
+        })
+        .unwrap();
         let commit_number = {
             let mut transactions = self
                 .transactions
                 .lock()
                 .expect("commit transaction record lock");
-            transactions.push(transaction.clone());
+            transactions.push(logical);
             transactions.len()
         };
         if commit_number == 1
             && let Some(preceding) = &self.preceding_commit
         {
             assert_eq!(
-                self.inner.commit(preceding).await?,
+                self.inner.transact(preceding).await?,
                 CommitOutcome::Committed
             );
         }
         if self.failing_commit == Some(commit_number) {
             return Err(FakeStoreError::Poisoned);
         }
-        self.inner.commit(transaction).await
+        self.inner.transact(transaction).await
     }
 }
 
@@ -127,13 +159,14 @@ fn given_a_new_payload_with_dedupe_when_enqueue_commits_then_chunks_indexes_and_
 
     assert_eq!(result.disposition, EnqueueDisposition::Enqueued);
     let tags = tags(&store, engine.namespace());
-    assert_eq!(tags.len(), 6);
+    assert_eq!(tags.len(), 7);
     for expected in [
         KeyTag::PayloadChunk,
         KeyTag::Job,
         KeyTag::Due,
         KeyTag::FairReady,
         KeyTag::Dedupe,
+        KeyTag::DedupeExpiry,
         KeyTag::Wake,
     ] {
         assert!(tags.contains(&expected), "missing {expected:?}");
@@ -217,7 +250,6 @@ fn given_a_completed_job_with_a_nonzero_fence_when_reusing_its_id_then_the_next_
         other => panic!("expected retry, got {other:?}"),
     };
     let second = block_on(engine.claim(id, not_before)).expect("second claim commits");
-    let completed_operation = second.operation_id();
     let fence_before = match &second.record().state {
         JobState::Leased(lease) => lease.fence.get(),
         _ => panic!("second claim must be leased"),
@@ -235,10 +267,6 @@ fn given_a_completed_job_with_a_nonzero_fence_when_reusing_its_id_then_the_next_
             ..
         } if record.state == JobState::Scheduled
     ));
-    assert_eq!(
-        block_on(engine.reconcile(id, completed_operation)).expect("reconcile reads state"),
-        ReconciliationOutcome::LeaseLost
-    );
     let successor = block_on(engine.claim(id, not_before)).expect("successor claim commits");
     let fence_after = match &successor.record().state {
         JobState::Leased(lease) => lease.fence.get(),
@@ -248,7 +276,7 @@ fn given_a_completed_job_with_a_nonzero_fence_when_reusing_its_id_then_the_next_
 }
 
 #[test]
-fn given_an_expired_dedupe_with_a_retained_receipt_when_reusing_its_id_then_the_fence_advances() {
+fn given_an_expired_dedupe_after_completion_when_reusing_its_id_then_the_fence_advances() {
     let store = FakeStore::new();
     let engine = system(store, FairnessPolicy::low_volume(), 1);
     let id = JobId::from([6; 16]);
@@ -287,64 +315,35 @@ fn given_an_expired_dedupe_with_a_retained_receipt_when_reusing_its_id_then_the_
 }
 
 #[test]
-fn given_a_retained_maximum_fence_receipt_when_reusing_its_id_then_state_is_unchanged() {
+fn given_exhausted_namespace_fence_when_claiming_new_work_then_no_lifecycle_state_changes() {
     let store = FakeStore::new();
     let engine = system(store.clone(), FairnessPolicy::low_volume(), 1);
     let id = JobId::from([7; 16]);
-    block_on(engine.enqueue_raw(low_volume_job(7, Timestamp::ZERO), Timestamp::ZERO))
-        .expect("enqueue commits");
-    let claim = block_on(engine.claim(id, Timestamp::ZERO)).expect("claim commits");
-    block_on(engine.complete(claim, completion(), Timestamp::ZERO)).expect("completion commits");
-
-    let operation_key = crate::keys::operation_key(engine.namespace(), &id).expect("operation key");
-    let encoded = store
-        .snapshot()
-        .expect("snapshot succeeds")
-        .into_iter()
-        .find(|(key, _)| key == &operation_key)
-        .map(|(_, value)| value)
-        .expect("completion receipt is retained");
-    let mut receipt = match decode_operation(&encoded).expect("receipt decodes") {
-        DecodedOperation::Receipt(receipt) => receipt,
-        DecodedOperation::Live(_) => panic!("completion must retain a receipt"),
-    };
-    receipt.fence = std::num::NonZeroU64::new(u64::MAX).expect("maximum fence is non-zero");
+    block_on(engine.enqueue_raw(low_volume_job(7, Timestamp::ZERO), Timestamp::ZERO)).unwrap();
+    let key = crate::codec::KeyCodec::encode(engine.namespace(), crate::codec::KeyTag::Fence, &[])
+        .unwrap();
     store
-        .put_raw(
-            operation_key,
-            crate::keys::operation_receipt_value(&receipt).expect("maximum receipt encodes"),
+        .put_raw(key, Bytes::copy_from_slice(&u64::MAX.to_be_bytes()))
+        .unwrap();
+    let before = crate::test_helper::application_snapshot(&store);
+    assert!(matches!(
+        block_on(engine.claim(id, Timestamp::ZERO)),
+        Err(JobSystemError::LeaseConflict)
+    ));
+    assert_eq!(crate::test_helper::application_snapshot(&store), before);
+}
+
+#[test]
+fn given_a_native_abort_with_unchanged_authority_when_reconciling_then_the_enqueue_finishes_atomically()
+ {
+    let store = FakeStore::new();
+    store
+        .queue_commit_for_key(
+            crate::keys::job_key(&Namespace::try_new(b"jobs").unwrap(), &JobId::from([1; 16]))
+                .unwrap(),
+            CommitOutcome::Conflict,
+            false,
         )
-        .expect("receipt fixture writes");
-    let before = store.snapshot().expect("snapshot succeeds");
-
-    let result = block_on(engine.enqueue_raw(low_volume_job(7, Timestamp::ZERO), Timestamp::ZERO));
-    assert!(matches!(result, Err(JobSystemError::LeaseConflict)));
-    assert_eq!(store.snapshot().expect("snapshot succeeds"), before);
-}
-
-#[test]
-fn given_an_orphan_maximum_fence_watermark_when_reusing_its_id_then_state_is_unchanged() {
-    let store = FakeStore::new();
-    let engine = system(store.clone(), FairnessPolicy::low_volume(), 1);
-    let id = JobId::from([8; 16]);
-    let operation_key = crate::keys::operation_key(engine.namespace(), &id).expect("operation key");
-    let watermark =
-        crate::keys::operation_watermark_value(&id, u64::MAX).expect("maximum watermark encodes");
-    store
-        .put_raw(operation_key, watermark)
-        .expect("watermark fixture writes");
-    let before = store.snapshot().expect("snapshot succeeds");
-
-    let result = block_on(engine.enqueue_raw(low_volume_job(8, Timestamp::ZERO), Timestamp::ZERO));
-    assert!(matches!(result, Err(JobSystemError::LeaseConflict)));
-    assert_eq!(store.snapshot().expect("snapshot succeeds"), before);
-}
-
-#[test]
-fn given_a_conflicting_enqueue_commit_when_reconciling_then_no_partial_state_is_visible() {
-    let store = FakeStore::new();
-    store
-        .queue_commit_outcome(CommitOutcome::Conflict)
         .expect("queue outcome");
     let engine = system(store.clone(), FairnessPolicy::low_volume(), 1);
 
@@ -360,15 +359,21 @@ fn given_a_conflicting_enqueue_commit_when_reconciling_then_no_partial_state_is_
         Timestamp::ZERO,
     ));
 
-    assert!(matches!(result, Err(JobSystemError::UnknownCommit)));
-    assert!(store.snapshot().expect("snapshot succeeds").is_empty());
+    assert_eq!(result.unwrap().disposition, EnqueueDisposition::Enqueued);
+    let claim = block_on(engine.claim(JobId::from([1; 16]), Timestamp::ZERO)).unwrap();
+    assert_eq!(claim.payload().as_ref(), b"payload");
 }
 
 #[test]
 fn given_an_unknown_before_enqueue_commit_when_reconciling_then_no_partial_state_is_visible() {
     let inner = FakeStore::new();
     inner
-        .queue_unknown_before_commit()
+        .queue_commit_for_key(
+            crate::keys::job_key(&Namespace::try_new(b"jobs").unwrap(), &JobId::from([1; 16]))
+                .unwrap(),
+            CommitOutcome::Unknown,
+            false,
+        )
         .expect("queue unknown-before outcome");
     let store = CommitRecordingStore::new(inner.clone());
     let engine = recording_system(store.clone());
@@ -385,16 +390,22 @@ fn given_an_unknown_before_enqueue_commit_when_reconciling_then_no_partial_state
         Timestamp::ZERO,
     ));
 
-    assert!(matches!(result, Err(JobSystemError::UnknownCommit)));
-    assert_eq!(store.transactions().len(), 1);
-    assert!(inner.snapshot().expect("snapshot succeeds").is_empty());
+    assert_eq!(result.unwrap().disposition, EnqueueDisposition::Enqueued);
+    assert_eq!(store.transactions().len(), 2);
+    assert_eq!(store.transactions()[0], store.transactions()[1]);
+    assert!(!crate::test_helper::application_snapshot(&inner).is_empty());
 }
 
 #[test]
 fn given_a_seed_commit_unknown_before_apply_when_ensuring_then_the_exact_transaction_is_retried() {
     let inner = FakeStore::new();
     inner
-        .queue_unknown_before_commit()
+        .queue_commit_for_key(
+            crate::keys::job_key(&Namespace::try_new(b"jobs").unwrap(), &JobId::from([9; 16]))
+                .unwrap(),
+            CommitOutcome::Unknown,
+            false,
+        )
         .expect("queue unknown-before outcome");
     let store = CommitRecordingStore::new(inner.clone());
     let engine = recording_system(store.clone());
@@ -407,14 +418,22 @@ fn given_a_seed_commit_unknown_before_apply_when_ensuring_then_the_exact_transac
     let transactions = store.transactions();
     assert_eq!(transactions.len(), 2);
     assert_eq!(transactions[0], transactions[1]);
-    assert!(!inner.snapshot().expect("snapshot succeeds").is_empty());
+    assert!(!crate::test_helper::application_snapshot(&inner).is_empty());
 }
 
 #[test]
 fn given_a_seed_commit_unknown_after_apply_when_ensuring_then_reconciliation_does_not_replay() {
     let inner = FakeStore::new();
     inner
-        .queue_unknown_after_commit()
+        .queue_commit_for_key(
+            crate::keys::job_key(
+                &Namespace::try_new(b"jobs").unwrap(),
+                &JobId::from([10; 16]),
+            )
+            .unwrap(),
+            CommitOutcome::Unknown,
+            true,
+        )
         .expect("queue unknown-after outcome");
     let store = CommitRecordingStore::new(inner.clone());
     let engine = recording_system(store.clone());
@@ -425,7 +444,7 @@ fn given_a_seed_commit_unknown_after_apply_when_ensuring_then_reconciliation_doe
 
     assert_eq!(result.disposition, EnqueueDisposition::Enqueued);
     assert_eq!(store.transactions().len(), 1);
-    assert!(!inner.snapshot().expect("snapshot succeeds").is_empty());
+    assert!(!crate::test_helper::application_snapshot(&inner).is_empty());
 }
 
 #[test]
@@ -447,10 +466,19 @@ fn given_a_seed_with_mismatched_persisted_identity_when_ensuring_then_the_mismat
 }
 
 #[test]
-fn given_a_seed_commit_conflict_without_state_when_ensuring_then_the_conflict_is_not_replayed() {
+fn given_a_seed_abort_with_unchanged_authority_when_ensuring_then_a_fresh_guarded_attempt_completes_it()
+ {
     let inner = FakeStore::new();
     inner
-        .queue_commit_outcome(CommitOutcome::Conflict)
+        .queue_commit_for_key(
+            crate::keys::job_key(
+                &Namespace::try_new(b"jobs").unwrap(),
+                &JobId::from([12; 16]),
+            )
+            .unwrap(),
+            CommitOutcome::Conflict,
+            false,
+        )
         .expect("queue conflict outcome");
     let store = CommitRecordingStore::new(inner.clone());
     let engine = recording_system(store.clone());
@@ -458,16 +486,35 @@ fn given_a_seed_commit_conflict_without_state_when_ensuring_then_the_conflict_is
     let result =
         block_on(engine.ensure_seed_raw(low_volume_job(12, Timestamp::ZERO), Timestamp::ZERO));
 
-    assert!(matches!(result, Err(JobSystemError::UnknownCommit)));
-    assert_eq!(store.transactions().len(), 1);
-    assert!(inner.snapshot().expect("snapshot succeeds").is_empty());
+    assert_eq!(result.unwrap().disposition, EnqueueDisposition::Enqueued);
+    let attempts = store.transactions();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].checks(), attempts[1].checks());
+    assert_eq!(attempts[0].mutations(), attempts[1].mutations());
+    assert_ne!(attempts[0].operation_id(), attempts[1].operation_id());
+    assert_eq!(
+        block_on(engine.ensure_seed_raw(low_volume_job(12, Timestamp::ZERO), Timestamp::ZERO))
+            .unwrap()
+            .disposition,
+        EnqueueDisposition::AlreadyPresent
+    );
+    assert_eq!(store.transactions().len(), 2);
+    assert!(!crate::test_helper::application_snapshot(&inner).is_empty());
 }
 
 #[test]
 fn given_a_seed_exact_retry_store_error_when_ensuring_then_the_typed_error_is_preserved() {
     let inner = FakeStore::new();
     inner
-        .queue_unknown_before_commit()
+        .queue_commit_for_key(
+            crate::keys::job_key(
+                &Namespace::try_new(b"jobs").unwrap(),
+                &JobId::from([13; 16]),
+            )
+            .unwrap(),
+            CommitOutcome::Unknown,
+            false,
+        )
         .expect("queue unknown-before outcome");
     let store = CommitRecordingStore::with_failing_commit(inner.clone(), 2);
     let engine = recording_system(store.clone());
@@ -482,19 +529,45 @@ fn given_a_seed_exact_retry_store_error_when_ensuring_then_the_typed_error_is_pr
     let transactions = store.transactions();
     assert_eq!(transactions.len(), 2);
     assert_eq!(transactions[0], transactions[1]);
-    assert!(inner.snapshot().expect("snapshot succeeds").is_empty());
+    assert!(crate::test_helper::application_snapshot(&inner).is_empty());
 }
 
 #[test]
-fn given_two_unresolved_seed_commits_when_ensuring_then_unknown_is_returned_after_one_exact_retry()
-{
+fn given_three_unresolved_seed_attempts_when_ensuring_then_pending_retries_preserve_exact_input() {
     let inner = FakeStore::new();
     inner
-        .queue_unknown_before_commit()
+        .queue_commit_for_key(
+            crate::keys::job_key(
+                &Namespace::try_new(b"jobs").unwrap(),
+                &JobId::from([14; 16]),
+            )
+            .unwrap(),
+            CommitOutcome::Unknown,
+            false,
+        )
         .expect("queue first unknown-before outcome");
     inner
-        .queue_unknown_before_commit()
+        .queue_commit_for_key(
+            crate::keys::job_key(
+                &Namespace::try_new(b"jobs").unwrap(),
+                &JobId::from([14; 16]),
+            )
+            .unwrap(),
+            CommitOutcome::Unknown,
+            false,
+        )
         .expect("queue second unknown-before outcome");
+    inner
+        .queue_commit_for_key(
+            crate::keys::job_key(
+                &Namespace::try_new(b"jobs").unwrap(),
+                &JobId::from([14; 16]),
+            )
+            .unwrap(),
+            CommitOutcome::Unknown,
+            false,
+        )
+        .expect("queue third unknown-before outcome");
     let store = CommitRecordingStore::new(inner.clone());
     let engine = recording_system(store.clone());
 
@@ -503,9 +576,13 @@ fn given_two_unresolved_seed_commits_when_ensuring_then_unknown_is_returned_afte
 
     assert!(matches!(result, Err(JobSystemError::UnknownCommit)));
     let transactions = store.transactions();
-    assert_eq!(transactions.len(), 2);
-    assert_eq!(transactions[0], transactions[1]);
-    assert!(inner.snapshot().expect("snapshot succeeds").is_empty());
+    assert_eq!(transactions.len(), 3);
+    assert_eq!(
+        transactions[0].operation_id(),
+        transactions[1].operation_id()
+    );
+    assert_eq!(transactions[1], transactions[2]);
+    assert!(crate::test_helper::application_snapshot(&inner).is_empty());
 }
 
 #[test]
@@ -637,7 +714,12 @@ fn given_a_replayed_job_with_a_foreign_namespace_when_reconciling_then_identity_
 fn given_an_unknown_after_commit_when_enqueue_reconciles_then_it_returns_enqueued_with_all_state() {
     let store = FakeStore::new();
     store
-        .queue_commit_outcome(CommitOutcome::Unknown)
+        .queue_commit_for_key(
+            crate::keys::job_key(&Namespace::try_new(b"jobs").unwrap(), &JobId::from([1; 16]))
+                .unwrap(),
+            CommitOutcome::Unknown,
+            true,
+        )
         .expect("queue unknown outcome");
     let engine = system(store.clone(), FairnessPolicy::low_volume(), 1);
 
@@ -702,8 +784,7 @@ fn given_a_later_enqueue_when_the_wake_exists_then_the_earliest_wake_is_retained
 }
 
 #[test]
-fn given_independent_seeds_when_queue_wake_initialization_races_then_only_the_wake_check_conflicts()
-{
+fn given_independent_seeds_when_queue_wake_initialization_races_then_the_seed_rebases_once() {
     let competitor = CommitRecordingStore::new(FakeStore::new());
     block_on(
         recording_system(competitor.clone())
@@ -718,20 +799,20 @@ fn given_independent_seeds_when_queue_wake_initialization_races_then_only_the_wa
         low_volume_job(22, Timestamp::from_millis(1)),
         Timestamp::from_millis(1),
     ));
-    assert!(matches!(result, Err(JobSystemError::UnknownCommit)));
+    assert_eq!(result.unwrap().disposition, EnqueueDisposition::Enqueued);
     let transactions = store.transactions();
     assert_eq!(
         transactions.len(),
-        1,
-        "a conflict must not be blindly retried"
+        2,
+        "only the known-aborted wake conflict can rebase"
     );
-    assert_only_queue_wake_check_conflicts(&inner, engine.namespace(), &transactions[0]);
+    assert_only_queue_wake_check_conflicts(&competitor.inner, engine.namespace(), &transactions[0]);
     let retry = block_on(engine.ensure_seed_raw(
         low_volume_job(22, Timestamp::from_millis(1)),
         Timestamp::from_millis(1),
     ))
     .expect("a new operation observes the already initialized queue wake");
-    assert_eq!(retry.disposition, EnqueueDisposition::Enqueued);
+    assert_eq!(retry.disposition, EnqueueDisposition::AlreadyPresent);
 }
 
 fn assert_only_queue_wake_check_conflicts(

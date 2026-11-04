@@ -21,14 +21,3 @@ impl TransitionAuthority {
             && self.fence == other.fence
     }
 }
-
-/// Compact outcome used by completion reconciliation; it never invokes a
-/// handler.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ReconciliationOutcome {
-    Committed,
-    AlreadyCommitted,
-    LeaseLost,
-    RetryCommit,
-    Conflict,
-}

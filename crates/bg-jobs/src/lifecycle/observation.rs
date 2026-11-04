@@ -3,7 +3,7 @@
 use bytes::Bytes;
 
 use crate::{
-    codec::{DecodedOperation, decode_job_record},
+    codec::decode_job_record,
     engine::JobSystem,
     error::{JobResult, JobSystemError, StoreDataError},
     ids::{JobId, OperationId},
@@ -40,7 +40,11 @@ async fn observe_values<S: JobStore>(
     match (encoded_job, encoded_operation) {
         (None, None) => Ok(LifecycleObservation::Missing),
         (Some(encoded), operation) => observe_current(system, job_id, encoded, operation).await,
-        (None, Some(encoded)) => observe_terminal(job_id, encoded),
+        (None, Some(_)) => Ok(invalid_observation(
+            LifecycleRecordStatus::Corrupt,
+            LifecycleRoutes::default(),
+            None,
+        )),
     }
 }
 
@@ -114,7 +118,9 @@ fn decode_operation_id(
     let Some(encoded) = encoded else {
         return Ok(None);
     };
-    Ok(crate::keys::decode_operation_authority(&encoded, job_id)?.operation_id())
+    Ok(Some(
+        crate::keys::decode_operation_authority(&encoded, job_id)?.operation_id(),
+    ))
 }
 
 async fn read_current_evidence<S: JobStore>(
@@ -261,33 +267,4 @@ fn record_status(error: &StoreDataError) -> LifecycleRecordStatus {
         | StoreDataError::LengthOverflow
         | StoreDataError::TrailingBytes => LifecycleRecordStatus::Corrupt,
     }
-}
-
-fn observe_terminal<E>(job_id: JobId, encoded: Bytes) -> JobResult<LifecycleObservation, E>
-where E: std::error::Error + Send + Sync + 'static {
-    let receipt = match crate::codec::decode_operation(&encoded) {
-        Ok(DecodedOperation::Receipt(receipt)) => receipt,
-        Ok(DecodedOperation::Live(_)) => {
-            return Ok(LifecycleObservation::Invalid {
-                status: LifecycleRecordStatus::Corrupt,
-                routes: LifecycleRoutes::default(),
-                record: None,
-            });
-        }
-        Err(error) => {
-            return Ok(LifecycleObservation::Invalid {
-                status: record_status(&error),
-                routes: LifecycleRoutes::default(),
-                record: None,
-            });
-        }
-    };
-    if receipt.job_id != job_id {
-        return Ok(LifecycleObservation::Invalid {
-            status: LifecycleRecordStatus::Corrupt,
-            routes: LifecycleRoutes::default(),
-            record: None,
-        });
-    }
-    Ok(LifecycleObservation::Terminal(receipt))
 }

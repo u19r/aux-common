@@ -49,6 +49,7 @@ module job_lifecycle {
 
   type Meta = {
     now: int,
+    fenceHighWater: int,
     paused: bool,
     dedupeActive: bool,
     dedupeJob: JobId,
@@ -186,6 +187,7 @@ module job_lifecycle {
 
   pure def initialMeta = {
     now: 0,
+    fenceHighWater: 1,
     paused: false,
     dedupeActive: false,
     dedupeJob: JobA,
@@ -661,7 +663,7 @@ module job_lifecycle {
       and current.dueRoute and expectedRevision == current.revision
       and current.dueAt <= meta.now and current.attempts < MAX_ATTEMPTS
     val effect = claimAuthorityKernel(current.revision, current.generation,
-      current.fence, meta.tokenProgression.get(job), current.attempts,
+      max(current.fence, meta.fenceHighWater), meta.tokenProgression.get(job), current.attempts,
       current.attemptId, meta.now)
     val competing = not(blocked(job)) and expectedRevision == meta.claimRevision
       and contender != current.node and (not(meta.claimPending)
@@ -685,6 +687,7 @@ module job_lifecycle {
       jobs' = if (allowed) update(jobs, job, updatedJob) else jobs,
       meta' = if (allowed)
         result(meta.with("claimPending", false)
+          .with("fenceHighWater", effect.nextFence)
           .with("tokenProgression", update(meta.tokenProgression, job, effect.nextToken)),
           Committed, ClaimCommitted)
         else result(meta.with("claimPending", false), Conflict, ClaimConflict),

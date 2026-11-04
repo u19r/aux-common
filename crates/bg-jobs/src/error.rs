@@ -142,6 +142,11 @@ impl std::error::Error for StoreFailure {}
 /// limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreContractError {
+    CommitJournalUnavailable,
+    CommitCapacity,
+    CommitOwnershipLost,
+    RetiredCommit,
+    CommitContentMismatch,
     Validation(ValidationError),
     CapabilityExceeded(&'static str),
     DuplicateTransactionKey(&'static str),
@@ -152,6 +157,15 @@ pub enum StoreContractError {
 impl fmt::Display for StoreContractError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CommitJournalUnavailable => formatter.write_str("commit journal is unavailable"),
+            Self::CommitCapacity => formatter.write_str("bounded commit admission is unavailable"),
+            Self::CommitOwnershipLost => {
+                formatter.write_str("commit recovery authority was fenced")
+            }
+            Self::RetiredCommit => formatter.write_str("commit identity is retired"),
+            Self::CommitContentMismatch => {
+                formatter.write_str("commit identity has different content")
+            }
             Self::Validation(error) => error.fmt(formatter),
             Self::CapabilityExceeded(field) => {
                 write!(formatter, "store capability exceeded: {field}")
@@ -187,6 +201,7 @@ pub enum JobSystemError<E> {
     WakeScheduler(crate::model::WakeSchedulerError),
     UnregisteredHandler,
     JobIdConflict,
+    CatalogConflict,
     NotFound,
     LeaseConflict,
     LeaseLost,
@@ -213,6 +228,7 @@ impl<E> fmt::Debug for JobSystemError<E> {
             }
             Self::UnregisteredHandler => formatter.write_str("UnregisteredHandler"),
             Self::JobIdConflict => formatter.write_str("JobIdConflict"),
+            Self::CatalogConflict => formatter.write_str("CatalogConflict"),
             Self::NotFound => formatter.write_str("NotFound"),
             Self::LeaseConflict => formatter.write_str("LeaseConflict"),
             Self::LeaseLost => formatter.write_str("LeaseLost"),
@@ -239,6 +255,7 @@ impl<E> fmt::Display for JobSystemError<E> {
             Self::JobIdConflict => {
                 formatter.write_str("job ID already has different immutable data")
             }
+            Self::CatalogConflict => formatter.write_str("configured job catalog conflicted"),
             Self::NotFound => formatter.write_str("job was not found"),
             Self::LeaseConflict => formatter.write_str("job claim conflicted"),
             Self::LeaseLost => formatter.write_str("job lease authority was lost"),

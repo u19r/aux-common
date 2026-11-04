@@ -16,10 +16,9 @@ use super::{
     shutdown::ShutdownController,
 };
 use crate::{
-    budget::{DriveReport, DriveRequest, DriveStopReason},
+    budget::{DriveReport, DriveRequest, DriveStopReason, OperationBudget},
     drive::{
         candidate::{Candidate, CandidateResult, process_candidate},
-        constants::OperationBudget,
         discovery::{Discovery, discover},
     },
     engine::JobSystem,
@@ -60,6 +59,19 @@ where
         request.max_store_operations().get(),
         system.clone_observer(),
     );
+    let recovery = system
+        .recover_pending_commits(&mut operation_budget, || {
+            system.is_shutdown() || request.finish_by().is_at_or_before(clock.now())
+        })
+        .await?;
+    if recovery.pending {
+        return system.finish_recovery_limited_drive(&request, &clock).await;
+    }
+    let maintenance_wake = system
+        .retire_expired_deduplication(now, &mut operation_budget, || {
+            system.is_shutdown() || request.finish_by().is_at_or_before(clock.now())
+        })
+        .await?;
     let discovery = discover(
         system,
         &request,
@@ -74,16 +86,39 @@ where
             request,
             discovery,
             operation_budget,
+            maintenance_wake,
         },
         clock,
     )
     .await
 }
 
+impl<S: JobStore> JobSystem<S> {
+    async fn finish_recovery_limited_drive<C: Fn() -> MonotonicDeadline>(
+        &self,
+        request: &DriveRequest,
+        clock: &DriveClock<C>,
+    ) -> JobResult<DriveReport, S::Error> {
+        let mut report = completion::empty_report(request.max_completion_details());
+        report.stop_reason = if request.finish_by().is_at_or_before(clock.now()) {
+            DriveStopReason::Deadline
+        } else {
+            DriveStopReason::Capacity
+        };
+        let wake = if self.is_shutdown() {
+            WakeHint::None
+        } else {
+            WakeHint::Now
+        };
+        finish_report(self, request, report, wake).await
+    }
+}
+
 struct DiscoveredDrive {
     request: DriveRequest,
     discovery: Discovery,
     operation_budget: OperationBudget,
+    maintenance_wake: WakeHint,
 }
 
 async fn drive_scheduler<S, C>(
@@ -99,8 +134,9 @@ where
         request,
         discovery,
         mut operation_budget,
+        maintenance_wake,
     } = drive;
-    let setup = SchedulerSetup::new(&request, &discovery);
+    let setup = SchedulerSetup::new(&request, &discovery, maintenance_wake);
     let Some((owner, candidates)) =
         prepare_owner(system, &request, discovery, &mut operation_budget).await?
     else {
@@ -126,10 +162,11 @@ struct SchedulerSetup {
     stop_reason: Option<DriveStopReason>,
     future_wake: Option<Timestamp>,
     immediate_candidates: u32,
+    maintenance_wake: WakeHint,
 }
 
 impl SchedulerSetup {
-    fn new(request: &DriveRequest, discovery: &Discovery) -> Self {
+    fn new(request: &DriveRequest, discovery: &Discovery, maintenance_wake: WakeHint) -> Self {
         let mut report = completion::empty_report(request.max_completion_details());
         if let Some(stop_reason) = discovery.stop_reason {
             report.stop_reason = stop_reason;
@@ -139,6 +176,7 @@ impl SchedulerSetup {
             stop_reason: discovery.stop_reason,
             future_wake: discovery.future_wake,
             immediate_candidates: discovery.immediate_candidates,
+            maintenance_wake,
         }
     }
 
@@ -154,7 +192,13 @@ impl SchedulerSetup {
             self.future_wake
                 .map_or(WakeHint::None, |at| WakeHint::from_timestamp(at, now))
         };
-        finish_report(system, request, self.report, next_wake).await
+        finish_report(
+            system,
+            request,
+            self.report,
+            next_wake.earliest(self.maintenance_wake),
+        )
+        .await
     }
 }
 
@@ -175,6 +219,7 @@ where
     active: Vec<InFlightCandidate<'system, S>>,
     active_payload_bytes: usize,
     shutdown: ShutdownController,
+    maintenance_wake: WakeHint,
 }
 
 struct SchedulerInit {
@@ -206,6 +251,7 @@ where
             stop_reason: _,
             future_wake: _,
             immediate_candidates: _,
+            maintenance_wake,
         } = setup;
         Self {
             system,
@@ -220,6 +266,7 @@ where
             active: Vec::with_capacity(active_capacity),
             active_payload_bytes: 0,
             shutdown: ShutdownController::new(),
+            maintenance_wake,
         }
     }
 
@@ -253,7 +300,7 @@ where
                 &mut self.active_payload_bytes,
                 completed,
                 permit,
-            );
+            )?;
         }
         error.map_or(Ok(()), Err)
     }
@@ -279,7 +326,9 @@ where
         let next_wake = if self.shutdown.requested() {
             WakeHint::None
         } else {
-            pending_at.map_or(WakeHint::None, |at| WakeHint::from_timestamp(at, now))
+            pending_at
+                .map_or(WakeHint::None, |at| WakeHint::from_timestamp(at, now))
+                .earliest(self.maintenance_wake)
         };
         finish_report(self.system, &self.request, self.report, next_wake).await
     }

@@ -2,7 +2,7 @@
 
 use crate::time::Timestamp;
 
-/// Durable cursor state supplied by a caller-owned schedule record.
+/// Durable cursor state stored in the configured namespace catalog.
 ///
 /// The initial `enabled` value comes from
 /// [`crate::schedule::RecurringSchedule::enabled`]; after creation, controls
@@ -65,6 +65,26 @@ impl ScheduleCursor {
         self.last_intended
     }
 
+    pub(crate) fn advance(
+        &self,
+        next_due: Option<Timestamp>,
+        watermark: Option<Timestamp>,
+        last_intended: Option<Timestamp>,
+    ) -> Result<Self, crate::error::ValidationError> {
+        let revision =
+            self.revision
+                .checked_add(1)
+                .ok_or(crate::error::ValidationError::Overflow {
+                    field: "schedule cursor revision",
+                })?;
+        let mut cursor = self.clone();
+        cursor.next_due = next_due;
+        cursor.watermark = watermark.or(self.watermark);
+        cursor.last_intended = last_intended;
+        cursor.revision = revision;
+        Ok(cursor)
+    }
+
     pub fn apply_control(
         &mut self,
         expected_revision: u64,
@@ -77,6 +97,14 @@ impl ScheduleCursor {
                 generation: self.generation,
             };
         }
+        let (Some(revision), Some(generation)) =
+            (self.revision.checked_add(1), self.generation.checked_add(1))
+        else {
+            return ScheduleControlResult::Conflict {
+                revision: self.revision,
+                generation: self.generation,
+            };
+        };
         match control {
             ScheduleControl::Pause => self.paused = true,
             ScheduleControl::Resume => self.paused = false,
@@ -84,8 +112,8 @@ impl ScheduleCursor {
             ScheduleControl::Disable => self.enabled = false,
         }
         self.active = false;
-        self.revision = self.revision.saturating_add(1);
-        self.generation = self.generation.saturating_add(1);
+        self.revision = revision;
+        self.generation = generation;
         ScheduleControlResult::Applied {
             revision: self.revision,
             generation: self.generation,
@@ -101,8 +129,11 @@ impl ScheduleCursor {
         {
             return false;
         }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
         self.active = true;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         true
     }
 
@@ -110,14 +141,17 @@ impl ScheduleCursor {
         if generation != self.generation || revision != self.revision || !self.active {
             return false;
         }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return false;
+        };
         self.active = false;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         true
     }
 }
 
 /// A schedule control mutation whose expected version is checked atomically
-/// by a caller-owned schedule record.
+/// against the configured namespace catalog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScheduleControl {
     Pause,

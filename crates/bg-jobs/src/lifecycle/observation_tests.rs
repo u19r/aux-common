@@ -86,24 +86,6 @@ fn given_a_live_job_when_observed_then_durable_routes_and_payload_state_are_retu
 }
 
 #[test]
-fn given_a_terminal_receipt_when_observed_then_bounded_receipt_is_returned() {
-    let store = FakeStore::new();
-    let engine = system(store, FairnessPolicy::low_volume(), 1);
-    let job_id = JobId::from([4; 16]);
-    block_on(engine.enqueue_raw(low_volume_job(4, Timestamp::ZERO), Timestamp::ZERO))
-        .expect("enqueue commits");
-    let claim = block_on(engine.claim(job_id, Timestamp::ZERO)).expect("claim commits");
-    block_on(engine.complete(claim, completion(), Timestamp::from_millis(10)))
-        .expect("completion commits");
-
-    let observation = block_on(engine.observe_lifecycle(job_id)).expect("observation succeeds");
-    let LifecycleObservation::Terminal(receipt) = observation else {
-        panic!("completion must leave a terminal receipt");
-    };
-    assert_eq!(receipt.job_id, job_id);
-}
-
-#[test]
 fn given_an_unreadable_job_record_when_observed_then_its_status_is_preserved() {
     for (job_id, encoded, expected) in [
         (
@@ -212,33 +194,24 @@ fn given_an_unknown_operation_value_when_observed_then_unknown_version_is_report
 }
 
 #[test]
-fn given_successful_completion_when_observed_then_exact_terminal_receipt_is_returned() {
+fn given_successful_completion_when_observed_then_no_per_job_history_remains() {
     let store = FakeStore::new();
-    let engine = system(store, FairnessPolicy::low_volume(), 1);
+    let engine = system(store.clone(), FairnessPolicy::low_volume(), 1);
     let job_id = JobId::from([2; 16]);
-    block_on(engine.enqueue_raw(low_volume_job(2, Timestamp::ZERO), Timestamp::ZERO))
-        .expect("enqueue commits");
-    let claim = block_on(engine.claim(job_id, Timestamp::ZERO)).expect("claim commits");
-    let operation = claim.operation_id();
-    let generation = claim.record().generation;
-    let revision = claim.record().revision + 1;
+    block_on(engine.enqueue_raw(low_volume_job(2, Timestamp::ZERO), Timestamp::ZERO)).unwrap();
+    let claim = block_on(engine.claim(job_id, Timestamp::ZERO)).unwrap();
     let completed_at = Timestamp::from_millis(10);
-
-    block_on(engine.complete(claim, completion(), completed_at)).expect("completion commits");
-
-    let observation = block_on(engine.observe_lifecycle(job_id)).expect("observation succeeds");
-    let LifecycleObservation::Terminal(receipt) = observation else {
-        panic!("completion must leave a terminal receipt");
-    };
-    assert_eq!(receipt.operation_id, operation);
-    assert_eq!(receipt.job_id, job_id);
-    assert_eq!(receipt.generation, generation);
-    assert_eq!(receipt.revision, revision);
-    assert_eq!(receipt.completed_at, completed_at);
-    assert_eq!(receipt.terminal, TerminalDisposition::Completed);
-    assert_eq!(
-        block_on(engine.reconcile(job_id, operation)).expect("reconcile succeeds"),
-        ReconciliationOutcome::AlreadyCommitted
+    let details = block_on(engine.complete(claim, completion(), completed_at)).unwrap();
+    assert_eq!(details.job_id, job_id);
+    assert_eq!(details.completed_at, completed_at);
+    assert!(matches!(
+        block_on(engine.observe_lifecycle(job_id)).unwrap(),
+        LifecycleObservation::Missing
+    ));
+    assert!(
+        block_on(store.get(crate::keys::operation_key(engine.namespace(), &job_id).unwrap()))
+            .unwrap()
+            .is_none()
     );
 }
 

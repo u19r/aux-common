@@ -13,8 +13,7 @@ use crate::{
     store::{Check, JobStore, Mutation},
     time::Timestamp,
     transition::{
-        authority_checks, checked_transaction, commit_marker, commit_record_without_claim,
-        fresh_operation, next_revision, wake_mutation,
+        authority_checks, checked_transaction, fresh_operation, next_revision, wake_mutation,
     },
 };
 
@@ -42,15 +41,19 @@ pub(crate) async fn request_job_cancellation<S: JobStore>(
         }
         None => Check::Absent(key.clone()),
     };
+    let mutations = match &cancellation_check {
+        Check::Absent(_) => vec![Mutation::Put(key, keys::cancellation_value()?)],
+        Check::Value(_, _) => Vec::new(),
+    };
     let mut checks = authority_checks(system, claim)?;
     checks.push(cancellation_check);
-    let cancellation = keys::cancellation_value()?;
-    let transaction = checked_transaction(
-        system,
-        checks,
-        vec![Mutation::Put(key.clone(), cancellation)],
-    )?;
-    commit_marker(system, transaction, &key).await?;
+    let transaction = checked_transaction(system, checks, mutations)?;
+    system
+        .commit_transition(
+            transaction,
+            crate::transition::TransitionConflict::LeaseLost,
+        )
+        .await?;
     let claim_cancellation = claim.cancellation();
     system.signal_matching_attempt(
         claim.record().job_id,
@@ -76,8 +79,12 @@ pub(crate) async fn cancel_job<S: JobStore>(
             let (transaction, fence_high_water) =
                 leased_cancel_transaction(system, job_key, encoded, record.queue.clone(), job_id)
                     .await?;
-            let cancellation_key = keys::cancellation_key(system.namespace(), &job_id)?;
-            commit_marker(system, transaction, &cancellation_key).await?;
+            (system)
+                .commit_transition(
+                    transaction,
+                    crate::transition::TransitionConflict::LeaseLost,
+                )
+                .await?;
             system.signal_matching_attempt(job_id, fence_high_water, None);
             system.observe(crate::observer::JobEvent::CancellationRequested {
                 queue: record.queue,
@@ -121,9 +128,13 @@ pub(super) async fn inactivate_scheduled<S: JobStore>(
     encoded: Bytes,
     disposition: ScheduledInactivation,
 ) -> JobResult<(), S::Error> {
-    let (transaction, new_encoded) =
+    let transaction =
         cancel_scheduled_transaction(system, &mut record, &encoded, disposition).await?;
-    commit_record_without_claim(system, transaction, &record.job_id, &encoded, &new_encoded)
+    system
+        .commit_terminal_transition(
+            transaction,
+            crate::transition::TransitionConflict::LeaseLost,
+        )
         .await?;
     system.observe(disposition.event(record.queue));
     Ok(())
@@ -134,7 +145,7 @@ async fn cancel_scheduled_transaction<S: JobStore>(
     record: &mut JobRecordV1,
     encoded: &Bytes,
     disposition: ScheduledInactivation,
-) -> JobResult<(crate::store::StoreTransaction, Bytes), S::Error> {
+) -> JobResult<crate::store::StoreTransaction, S::Error> {
     let (old_due, fair_key, markers) = load_scheduled_markers(system, record).await?;
     record.state = disposition.state();
     record.revision = next_revision(system, record)?;
@@ -170,7 +181,7 @@ async fn cancel_scheduled_transaction<S: JobStore>(
     if let Some(check) = wake_check {
         checks.push(check);
     }
-    Ok((checked_transaction(system, checks, mutations)?, new_encoded))
+    checked_transaction(system, checks, mutations)
 }
 
 fn cancel_scheduled_mutations<S: JobStore>(
@@ -253,7 +264,12 @@ async fn cancel_suspended<S: JobStore>(
             Mutation::Put(authority.operation_key, marker),
         ],
     )?;
-    commit_record_without_claim(system, transaction, &job_id, &authority.encoded, &next).await?;
+    system
+        .commit_terminal_transition(
+            transaction,
+            crate::transition::TransitionConflict::LeaseLost,
+        )
+        .await?;
     system.observe(crate::observer::JobEvent::Cancelled {
         queue: authority.record.queue,
     });

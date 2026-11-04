@@ -8,7 +8,6 @@ use crate::{
     store::JobStore,
     test_helper::{FakeStore, block_on, completion, low_volume_job, system},
     time::Timestamp,
-    transition::ReconciliationOutcome,
 };
 
 fn claim_job(system: &JobSystem<FakeStore>, id: u8) -> ClaimedJob {
@@ -30,15 +29,17 @@ fn given_completion_unknown_before_commit_when_reconciling_then_no_handler_repea
     store
         .queue_unknown_before_commit()
         .expect("retry unknown-before queued");
+    store
+        .queue_unknown_before_commit()
+        .expect("ambiguous pending admission queues");
 
     assert!(matches!(
         block_on(system.complete(claim, completion(), Timestamp::from_millis(1))),
         Err(JobSystemError::UnknownCommit)
     ));
-    assert_eq!(
-        block_on(system.reconcile(JobId::from([1; 16]), operation))
-            .expect("reconciliation reads state"),
-        ReconciliationOutcome::RetryCommit
+    assert!(
+        matches!(block_on(system.observe_lifecycle(JobId::from([1; 16]))).unwrap(),
+        crate::LifecycleObservation::Current { operation_id: Some(current), .. } if current == operation)
     );
 }
 
@@ -81,6 +82,9 @@ fn given_dead_letter_unknown_results_before_or_after_commit_then_the_record_is_n
             store
                 .queue_unknown_before_commit()
                 .expect("retry unknown-before queued");
+            store
+                .queue_unknown_before_commit()
+                .expect("ambiguous pending admission queues");
         }
         let result = block_on(system.apply_outcome(
             claim,
@@ -116,6 +120,9 @@ fn given_scheduled_cancellation_unknown_results_then_reconciliation_sees_the_ter
             store
                 .queue_unknown_before_commit()
                 .expect("retry unknown-before queued");
+            store
+                .queue_unknown_before_commit()
+                .expect("ambiguous pending admission queues");
         }
         let result = block_on(system.cancel_job(id, Timestamp::ZERO));
         if after {
@@ -144,6 +151,9 @@ fn given_leased_cancellation_unknown_before_or_after_commit_then_the_claim_is_no
             store
                 .queue_unknown_before_commit()
                 .expect("retry unknown-before queued");
+            store
+                .queue_unknown_before_commit()
+                .expect("ambiguous pending admission queues");
         }
         let result =
             block_on(system.apply_outcome(claim, JobOutcome::Cancelled, Timestamp::from_millis(1)));
@@ -152,12 +162,39 @@ fn given_leased_cancellation_unknown_before_or_after_commit_then_the_claim_is_no
         } else {
             assert!(matches!(result, Err(JobSystemError::UnknownCommit)));
         }
-        let reconciliation = block_on(system.reconcile(JobId::from([id_byte; 16]), operation))
-            .expect("reconciliation reads state");
-        if after {
-            assert_eq!(reconciliation, ReconciliationOutcome::LeaseLost);
-        } else {
-            assert_eq!(reconciliation, ReconciliationOutcome::RetryCommit);
-        }
+        let observation = block_on(system.observe_lifecycle(JobId::from([id_byte; 16]))).unwrap();
+        assert!(
+            matches!(observation, crate::LifecycleObservation::Current { operation_id: Some(current), .. }
+            if (current == operation) == !after)
+        );
     }
+}
+
+#[test]
+fn given_a_malformed_wake_key_when_a_command_conflicts_then_recovery_rejects_it_without_changing_the_value()
+ {
+    let store = FakeStore::distributed();
+    let system = system(store.clone(), FairnessPolicy::low_volume(), 1);
+    let prefix =
+        crate::codec::KeyCodec::encode(system.namespace(), crate::codec::KeyTag::Wake, &[])
+            .unwrap();
+    let mut malformed = prefix.as_bytes().to_vec();
+    malformed.push(0);
+    let key = crate::store::StoreKey::try_from(malformed).unwrap();
+    let existing = crate::keys::wake_value(Timestamp::from_millis(1)).unwrap();
+    store.put_raw(key.clone(), existing.clone()).unwrap();
+    let input = crate::transition::checked_transaction(
+        &system,
+        vec![crate::store::Check::Absent(key.clone())],
+        vec![crate::store::Mutation::Put(
+            key.clone(),
+            crate::keys::wake_value(Timestamp::ZERO).unwrap(),
+        )],
+    )
+    .unwrap();
+    assert!(matches!(
+        block_on(system.commit_durable(input)),
+        Err(JobSystemError::StoreData(_))
+    ));
+    assert_eq!(block_on(store.get(key)).unwrap(), Some(existing));
 }

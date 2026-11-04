@@ -95,7 +95,7 @@ fn build_identity_drive_request() -> DriveRequest {
         max_concurrency: NonZeroU16::MIN,
         max_payload_bytes_in_flight: NonZeroUsize::new(1_024).expect("payload budget is non-zero"),
         max_completion_details: 1,
-        max_store_operations: NonZeroU32::new(64).expect("store budget is non-zero"),
+        max_store_operations: NonZeroU32::new(512).expect("store budget is non-zero"),
         stop_claiming_at: MonotonicDeadline::from_nanos(1),
         finish_by: MonotonicDeadline::from_nanos(u64::MAX),
     })
@@ -239,7 +239,7 @@ fn handler_observes_the_exact_wall_time_supplied_to_drive() {
         max_concurrency: NonZeroU16::MIN,
         max_payload_bytes_in_flight: NonZeroUsize::new(1_024).expect("payload budget is non-zero"),
         max_completion_details: 1,
-        max_store_operations: NonZeroU32::new(64).expect("store budget is non-zero"),
+        max_store_operations: NonZeroU32::new(512).expect("store budget is non-zero"),
         stop_claiming_at: MonotonicDeadline::from_nanos(1),
         finish_by: MonotonicDeadline::from_nanos(2),
     })

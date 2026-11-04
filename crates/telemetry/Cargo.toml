@@ -18,6 +18,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time"] }
 tower-http = { workspace = true, features = ["trace"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }

@@ -7,11 +7,8 @@ use super::{
     scan::QueueDiscoveryContext,
 };
 use crate::{
-    budget::{DriveRequest, DriveStopReason},
-    drive::{
-        candidate::Candidate,
-        constants::{self, OperationBudget},
-    },
+    budget::{DriveRequest, DriveStopReason, OperationBudget},
+    drive::{candidate::Candidate, constants},
     engine::JobSystem,
     error::JobResult,
     keys,

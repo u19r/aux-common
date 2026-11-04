@@ -323,13 +323,28 @@ impl JobHandler for RejectedPublicationHandler {
 impl JobHandler for ConflictingSettlementHandler {
     fn execute<'a>(
         &'a self,
-        _context: ExecutionContext<'a>,
+        context: ExecutionContext<'a>,
         _payload: &'a [u8],
     ) -> HandlerFuture<'a> {
-        self.0
-            .queue_commit_outcome(bg_jobs::store::CommitOutcome::Conflict)
-            .expect("inject a lost settlement claim");
-        Box::pin(async {
+        use bg_jobs::{
+            JobStore,
+            test_support::codec::{KeyCodec, decode_job_record, encode_job_record},
+        };
+        let key = KeyCodec::job(context.namespace(), &context.job_id()).expect("job key");
+        Box::pin(async move {
+            // Simulate a competing renewal changing the exact job snapshot.
+            // A naked injected conflict is retryable by the finite journal.
+            let encoded = self
+                .0
+                .get(key.clone())
+                .await
+                .expect("read job")
+                .expect("leased job");
+            let mut record = decode_job_record(&encoded).expect("decode leased job");
+            record.revision += 1;
+            self.0
+                .put_raw(key, encode_job_record(&record).expect("encode renewal"))
+                .expect("publish renewal");
             Ok(JobOutcome::Complete(
                 bg_jobs::OutcomeCode::try_new("finished").expect("outcome code"),
             ))
@@ -354,7 +369,14 @@ async fn assert_interrupted_claim_recovery(store: FakeStore, handler: impl JobHa
     let scheduler = PendingScheduler::default();
     let entered = Arc::clone(&scheduler.entered);
     let id = JobId::from([96; JobId::BYTE_LENGTH]);
-    let mut catalog = JobCatalog::new();
+    let mut catalog = JobCatalog::new().with_manifest(
+        bg_jobs::CatalogManifest::try_new(
+            bg_jobs::CatalogRevision::from(std::num::NonZeroU64::MIN),
+            vec![id],
+            Vec::new(),
+        )
+        .unwrap(),
+    );
     catalog
         .register_seeded(
             JobSpec::unit(
@@ -432,8 +454,16 @@ impl JobHandler for CountingHandler {
 
 #[tokio::test]
 async fn given_shutdown_before_drive_then_no_handler_is_started() {
+    let id = JobId::from([7; JobId::BYTE_LENGTH]);
     let executions = Arc::new(AtomicUsize::new(0));
-    let mut catalog = JobCatalog::new();
+    let mut catalog = JobCatalog::new().with_manifest(
+        bg_jobs::CatalogManifest::try_new(
+            bg_jobs::CatalogRevision::from(std::num::NonZeroU64::MIN),
+            vec![id],
+            Vec::new(),
+        )
+        .unwrap(),
+    );
     catalog
         .register_seeded(
             JobSpec::unit(
@@ -477,7 +507,14 @@ async fn given_shutdown_before_drive_then_no_handler_is_started() {
 async fn given_unfinished_and_closed_jobs_when_observing_queue_outcomes_then_only_closed_jobs_complete()
  {
     let id = JobId::from([93; JobId::BYTE_LENGTH]);
-    let mut catalog = JobCatalog::new();
+    let mut catalog = JobCatalog::new().with_manifest(
+        bg_jobs::CatalogManifest::try_new(
+            bg_jobs::CatalogRevision::from(std::num::NonZeroU64::MIN),
+            vec![id],
+            Vec::new(),
+        )
+        .unwrap(),
+    );
     catalog
         .register_seeded(
             JobSpec::unit(
@@ -553,7 +590,14 @@ async fn given_long_seed_timeout_when_short_drive_loses_publication_then_restart
     let id = JobId::from([98; JobId::BYTE_LENGTH]);
     let store = FakeStore::local();
     let clock = Arc::new(TestClock::new(Timestamp::ZERO, MonotonicDeadline::ZERO));
-    let mut catalog = JobCatalog::new();
+    let mut catalog = JobCatalog::new().with_manifest(
+        bg_jobs::CatalogManifest::try_new(
+            bg_jobs::CatalogRevision::from(std::num::NonZeroU64::MIN),
+            vec![id],
+            Vec::new(),
+        )
+        .unwrap(),
+    );
     catalog
         .register_seeded(
             JobSpec::unit(

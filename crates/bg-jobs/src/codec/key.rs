@@ -17,10 +17,15 @@ pub enum KeyTag {
     DeadLetter = b'X',
     Schedule = b'S',
     Dedupe = b'U',
+    DedupeExpiry = b'E',
     Wake = b'W',
     Permit = b'R',
     Operation = b'O',
     Cancellation = b'C',
+    Commit = b'B',
+    CommitInput = b'K',
+    Fence = b'H',
+    Catalog = b'A',
 }
 
 impl KeyTag {
@@ -38,10 +43,15 @@ impl KeyTag {
             b'X' => Self::DeadLetter,
             b'S' => Self::Schedule,
             b'U' => Self::Dedupe,
+            b'E' => Self::DedupeExpiry,
             b'W' => Self::Wake,
             b'R' => Self::Permit,
             b'O' => Self::Operation,
             b'C' => Self::Cancellation,
+            b'B' => Self::Commit,
+            b'K' => Self::CommitInput,
+            b'H' => Self::Fence,
+            b'A' => Self::Catalog,
             other => return Err(StoreDataError::UnknownTag(other)),
         };
         Ok(tag)

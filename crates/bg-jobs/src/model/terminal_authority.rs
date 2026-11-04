@@ -28,6 +28,10 @@ impl JobTerminalAuthority {
         }
     }
 
+    pub(crate) fn into_snapshot(self) -> (StoreKey, Bytes) {
+        (self.observation_keys[0].clone(), self.encoded_job)
+    }
+
     pub fn observation_keys(&self) -> &[StoreKey; 2] {
         &self.observation_keys
     }

@@ -1,9 +1,6 @@
-use super::{
-    super::{claim_deadline_reached, constants::OperationBudget},
-    budget::DiscoveryBudget,
-};
+use super::{super::claim_deadline_reached, budget::DiscoveryBudget};
 use crate::{
-    budget::{DriveRequest, DriveStopReason},
+    budget::{DriveRequest, DriveStopReason, OperationBudget},
     codec::{KeyCodec, KeyTag},
     engine::JobSystem,
     error::{JobResult, JobSystemError},

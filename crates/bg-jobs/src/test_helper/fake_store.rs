@@ -13,7 +13,6 @@ use super::constants::{
 };
 use crate::{
     error::StoreContractError,
-    ids::CommitOperationId,
     store::{
         Check, CommitOutcome, JobStore, Mutation, RangeDirection, RangePage, RangeRequest,
         StoreCapabilities, StoreCapabilitiesInput, StoreKey, StoreLevel,
@@ -26,7 +25,6 @@ pub enum FakeStoreError {
     Contract(StoreContractError),
     KeyTooLarge,
     RangeItemTooLarge,
-    CommitOperationReused,
     Poisoned,
 }
 
@@ -36,9 +34,6 @@ impl fmt::Display for FakeStoreError {
             Self::Contract(error) => error.fmt(formatter),
             Self::KeyTooLarge => formatter.write_str("fake store key exceeds capability"),
             Self::RangeItemTooLarge => formatter.write_str("fake store range item exceeds limit"),
-            Self::CommitOperationReused => {
-                formatter.write_str("commit operation ID was reused with different content")
-            }
             Self::Poisoned => formatter.write_str("fake store lock is poisoned"),
         }
     }
@@ -52,21 +47,16 @@ impl From<StoreContractError> for FakeStoreError {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct QueuedCommit {
     outcome: CommitOutcome,
     apply: bool,
+    mutation_key: Option<StoreKey>,
 }
 
 struct FakeState {
     entries: BTreeMap<StoreKey, Bytes>,
-    commits: BTreeMap<CommitOperationId, RecordedCommit>,
     queued_commits: VecDeque<QueuedCommit>,
-}
-
-struct RecordedCommit {
-    transaction: crate::store::StoreTransaction,
-    outcome: CommitOutcome,
 }
 
 /// A deliberately fake, deterministic, checked, atomic ordered key/value store
@@ -128,7 +118,6 @@ impl FakeStore {
             capabilities,
             state: Arc::new(Mutex::new(FakeState {
                 entries: BTreeMap::new(),
-                commits: BTreeMap::new(),
                 queued_commits: VecDeque::new(),
             })),
         }
@@ -153,6 +142,23 @@ impl FakeStore {
     /// applies.
     pub fn queue_unknown_after_commit(&self) -> Result<(), FakeStoreError> {
         self.queue_commit(CommitOutcome::Unknown, true)
+    }
+
+    /// Injects a result only when the transaction mutates the selected key.
+    /// Journal reservation and settlement remain independent native writes.
+    pub fn queue_commit_for_key(
+        &self,
+        key: StoreKey,
+        outcome: CommitOutcome,
+        apply: bool,
+    ) -> Result<(), FakeStoreError> {
+        let mut state = self.state.lock().map_err(|_| FakeStoreError::Poisoned)?;
+        state.queued_commits.push_back(QueuedCommit {
+            outcome,
+            apply,
+            mutation_key: Some(key),
+        });
+        Ok(())
     }
 
     pub fn put_raw(&self, key: StoreKey, value: Bytes) -> Result<(), FakeStoreError> {
@@ -193,9 +199,11 @@ impl FakeStore {
 
     fn queue_commit(&self, outcome: CommitOutcome, apply: bool) -> Result<(), FakeStoreError> {
         let mut state = self.state.lock().map_err(|_| FakeStoreError::Poisoned)?;
-        state
-            .queued_commits
-            .push_back(QueuedCommit { outcome, apply });
+        state.queued_commits.push_back(QueuedCommit {
+            outcome,
+            apply,
+            mutation_key: None,
+        });
         Ok(())
     }
 
@@ -270,45 +278,31 @@ impl FakeStore {
             self.validate_key(mutation.key())?;
         }
         let mut state = self.state.lock().map_err(|_| FakeStoreError::Poisoned)?;
-        if let Some(recorded) = state.commits.get(&transaction.operation_id()) {
-            return if recorded.transaction == *transaction {
-                Ok(recorded.outcome)
-            } else {
-                Err(FakeStoreError::CommitOperationReused)
-            };
-        }
         if !checks_match(&state.entries, transaction.checks()) {
-            record_commit(&mut state, transaction, CommitOutcome::Conflict);
             return Ok(CommitOutcome::Conflict);
         }
-        let queued = state.queued_commits.pop_front();
+        let matches_fault = state.queued_commits.front().is_some_and(|fault| {
+            fault.mutation_key.as_ref().is_none_or(|key| {
+                transaction
+                    .mutations()
+                    .iter()
+                    .any(|mutation| mutation.key() == key)
+            })
+        });
+        let queued = if matches_fault {
+            state.queued_commits.pop_front()
+        } else {
+            None
+        };
         let (outcome, apply) = queued
             .map(|value| (value.outcome, value.apply))
             .unwrap_or((CommitOutcome::Committed, true));
         if outcome == CommitOutcome::Conflict || !apply {
-            if outcome == CommitOutcome::Conflict {
-                record_commit(&mut state, transaction, CommitOutcome::Conflict);
-            }
             return Ok(outcome);
         }
         apply_mutations(&mut state.entries, transaction.mutations());
-        record_commit(&mut state, transaction, CommitOutcome::Committed);
         Ok(outcome)
     }
-}
-
-fn record_commit(
-    state: &mut FakeState,
-    transaction: &crate::store::StoreTransaction,
-    outcome: CommitOutcome,
-) {
-    state.commits.insert(
-        transaction.operation_id(),
-        RecordedCommit {
-            transaction: transaction.clone(),
-            outcome,
-        },
-    );
 }
 
 impl JobStore for FakeStore {
@@ -343,7 +337,7 @@ impl JobStore for FakeStore {
         self.read_page(request)
     }
 
-    async fn commit(
+    async fn transact(
         &self,
         transaction: &crate::store::StoreTransaction,
     ) -> Result<CommitOutcome, Self::Error> {

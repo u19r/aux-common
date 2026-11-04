@@ -330,7 +330,7 @@ fn given_acknowledged_remote_claim_when_short_drive_stops_then_registered_lease_
         max_concurrency: NonZeroU16::MIN,
         max_payload_bytes_in_flight: std::num::NonZeroUsize::new(1024).unwrap(),
         max_completion_details: 1,
-        max_store_operations: std::num::NonZeroU32::new(128).unwrap(),
+        max_store_operations: std::num::NonZeroU32::new(512).unwrap(),
         stop_claiming_at: MonotonicDeadline::from_nanos(1_000_000),
         finish_by: MonotonicDeadline::from_nanos(5_000_000),
     })

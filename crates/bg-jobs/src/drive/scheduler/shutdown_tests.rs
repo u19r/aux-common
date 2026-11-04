@@ -24,7 +24,7 @@ fn drive_request() -> DriveRequest {
         max_concurrency: std::num::NonZeroU16::new(1).expect("concurrency is non-zero"),
         max_payload_bytes_in_flight: std::num::NonZeroUsize::new(1024).expect("payload budget"),
         max_completion_details: 1,
-        max_store_operations: one(64),
+        max_store_operations: one(512),
         stop_claiming_at: MonotonicDeadline::from_nanos(1),
         finish_by: MonotonicDeadline::from_nanos(u64::MAX),
     })
@@ -602,7 +602,7 @@ fn given_a_wake_driven_executor_when_handler_deadline_expires_then_drive_is_woke
         max_concurrency: std::num::NonZeroU16::new(1).expect("concurrency is non-zero"),
         max_payload_bytes_in_flight: std::num::NonZeroUsize::new(1024).expect("payload budget"),
         max_completion_details: 1,
-        max_store_operations: one(64),
+        max_store_operations: one(512),
         stop_claiming_at: MonotonicDeadline::from_nanos(200_000_000),
         finish_by: MonotonicDeadline::from_nanos(250_000_000),
     })

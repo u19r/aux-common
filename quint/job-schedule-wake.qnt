@@ -3,9 +3,9 @@
 /// A schedule occurrence has deterministic identity derived from its due
 /// watermark.  Skip emits no occurrence, FireOnce emits exactly one, and
 /// CatchUp emits each bounded missed occurrence with a distinct identity.
-/// Materialization is a conditional two-node transaction over schedule
-/// revision, occurrence identity, job state, and durable routes.  A failed
-/// contender is a revision conflict, not a no-op boolean.
+/// Selection rejects stale evaluator revisions before admitting deterministic
+/// jobs. This model covers pure evaluation and advisory wake integration;
+/// durable catalog cursor/admission coupling is a separate protocol.
 ///
 /// Wakes are advisory.  SetWake can observe durable pending work but cannot
 /// fabricate a job; lost, duplicate, and stale wakes leave accepted durable

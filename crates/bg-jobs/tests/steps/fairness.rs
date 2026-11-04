@@ -346,7 +346,7 @@ async fn when_enqueue_selects_low_volume(world: &mut BddWorld) -> Result<(), Str
         )
         .await?;
     }
-    let report = drive(&low_system, 2, 1, 512 * 1024, 128, now).await?;
+    let report = drive(&low_system, 2, 1, 512 * 1024, 2048, now).await?;
     let selected = selected_ids(&report);
     evidence(world).selected = selected;
     if evidence(world).selected.len() <= 1 {
@@ -560,7 +560,7 @@ async fn given_scratch_jobs(world: &mut BddWorld) -> Result<(), String> {
 #[when("processors are available")]
 async fn when_processors_available(world: &mut BddWorld) -> Result<(), String> {
     let system = lifecycle::take_system(world)?;
-    let report = drive(&system, 7, 1, 512 * 1024, 128, world.now).await?;
+    let report = drive(&system, 7, 1, 512 * 1024, 2048, world.now).await?;
     evidence(world).selected = selected_ids(&report);
     world.drive_report = Some(report);
     world.system = Some(system);
@@ -633,7 +633,7 @@ async fn then_low_volume_capped(world: &mut BddWorld) -> Result<(), String> {
 #[when("enough dispatch cost is observed")]
 async fn when_priority_dispatch(world: &mut BddWorld) -> Result<(), String> {
     let system = lifecycle::take_system(world)?;
-    let report = drive(&system, 13, 1, 512 * 1024, 512, world.now).await?;
+    let report = drive(&system, 13, 1, 512 * 1024, 4096, world.now).await?;
     evidence(world).selected = selected_ids(&report);
     world.drive_report = Some(report);
     world.system = Some(system);
@@ -663,7 +663,7 @@ async fn then_priority_ratio(world: &mut BddWorld) -> Result<(), String> {
 #[when("independent eligible work exists")]
 async fn when_independent_work_exists(world: &mut BddWorld) -> Result<(), String> {
     let system = lifecycle::take_system(world)?;
-    let report = drive(&system, 2, 1, 16, 128, world.now).await?;
+    let report = drive(&system, 2, 1, 16, 512, world.now).await?;
     evidence(world).selected = selected_ids(&report);
     world.drive_report = Some(report);
     world.system = Some(system);
@@ -712,7 +712,7 @@ async fn then_batch_outcomes(world: &mut BddWorld) -> Result<(), String> {
 #[when("a batch is driven")]
 async fn when_batch_driven(world: &mut BddWorld) -> Result<(), String> {
     let system = lifecycle::take_system(world)?;
-    let report = drive(&system, 2, 2, 512 * 1024, 128, world.now).await?;
+    let report = drive(&system, 2, 2, 512 * 1024, 2048, world.now).await?;
     evidence(world).selected = selected_ids(&report);
     world.drive_report = Some(report);
     world.system = Some(system);
@@ -760,7 +760,7 @@ async fn then_scratch_capacity(world: &mut BddWorld) -> Result<(), String> {
     Ok(())
 }
 
-#[given("a schedule has two due overlap-forbidden occurrences in one ordering group")]
+#[given("a schedule has two due times with overlap forbidden")]
 async fn given_overlap_schedule(world: &mut BddWorld) -> Result<(), String> {
     let store = FakeStore::new();
     let system = public_system(store.clone(), 7)?;
@@ -789,6 +789,10 @@ async fn given_overlap_schedule(world: &mut BddWorld) -> Result<(), String> {
         enabled: true,
     });
     let now = Timestamp::from_millis(2 * 60 * 60 * 1_000);
+    system
+        .initialize_catalog()
+        .await
+        .map_err(lifecycle::display_error)?;
     let materialized = system
         .materialize_schedule(
             &schedule,
@@ -797,12 +801,13 @@ async fn given_overlap_schedule(world: &mut BddWorld) -> Result<(), String> {
         )
         .await
         .map_err(lifecycle::display_error)?;
-    if materialized.occurrences.len() != 2 {
+    if materialized.occurrences.len() != 1 {
         return Err(format!(
-            "expected two due occurrences, got {}",
+            "expected one active occurrence while the second stays due, got {}",
             materialized.occurrences.len()
         ));
     }
+    evidence(world).overlap_schedule = Some(schedule);
     world.store = Some(store);
     world.system = Some(system);
     world.now = now;
@@ -812,7 +817,20 @@ async fn given_overlap_schedule(world: &mut BddWorld) -> Result<(), String> {
 #[when("the public engine drives with two available permits")]
 async fn when_overlap_drives(world: &mut BddWorld) -> Result<(), String> {
     let system = lifecycle::take_system(world)?;
-    let report = drive(&system, 2, 2, 512 * 1024, 128, world.now).await?;
+    let report = drive(&system, 2, 2, 512 * 1024, 2048, world.now).await?;
+    let schedule = evidence(world)
+        .overlap_schedule
+        .take()
+        .ok_or("overlap schedule missing")?;
+    let successor = system
+        .materialize_schedule(
+            &schedule,
+            &ScheduleCursor::new(Some(Timestamp::ZERO), true),
+            world.now,
+        )
+        .await
+        .map_err(lifecycle::display_error)?;
+    evidence(world).overlap_successor_admitted = successor.occurrences.len() == 1;
     evidence(world).selected = selected_ids(&report);
     world.drive_report = Some(report);
     world.system = Some(system);
@@ -822,7 +840,12 @@ async fn when_overlap_drives(world: &mut BddWorld) -> Result<(), String> {
 #[then("overlap-forbidden work claims at most one permit")]
 async fn then_overlap_forbidden(world: &mut BddWorld) -> Result<(), String> {
     let report = world.drive_report.as_ref().ok_or("drive report missing")?;
-    if report.counts.claimed > 1 {
+    if report.counts.claimed != 1
+        || !world
+            .fairness
+            .as_ref()
+            .is_some_and(|state| state.overlap_successor_admitted)
+    {
         return Err(format!(
             "overlap-forbidden schedule claimed {} permits",
             report.counts.claimed
@@ -875,12 +898,12 @@ async fn when_claimants_overlap(world: &mut BddWorld) -> Result<(), String> {
     if !matches!(conflict, Err(JobSystemError::LeaseConflict)) {
         return Err("overlapping claimant returned an unexpected outcome".to_owned());
     }
-    let first_report = drive(&second, 1, 1, 512 * 1024, 128, now).await?;
+    let first_report = drive(&second, 1, 1, 512 * 1024, 2048, now).await?;
     first
         .complete(first_claim, JobOutcome::Complete(completed_code()), now)
         .await
         .map_err(lifecycle::display_error)?;
-    let second_report = drive(&second, 1, 1, 512 * 1024, 128, now).await?;
+    let second_report = drive(&second, 1, 1, 512 * 1024, 2048, now).await?;
     let mut selected = selected_ids(&first_report);
     selected.extend(selected_ids(&second_report));
     evidence(world).selected = selected;

@@ -104,7 +104,7 @@ one winner, one conflict, and no partial effects across the processes or nodes t
 The fake/reference stores and conformance helpers are test infrastructure, not that proof and not
 deployment components. The reusable [`bg-jobs-conformance`](../bg-jobs-conformance/README.md) suite
 checks the portable contract but cannot certify backend contention. The consuming application also
-owns handler registration, routes, payload migration, and runtime integration; this crate does not
+owns handler registration, routes, payloads, and runtime integration; this crate does not
 replace those jobs by itself.
 
 ## Ownership and review
@@ -146,6 +146,37 @@ lifecycle state, and checkpoint, while the supplied `scheduled_at` is used only 
 The low-level raw enqueue operation remains strict and rejects a replay whose original schedule has
 changed; routine callers should use the typed catalog and runtime facade instead. It is available
 only through the runtime adapter boundary, not through the routine facade.
+
+Configured startup seeds use `JobCatalog::with_manifest` and `ensure_seeds()`. Every worker for a
+namespace supplies the same complete `CatalogManifest`, including supported disabled controllers,
+regardless of its handler subset. Configured seed admission recovers abandoned input after a definite capacity
+rejection and retry once, so a full abandoned pool cannot block worker startup. A newer
+`CatalogRevision` changes membership. Each retained ID
+binds one immutable definition; a changed definition needs a new ID. Completed configured seeds
+retain only their digest and completion bit in the bounded catalog ledger. Dynamic `ensure_seed`
+is active-only: inspect durable application status before enqueueing an already-completed business
+operation, including when dispatch carries an old Pending snapshot.
+
+Recurring schedule materialization uses the stored catalog cursor after its first initialization.
+Occurrence admission and cursor advancement commit atomically. `control_schedule` updates that
+same cursor. Callers do not persist a second authoritative cursor. Cancelled and dead-lettered jobs
+retain redrive and reconciliation state until the application calls `settle_terminal` with the exact
+`JobTerminalAuthority`, after durable business reconciliation. A concurrent redrive rejects stale
+settlement. Unique deduplication identities retain their promised window; bounded scheduler
+maintenance removes them after expiry.
+
+Event-driven consumers without a resident driver call `JobRuntime::recover_commits()` through
+an exclusive mutable runtime before admission. This separately bounded phase never invokes a
+handler. Dynamic seed calls inside handlers retain their original operation/memory budgets and
+do not trigger a full-pool recovery pass.
+
+The journal has 256 fixed slots per namespace. Normal commands atomically apply business changes
+and a fixed-size completed witness in one transaction. JobSystem acknowledges the result before
+another command atomically replaces that witness. A replacement engine reconciles it before reuse.
+Pending commands retain complete input; `CommitCapacity` applies backpressure when none can be
+admitted. Recovery finishes pending work and deletes its input; delayed retired identities fail with `RetiredCommit`. Bootstrap and
+recovery may write. Idle discovery after required recovery and maintenance deadlines makes no
+mutations. Backend futures must enforce timeouts as well as operation budgets.
 
 Recurring poll handlers use `ExecutionContext::poll_checkpoint()` to resume their application
 payload and `continue_poll()` to retain polling history in the checkpoint.
@@ -195,10 +226,12 @@ checkpoint, and destination receipt. `owner()` is intentionally excluded because
 between workers, and `JobId` is intentionally excluded because a job identifier may be reused or
 redriven for another logical execution. Put any application business identifier in the validated
 typed payload. `operation_id()` identifies the current local lifecycle operation and may rotate; use
-it for correlation, not as the sole external idempotency key. `OperationReceipt` records local
-lifecycle authority and is not an external-effect receipt. After an ambiguous local completion,
-`reconcile` and `observe_lifecycle` establish the local result, while the consumer reconciles its
-destination receipt independently.
+it for correlation, not as the sole external idempotency key. Completion acknowledgement uses a
+finite durable-input journal. A replacement worker can finish accepted input through
+`recover_commits()` without rerunning its handler. Successful completion removes per-job evidence;
+`observe_lifecycle` then returns `Missing`, which does not establish application success. Callers
+reconcile their durable business records independently. There is no stored completion history or
+receipt-based reconciliation API.
 
 With destination-side atomic fencing, consumers do not need a separate pending/activate lease
 protocol. If a destination cannot atomically enforce the fence with its effect, keep a destination-

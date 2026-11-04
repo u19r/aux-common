@@ -18,7 +18,7 @@ pub async fn run_faults<S: JobStore>(
         .map_err(ConformanceError::Invalid)?;
     let clean = transaction(store, vec![], vec![Mutation::Delete(key.clone())])?;
     let _ = store
-        .commit(&clean)
+        .transact(&clean)
         .await
         .map_err(ConformanceError::Store)?;
     let mut report = ConformanceReport {
@@ -43,7 +43,7 @@ async fn transient_faults<S: JobStore>(
             .queue_commit_fault(CommitFaultKind::Transient(kind))
             .map_err(ConformanceError::Store)?;
         let transaction = put_transaction(store, key, b"transient")?;
-        let result = store.commit(&transaction).await;
+        let result = store.transact(&transaction).await;
         report.commits += 1;
         report.assertions += 1;
         let matches_kind = matches!(
@@ -75,7 +75,7 @@ async fn injected_conflict<S: JobStore>(
     report.assertions += 1;
     let transaction = put_transaction(store, key, b"conflict")?;
     if store
-        .commit(&transaction)
+        .transact(&transaction)
         .await
         .map_err(ConformanceError::Store)?
         != CommitOutcome::Conflict
@@ -98,7 +98,7 @@ async fn unknown_before<S: JobStore>(
     report.assertions += 1;
     let transaction = put_transaction(store, key, b"before")?;
     if store
-        .commit(&transaction)
+        .transact(&transaction)
         .await
         .map_err(ConformanceError::Store)?
         != CommitOutcome::Unknown
@@ -128,7 +128,7 @@ async fn unknown_after<S: JobStore>(
     report.assertions += 1;
     let transaction = put_transaction(store, key, b"after")?;
     if store
-        .commit(&transaction)
+        .transact(&transaction)
         .await
         .map_err(ConformanceError::Store)?
         != CommitOutcome::Unknown

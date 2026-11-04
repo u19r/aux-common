@@ -17,9 +17,7 @@ pub(super) const ALL_COMMAND_FAMILIES: [&str; 16] = [
     "LifecycleRedrive",
 ];
 
-// Keep the connector's finite exposure bookkeeping aligned with the Quint
-// model. Terminal receipts themselves remain public store observations; this
-// set only records which of those receipts the model has exposed as
-// completion details, a value with no persisted representation.
+// Keep the connector's finite caller-result exposure aligned with the Quint
+// model. Completion details have no persisted representation.
 pub(super) const MAX_COMPLETION_RECEIPTS: usize = 2;
 pub(super) const MAX_UNRELATED_PROGRESS: i64 = 4;

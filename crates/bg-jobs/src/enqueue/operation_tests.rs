@@ -213,99 +213,22 @@ fn given_a_continued_controller_when_restart_ensures_its_seed_then_progress_is_p
 }
 
 #[test]
-fn given_a_completed_seed_when_startup_reseeds_then_the_terminal_receipt_is_preserved() {
+fn given_completed_dynamic_work_when_explicitly_enqueued_again_then_the_caller_starts_new_work() {
     let store = FakeStore::new();
     let engine = system(store.clone(), FairnessPolicy::low_volume(), 1);
     let seed = crate::test_helper::low_volume_job(11, Timestamp::ZERO);
     block_on(engine.ensure_seed_raw(seed.clone(), Timestamp::ZERO)).unwrap();
     let claim = block_on(engine.claim(seed.job_id, Timestamp::ZERO)).unwrap();
     block_on(engine.complete(claim, crate::test_helper::completion(), Timestamp::ZERO)).unwrap();
-    let before = store.snapshot().unwrap();
-    let result = block_on(engine.ensure_seed_raw(seed, Timestamp::from_millis(1))).unwrap();
-    assert_eq!(result.disposition, EnqueueDisposition::AlreadyPresent);
-    assert_eq!(result.wake, WakeHint::None);
-    assert_eq!(store.snapshot().unwrap(), before);
-}
-
-#[test]
-fn given_a_foreign_terminal_receipt_when_startup_reseeds_then_identity_conflicts_without_writes() {
-    let store = FakeStore::new();
-    let engine = system(store.clone(), FairnessPolicy::low_volume(), 1);
-    let seed = crate::test_helper::low_volume_job(12, Timestamp::ZERO);
-    block_on(engine.ensure_seed_raw(seed.clone(), Timestamp::ZERO)).unwrap();
-    let claim = block_on(engine.claim(seed.job_id, Timestamp::ZERO)).unwrap();
-    block_on(engine.complete(claim, crate::test_helper::completion(), Timestamp::ZERO)).unwrap();
-    let key = crate::keys::operation_key(engine.namespace(), &seed.job_id).unwrap();
-    let mut receipt =
-        match crate::codec::decode_operation(&block_on(store.get(key.clone())).unwrap().unwrap())
+    assert!(
+        block_on(store.get(crate::keys::operation_key(engine.namespace(), &seed.job_id).unwrap()))
             .unwrap()
-        {
-            crate::codec::DecodedOperation::Receipt(receipt) => receipt,
-            crate::codec::DecodedOperation::Live(_) => panic!("terminal receipt"),
-        };
-    receipt.kind = JobKind::try_new("different").unwrap();
-    store
-        .put_raw(key, crate::keys::operation_receipt_value(&receipt).unwrap())
-        .unwrap();
-    let before = store.snapshot().unwrap();
-    assert!(matches!(
-        block_on(engine.ensure_seed_raw(seed, Timestamp::ZERO)),
-        Err(JobSystemError::JobIdConflict)
-    ));
-    assert_eq!(store.snapshot().unwrap(), before);
-}
-
-#[test]
-fn given_a_completed_seed_when_its_definition_changes_then_startup_conflicts_without_writes() {
-    let store = FakeStore::new();
-    let engine = system(store.clone(), FairnessPolicy::low_volume(), 1);
-    let seed = crate::test_helper::low_volume_job(13, Timestamp::ZERO);
-    block_on(engine.ensure_seed_raw(seed.clone(), Timestamp::ZERO)).unwrap();
-    let claim = block_on(engine.claim(seed.job_id, Timestamp::ZERO)).unwrap();
-    block_on(engine.complete(claim, crate::test_helper::completion(), Timestamp::ZERO)).unwrap();
-    let before = store.snapshot().unwrap();
-    let mut changed_payload = seed.clone();
-    changed_payload.payload = Bytes::from_static(b"different");
-    let mut changed_policy = seed.clone();
-    changed_policy.retry_override = Some(RetrySelection::Preset(RetryPreset::Network));
-    let mut changed_priority = seed;
-    changed_priority.priority = Priority::Bulk;
-    for changed in [changed_payload, changed_policy, changed_priority] {
-        assert!(matches!(
-            block_on(engine.ensure_seed_raw(changed, Timestamp::ZERO)),
-            Err(JobSystemError::JobIdConflict)
-        ));
-        assert_eq!(store.snapshot().unwrap(), before);
-    }
-}
-
-#[test]
-fn given_a_legacy_completed_seed_receipt_when_startup_reseeds_then_unproved_identity_fails_closed()
-{
-    let store = FakeStore::new();
-    let engine = system(store.clone(), FairnessPolicy::low_volume(), 1);
-    let seed = crate::test_helper::low_volume_job(14, Timestamp::ZERO);
-    block_on(engine.ensure_seed_raw(seed.clone(), Timestamp::ZERO)).unwrap();
-    let claim = block_on(engine.claim(seed.job_id, Timestamp::ZERO)).unwrap();
-    block_on(engine.complete(claim, crate::test_helper::completion(), Timestamp::ZERO)).unwrap();
-    let key = crate::keys::operation_key(engine.namespace(), &seed.job_id).unwrap();
-    let mut receipt =
-        match crate::codec::decode_operation(&block_on(store.get(key.clone())).unwrap().unwrap())
-            .unwrap()
-        {
-            crate::codec::DecodedOperation::Receipt(receipt) => receipt,
-            crate::codec::DecodedOperation::Live(_) => panic!("terminal receipt"),
-        };
-    receipt.definition_digest = None;
-    store
-        .put_raw(key, crate::keys::operation_receipt_value(&receipt).unwrap())
-        .unwrap();
-    let before = store.snapshot().unwrap();
-    assert!(matches!(
-        block_on(engine.ensure_seed_raw(seed, Timestamp::ZERO)),
-        Err(JobSystemError::JobIdConflict)
-    ));
-    assert_eq!(store.snapshot().unwrap(), before);
+            .is_none()
+    );
+    let result = block_on(engine.ensure_seed_raw(seed.clone(), Timestamp::from_millis(1))).unwrap();
+    assert_eq!(result.disposition, EnqueueDisposition::Enqueued);
+    let claim = block_on(engine.claim(seed.job_id, Timestamp::from_millis(1))).unwrap();
+    assert_eq!(claim.payload().as_ref(), seed.payload.as_ref());
 }
 
 #[derive(Clone)]
@@ -334,9 +257,14 @@ impl JobStore for CompleteBeforeAcknowledgement {
         self.inner.read_range(request).await
     }
 
-    async fn commit(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
-        let outcome = self.inner.commit(transaction).await?;
+    async fn transact(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
+        let outcome = self.inner.transact(transaction).await?;
         if outcome == CommitOutcome::Committed
+            && transaction.mutations().iter().any(|mutation| {
+                mutation.key()
+                    == &crate::keys::job_key(&Namespace::try_new(b"jobs").unwrap(), &self.job_id)
+                        .unwrap()
+            })
             && self
                 .interrupt
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -371,11 +299,20 @@ fn given_seed_completion_before_a_lost_enqueue_response_when_reconciled_then_app
     );
     let result = block_on(engine.ensure_seed_raw(seed.clone(), Timestamp::ZERO)).unwrap();
     assert_eq!(result.disposition, EnqueueDisposition::Enqueued);
-    assert_eq!(result.wake, WakeHint::None);
-    let before = store.inner.snapshot().unwrap();
-    let repeated = block_on(engine.ensure_seed_raw(seed, Timestamp::ZERO)).unwrap();
-    assert_eq!(repeated.disposition, EnqueueDisposition::AlreadyPresent);
-    assert_eq!(store.inner.snapshot().unwrap(), before);
+    assert_eq!(result.wake, WakeHint::Now);
+    assert!(matches!(
+        block_on(engine.observe_lifecycle(seed.job_id)).unwrap(),
+        LifecycleObservation::Missing
+    ));
+    assert!(
+        block_on(
+            store
+                .inner
+                .get(crate::keys::operation_key(engine.namespace(), &seed.job_id).unwrap())
+        )
+        .unwrap()
+        .is_none()
+    );
 }
 
 #[test]
@@ -390,4 +327,34 @@ fn given_an_overdue_stable_seed_when_first_enqueued_then_it_can_be_claimed_at_en
     assert_eq!(claim.record().scheduled_at, Timestamp::ZERO);
     assert_eq!(claim.record().created_at, now);
     assert!(claim.record().retention_deadline > now);
+}
+
+#[test]
+fn given_completed_work_with_expired_deduplication_when_scheduler_observes_it_then_expired_identity_does_not_accumulate()
+ {
+    let store = FakeStore::distributed();
+    let engine = system(store.clone(), FairnessPolicy::low_volume(), 1);
+    let mut seed = crate::test_helper::low_volume_job(30, Timestamp::ZERO);
+    let dedupe = crate::test_helper::dedupe(b"expired-unique", Timestamp::from_millis(1));
+    let key = crate::keys::dedupe_key(engine.namespace(), dedupe.key()).unwrap();
+    seed.deduplication = Some(dedupe);
+    block_on(engine.enqueue_raw(seed.clone(), Timestamp::ZERO)).unwrap();
+    let claim = block_on(engine.claim(seed.job_id, Timestamp::ZERO)).unwrap();
+    block_on(engine.complete(claim, crate::test_helper::completion(), Timestamp::ZERO)).unwrap();
+    assert!(
+        store.contains(&key).unwrap(),
+        "promised retention window must survive completion"
+    );
+    let request = DriveBudget::try_tiny(QueueSelection::all())
+        .unwrap()
+        .request_at(MonotonicDeadline::ZERO)
+        .unwrap();
+    block_on(engine.drive(request, Timestamp::from_millis(2), || {
+        MonotonicDeadline::ZERO
+    }))
+    .unwrap();
+    assert!(
+        !store.contains(&key).unwrap(),
+        "expired unique dedupe identities must not form another permanent archive"
+    );
 }

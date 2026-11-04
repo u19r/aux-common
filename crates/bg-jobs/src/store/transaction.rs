@@ -81,11 +81,40 @@ pub struct StoreTransaction {
 /// Inputs for constructing a checked transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoreTransactionInput {
-    /// Stable identity for this one logical commit and all of its retries.
+    /// Logical command identity retained in journal recovery input.
     pub operation_id: CommitOperationId,
     pub checks: Vec<Check>,
     pub mutations: Vec<Mutation>,
     pub limits: TransactionLimits,
+}
+
+impl From<StoreTransaction> for StoreTransactionInput {
+    fn from(transaction: StoreTransaction) -> Self {
+        Self {
+            operation_id: transaction.operation_id,
+            checks: transaction.checks,
+            mutations: transaction.mutations,
+            limits: transaction.limits,
+        }
+    }
+}
+
+impl StoreTransactionInput {
+    pub(crate) fn remove_key(&mut self, key: &StoreKey) {
+        self.checks.retain(|check| check.key() != key);
+        self.mutations.retain(|mutation| mutation.key() != key);
+    }
+
+    /// Replace this key's condition and optional put; retain every other
+    /// authority.
+    pub(crate) fn replace_key(&mut self, check: Check, next: Option<Bytes>) {
+        self.remove_key(check.key());
+        if let Some(value) = next {
+            self.mutations
+                .push(Mutation::Put(check.key().clone(), value));
+        }
+        self.checks.push(check);
+    }
 }
 
 impl TryFrom<StoreTransactionInput> for StoreTransaction {
@@ -93,6 +122,7 @@ impl TryFrom<StoreTransactionInput> for StoreTransaction {
 
     fn try_from(input: StoreTransactionInput) -> Result<Self, Self::Error> {
         validate_counts(&input)?;
+        validate_binding_lengths(&input)?;
         let encoded_bytes = encoded_bytes(&input);
         if encoded_bytes > input.limits.max_bytes.get() {
             return Err(StoreContractError::CapabilityExceeded("transaction bytes"));
@@ -110,7 +140,8 @@ impl TryFrom<StoreTransactionInput> for StoreTransaction {
 }
 
 impl StoreTransaction {
-    /// Stable identity that adapters use to replay an established outcome.
+    /// Logical command identity. Native attempts always evaluate current
+    /// checks.
     pub const fn operation_id(&self) -> CommitOperationId {
         self.operation_id
     }
@@ -165,6 +196,29 @@ fn validate_unique_keys<T>(
     let mut seen = BTreeSet::new();
     if values.iter().any(|value| !seen.insert(key(value))) {
         return Err(StoreContractError::DuplicateTransactionKey(section));
+    }
+    Ok(())
+}
+
+fn validate_binding_lengths(input: &StoreTransactionInput) -> Result<(), StoreContractError> {
+    let lengths = input
+        .checks
+        .iter()
+        .flat_map(|check| match check {
+            Check::Absent(key) => [key.as_bytes().len(), 0],
+            Check::Value(key, value) => [key.as_bytes().len(), value.len()],
+        })
+        .chain(input.mutations.iter().flat_map(|mutation| match mutation {
+            Mutation::Put(key, value) => [key.as_bytes().len(), value.len()],
+            Mutation::Delete(key) => [key.as_bytes().len(), 0],
+        }));
+    if lengths
+        .into_iter()
+        .any(|length| u32::try_from(length).is_err())
+    {
+        return Err(StoreContractError::CapabilityExceeded(
+            "binding byte length",
+        ));
     }
     Ok(())
 }

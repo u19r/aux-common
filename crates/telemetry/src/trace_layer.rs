@@ -11,7 +11,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use metrics_facade::{counter, histogram};
+use metrics_facade::{RequestOperation, counter, histogram};
 use tower_http::{
     classify::{ServerErrorsAsFailures, ServerErrorsFailureClass, SharedClassifier},
     trace::{DefaultOnBodyChunk, DefaultOnEos, DefaultOnRequest, TraceLayer},
@@ -52,6 +52,15 @@ pub fn request_trace_layer() -> RequestTraceLayer {
         .make_span_with(make_span as MakeSpanFn)
         .on_response(on_response as OnResponseFn)
         .on_failure(on_failure as OnFailureFn)
+}
+
+/// Attribute storage only while polling the request's own future. Install
+/// outside synchronous request middleware; spawned workers do not inherit it.
+pub async fn request_operation_scope(request: http::Request<Body>, next: Next) -> Response {
+    let operation = format!("{} {}", request.method(), bounded_operation_path(&request));
+    RequestOperation::from(operation.as_str())
+        .scope(next.run(request))
+        .await
 }
 
 pub async fn slow_operation_log(

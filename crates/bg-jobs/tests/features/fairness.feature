@@ -53,7 +53,7 @@ Feature: Fair priority and batch execution
 
   @F003_S009
   Scenario: Schedule overlap consumes one primary permit
-    Given a schedule has two due overlap-forbidden occurrences in one ordering group
+    Given a schedule has two due times with overlap forbidden
     When the public engine drives with two available permits
     Then overlap-forbidden work claims at most one permit
 

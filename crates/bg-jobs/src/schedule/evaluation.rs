@@ -165,7 +165,8 @@ fn finish_evaluation(
     backlog: Backlog,
 ) -> Result<ScheduleEvaluation, ValidationError> {
     if backlog.count == 0 {
-        let wake = WakeHint::from_optional_timestamp(cron.next_at_or_after(now)?);
+        let earliest = cursor.next_due.map_or(now, |due| due.max(now));
+        let wake = WakeHint::from_optional_timestamp(cron.next_at_or_after(earliest)?);
         return Ok(ScheduleEvaluation::idle(cursor.clone(), wake));
     }
     let resumable = backlog.resumable;
@@ -184,7 +185,7 @@ fn finish_evaluation(
     } else {
         cron.next_after(now)?
     };
-    let next_cursor = advance_cursor(cursor, next_due, watermark, last_intended);
+    let next_cursor = cursor.advance(next_due, watermark, last_intended)?;
     let wake = if resumable {
         WakeHint::Now
     } else {
@@ -327,18 +328,4 @@ fn occurrences(
         }
     }
     (occurrences, skipped, watermark, last_intended)
-}
-
-fn advance_cursor(
-    cursor: &ScheduleCursor,
-    next_due: Option<Timestamp>,
-    watermark: Option<Timestamp>,
-    last_intended: Option<Timestamp>,
-) -> ScheduleCursor {
-    let mut next_cursor = cursor.clone();
-    next_cursor.next_due = next_due;
-    next_cursor.watermark = watermark.or(cursor.watermark);
-    next_cursor.revision = cursor.revision.saturating_add(1);
-    next_cursor.last_intended = last_intended;
-    next_cursor
 }

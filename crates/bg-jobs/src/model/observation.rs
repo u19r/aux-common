@@ -2,7 +2,7 @@ use std::num::NonZeroU16;
 
 use super::{
     constants::PAYLOAD_DIGEST_BYTES,
-    record::{AttemptHistory, JobPolicySnapshot, JobState, OperationReceipt},
+    record::{AttemptHistory, JobPolicySnapshot, JobState},
 };
 use crate::{
     ids::{ExecutionId, JobId, JobKind, OperationId, OrderingKey, QueueName},
@@ -71,7 +71,7 @@ pub struct LifecycleRecord {
     pub revision: u64,
 }
 
-/// Observation of one job's authoritative live record or terminal receipt.
+/// Observation of one job's current authoritative record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LifecycleObservation {
     Current {
@@ -81,7 +81,6 @@ pub enum LifecycleObservation {
         cancellation_requested: bool,
         status: LifecycleRecordStatus,
     },
-    Terminal(OperationReceipt),
     Invalid {
         status: LifecycleRecordStatus,
         routes: LifecycleRoutes,

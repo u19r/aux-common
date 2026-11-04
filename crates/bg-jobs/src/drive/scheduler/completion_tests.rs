@@ -12,6 +12,7 @@ use std::{
 use super::shutdown_tests::{never_waking_system, never_waking_system_with_scheduler};
 use crate::{
     budget::{DriveRequestInput, QueueSelection},
+    observer::StoreOperation,
     test_helper::{block_on, low_volume_job, one, system},
     *,
 };
@@ -23,11 +24,55 @@ fn drive_request() -> DriveRequest {
         max_concurrency: std::num::NonZeroU16::new(1).expect("concurrency is non-zero"),
         max_payload_bytes_in_flight: std::num::NonZeroUsize::new(1024).expect("payload budget"),
         max_completion_details: 1,
-        max_store_operations: one(64),
+        max_store_operations: one(512),
         stop_claiming_at: MonotonicDeadline::from_nanos(1),
         finish_by: MonotonicDeadline::from_nanos(u64::MAX),
     })
     .expect("drive request is valid")
+}
+
+#[derive(Default)]
+struct CommitCounter(AtomicUsize);
+
+impl JobObserver for CommitCounter {
+    fn observe(&self, event: JobEvent) {
+        if matches!(
+            event,
+            JobEvent::StoreOperation {
+                operation: StoreOperation::Commit
+            }
+        ) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[test]
+fn given_no_due_work_when_observing_ten_thousand_times_then_no_commit_is_dispatched() {
+    for has_future_job in [false, true] {
+        let store = FakeStore::new();
+        let counter = Arc::new(CommitCounter::default());
+        let engine =
+            system(store.clone(), FairnessPolicy::low_volume(), 1).with_observer(counter.clone());
+        if has_future_job {
+            block_on(engine.enqueue_raw(
+                low_volume_job(1, Timestamp::from_millis(1000)),
+                Timestamp::ZERO,
+            ))
+            .unwrap();
+        }
+        let before = store.snapshot().unwrap();
+        counter.0.store(0, Ordering::Relaxed);
+        for _ in 0..10_000 {
+            let report = block_on(engine.drive(drive_request(), Timestamp::ZERO, || {
+                MonotonicDeadline::from_nanos(0)
+            }))
+            .unwrap();
+            assert_eq!(report.counts.claimed, 0);
+        }
+        assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+        assert_eq!(store.snapshot().unwrap(), before);
+    }
 }
 
 struct CountingScheduler {
@@ -78,7 +123,7 @@ fn given_zero_completion_detail_budget_when_driving_then_success_is_counted_and_
         max_payload_bytes_in_flight: std::num::NonZeroUsize::new(384 * 1024)
             .expect("payload budget is non-zero"),
         max_completion_details: 0,
-        max_store_operations: one(32),
+        max_store_operations: one(512),
         stop_claiming_at: MonotonicDeadline::from_nanos(1),
         finish_by: MonotonicDeadline::from_nanos(u64::MAX),
     })
@@ -182,9 +227,13 @@ impl JobHandler for CompletionFailureHandler {
                 return Poll::Pending;
             }
             if is_failure {
-                for _ in 0..2 {
+                for _ in 0..3 {
                     self.store
-                        .queue_unknown_before_commit()
+                        .queue_commit_for_key(
+                            crate::keys::job_key(context.namespace(), &context.job_id()).unwrap(),
+                            CommitOutcome::Unknown,
+                            false,
+                        )
                         .expect("inject unacknowledged completion");
                 }
             }
@@ -260,7 +309,7 @@ fn assert_completion_error_settles_active_handler(fail_first: bool) {
         max_concurrency: std::num::NonZeroU16::new(2).expect("two handlers"),
         max_payload_bytes_in_flight: std::num::NonZeroUsize::new(1024).expect("payload budget"),
         max_completion_details: 2,
-        max_store_operations: one(256),
+        max_store_operations: one(512),
         stop_claiming_at: MonotonicDeadline::from_nanos(1_000_000_000),
         finish_by: MonotonicDeadline::from_nanos(u64::MAX),
     })

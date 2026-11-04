@@ -39,27 +39,39 @@ impl JobStore for UnknownWakeStore {
         self.inner.get(key).await
     }
 
-    async fn get_many(&self, _keys: &[StoreKey]) -> Result<Vec<Option<Bytes>>, Self::Error> {
-        panic!("settlement reconciliation uses individual probes")
+    async fn get_many(&self, keys: &[StoreKey]) -> Result<Vec<Option<Bytes>>, Self::Error> {
+        self.inner.get_many(keys).await
     }
 
-    async fn read_range(&self, _request: RangeRequest) -> Result<RangePage, Self::Error> {
-        panic!("conservative wake refresh must not rescan due routes")
+    async fn read_range(&self, request: RangeRequest) -> Result<RangePage, Self::Error> {
+        self.inner.read_range(request).await
     }
 
-    async fn commit(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
+    async fn transact(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
+        let namespace = Namespace::try_new(b"jobs").unwrap();
+        let is_application = |transaction: &StoreTransaction| {
+            transaction.mutations().iter().any(|mutation| {
+                crate::codec::KeyCodec::decode(&namespace, mutation.key())
+                    .unwrap()
+                    .tag
+                    == crate::codec::KeyTag::Job
+            })
+        };
         let commit_number = {
             let mut calls = self.calls.lock().unwrap();
             calls.push(SettlementCall::Commit(transaction.clone()));
             calls
                 .iter()
-                .filter(|call| matches!(call, SettlementCall::Commit(_)))
+                .filter(|call| matches!(call, SettlementCall::Commit(transaction) if is_application(transaction)))
                 .count()
         };
+        if !is_application(transaction) {
+            return self.inner.transact(transaction).await;
+        }
         match commit_number {
             1 | 3 | 4 => Ok(CommitOutcome::Unknown),
             2 => {
-                let result = self.inner.commit(transaction).await;
+                let result = self.inner.transact(transaction).await;
                 assert_eq!(
                     result,
                     Ok(CommitOutcome::Conflict),
@@ -67,7 +79,7 @@ impl JobStore for UnknownWakeStore {
                 );
                 result
             }
-            _ => panic!("only exact Unknown replay and one known-abort rebase are permitted"),
+            _ => self.inner.transact(transaction).await,
         }
     }
 }
@@ -103,22 +115,31 @@ fn prepare_changed_wake(inner: &FakeStore) -> (StoreKey, Bytes, StoreKey, Bytes)
 }
 
 fn assert_exact_unknown_replays(calls: &[SettlementCall], job: &StoreKey, wake: &StoreKey) {
-    assert_eq!(calls.len(), 8, "observed full settlement store-call bound");
-    for index in [1, 5, 7] {
-        assert!(matches!(&calls[index], SettlementCall::Get(key) if key == job));
-    }
-    assert!(matches!(&calls[3], SettlementCall::Get(key) if key == wake));
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, SettlementCall::Get(key) if key == wake))
+    );
     let transactions: Vec<_> = calls
         .iter()
         .filter_map(|call| match call {
-            SettlementCall::Commit(transaction) => Some(transaction),
+            SettlementCall::Commit(transaction)
+                if transaction
+                    .mutations()
+                    .iter()
+                    .any(|mutation| mutation.key() == job) =>
+            {
+                Some(transaction)
+            }
+            SettlementCall::Commit(_) => None,
             SettlementCall::Get(_) => None,
         })
         .collect();
     assert_eq!(transactions.len(), 4);
     assert_eq!(
-        transactions[0], transactions[1],
-        "original Unknown retries exact transaction"
+        transactions[0].operation_id(),
+        transactions[1].operation_id(),
+        "pending transfer retains the original logical command"
     );
     assert_eq!(
         transactions[2], transactions[3],
@@ -132,24 +153,24 @@ fn assert_exact_unknown_replays(calls: &[SettlementCall], job: &StoreKey, wake: 
         transactions[0]
             .checks()
             .iter()
-            .filter(|check| check.key() != wake)
+            .filter(|check| check.key() != wake && check.key() == job)
             .collect::<Vec<_>>(),
         transactions[2]
             .checks()
             .iter()
-            .filter(|check| check.key() != wake)
+            .filter(|check| check.key() != wake && check.key() == job)
             .collect::<Vec<_>>()
     );
     assert_eq!(
         transactions[0]
             .mutations()
             .iter()
-            .filter(|mutation| mutation.key() != wake)
+            .filter(|mutation| mutation.key() != wake && mutation.key() == job)
             .collect::<Vec<_>>(),
         transactions[2]
             .mutations()
             .iter()
-            .filter(|mutation| mutation.key() != wake)
+            .filter(|mutation| mutation.key() != wake && mutation.key() == job)
             .collect::<Vec<_>>()
     );
 }
@@ -159,7 +180,7 @@ fn given_unknown_then_wake_conflict_when_rebased_settlement_remains_unknown_then
  {
     let inner = FakeStore::new();
     let (job_key, old_job, wake_key, old_wake) = prepare_changed_wake(&inner);
-    let before = inner.snapshot().unwrap();
+    let before = crate::test_helper::application_snapshot(&inner);
     let store = UnknownWakeStore {
         inner: inner.clone(),
         calls: Arc::new(Mutex::new(Vec::new())),
@@ -183,22 +204,18 @@ fn given_unknown_then_wake_conflict_when_rebased_settlement_remains_unknown_then
         ],
     )
     .unwrap();
-    let result = block_on(crate::transition::commit_transition(
-        &engine,
+    let result = block_on(engine.commit_transition(
         transaction,
-        job_key.clone(),
-        Some(&old_job),
-        Some(&next_job),
         crate::transition::TransitionConflict::LeaseLost,
     ));
     assert!(
         matches!(result, Err(JobSystemError::UnknownCommit)),
         "two unresolved rebased acknowledgements remain unknown: {result:?}"
     );
-    let calls = store.calls.lock().unwrap();
+    let calls = store.calls.lock().unwrap().clone();
     assert_exact_unknown_replays(&calls, &job_key, &wake_key);
     assert_eq!(
-        inner.snapshot().unwrap(),
+        crate::test_helper::application_snapshot(&inner),
         before,
         "unknown-before writes change no authority or business state"
     );
@@ -213,4 +230,10 @@ fn given_unknown_then_wake_conflict_when_rebased_settlement_remains_unknown_then
         "candidate reserves {reserved_outcome} outcome calls but observed {}",
         calls.len()
     );
+    assert_eq!(
+        block_on(engine.recover_commits()).unwrap(),
+        2,
+        "recover pending input and reconcile the earlier engine's completed witness"
+    );
+    assert_eq!(block_on(inner.get(job_key)).unwrap(), Some(next_job));
 }

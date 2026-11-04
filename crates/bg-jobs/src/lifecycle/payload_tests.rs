@@ -86,8 +86,8 @@ impl JobStore for RecordingStore {
         self.inner.read_range(request).await
     }
 
-    async fn commit(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
-        self.inner.commit(transaction).await
+    async fn transact(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
+        self.inner.transact(transaction).await
     }
 }
 

@@ -42,14 +42,14 @@ fn given_quint_rendered_store_commands_when_parsed_then_all_families_are_preserv
 }
 
 #[test]
-fn given_deleted_connector_receipt_when_projecting_then_store_state_remains_authoritative() {
+fn given_deleted_operation_metadata_when_projecting_then_job_record_remains_authoritative() {
     let driver = StoreProtocolDriver::try_default().expect("connector setup");
-    let key = persist::receipt_key(&driver.namespace, &JobId::JobA).expect("receipt key");
+    let key = persist::operation_key(&driver.namespace, &JobId::JobA).expect("operation key");
 
     driver
         .store
         .delete_raw(&key)
-        .expect("delete receipt shadow");
+        .expect("delete operation metadata");
 
     let projection = driver.projection().expect("projection from store");
     assert_eq!(projection.records[&JobId::JobA].revision, 1);

@@ -11,7 +11,23 @@ use crate::{
 };
 
 fn system() -> JobSystem<FakeStore> {
-    crate::test_helper::system(FakeStore::distributed(), FairnessPolicy::low_volume(), 11)
+    let reference =
+        crate::test_helper::system(FakeStore::distributed(), FairnessPolicy::low_volume(), 11);
+    let manifest = crate::CatalogManifest::try_new(
+        crate::CatalogRevision::from(std::num::NonZeroU64::MIN),
+        Vec::new(),
+        vec![ScheduleId::from([42; 16])],
+    )
+    .unwrap();
+    let system = JobSystem::new(
+        reference.store().inner.clone(),
+        crate::JobCatalog::from_registry(reference.registry().clone()).with_manifest(manifest),
+        reference.namespace().clone(),
+        *reference.owner(),
+        crate::test_helper::wake_scheduler(),
+    );
+    block_on(system.initialize_catalog()).unwrap();
+    system
 }
 
 fn schedule(enabled: bool) -> RecurringSchedule {
@@ -76,7 +92,7 @@ fn given_public_schedule_and_wake_boundaries_when_driven_then_real_state_remains
         max_concurrency: NonZeroU16::MIN,
         max_payload_bytes_in_flight: NonZeroUsize::new(1024).expect("bytes are non-zero"),
         max_completion_details: 1,
-        max_store_operations: NonZeroU32::new(64).expect("budget is non-zero"),
+        max_store_operations: NonZeroU32::new(512).expect("budget is non-zero"),
         stop_claiming_at: MonotonicDeadline::ZERO,
         finish_by: MonotonicDeadline::from_nanos(1),
     })

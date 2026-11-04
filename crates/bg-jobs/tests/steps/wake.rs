@@ -7,7 +7,7 @@ use std::{
 };
 
 use bg_jobs::{
-    DriveStopReason, EnqueueDisposition, JobKind, Priority, QueueSelection, Timestamp, WakeHint,
+    DriveStopReason, JobKind, Priority, QueueSelection, Timestamp, WakeHint,
     runtime::MonotonicDeadline,
     test_support::{
         FakeStore,
@@ -76,7 +76,7 @@ fn pulse_request(max_claims: u32) -> Result<DriveRequest, String> {
         max_concurrency: nonzero_u16(1)?,
         max_payload_bytes_in_flight: nonzero_usize(512 * 1024)?,
         max_completion_details: max_claims,
-        max_store_operations: nonzero_u32(64)?,
+        max_store_operations: nonzero_u32(1024)?,
         stop_claiming_at: MonotonicDeadline::from_nanos(u64::MAX),
         finish_by: MonotonicDeadline::from_nanos(u64::MAX),
     })
@@ -90,7 +90,7 @@ fn deadline_request() -> Result<DriveRequest, String> {
         max_concurrency: nonzero_u16(1)?,
         max_payload_bytes_in_flight: nonzero_usize(512 * 1024)?,
         max_completion_details: 4,
-        max_store_operations: nonzero_u32(64)?,
+        max_store_operations: nonzero_u32(1024)?,
         stop_claiming_at: MonotonicDeadline::ZERO,
         finish_by: MonotonicDeadline::from_nanos(1),
     })
@@ -120,6 +120,10 @@ async fn when_two_nodes_materialise(world: &mut BddWorld) -> Result<(), String> 
     let recurring = schedule(&expression, MisfirePolicy::FireOnce)?;
     let cursor = schedule_cursor();
     let now = Timestamp::from_millis(3 * HOUR);
+    first
+        .initialize_catalog()
+        .await
+        .map_err(lifecycle::display_error)?;
     let first_result = first
         .materialize_schedule(&recurring, &cursor, now)
         .await
@@ -132,17 +136,19 @@ async fn when_two_nodes_materialise(world: &mut BddWorld) -> Result<(), String> 
         .occurrences
         .first()
         .ok_or("first node emitted no occurrence")?;
-    let second_occurrence = second_result
+    let evaluated = recurring
+        .evaluate(&cursor, now)
+        .map_err(lifecycle::display_error)?;
+    let second_identity = evaluated
         .occurrences
         .first()
-        .ok_or("second node emitted no occurrence")?;
+        .ok_or("second evaluator found no intended occurrence")?
+        .occurrence_id();
     let state = evidence(world);
     state.deterministic_intended = Some(first_occurrence.occurrence.intended_at);
-    state.deterministic_ids_match =
-        first_occurrence.occurrence.occurrence_id() == second_occurrence.occurrence.occurrence_id();
-    state.deterministic_enqueued =
-        usize::from(first_occurrence.enqueue.disposition == EnqueueDisposition::Enqueued)
-            + usize::from(second_occurrence.enqueue.disposition == EnqueueDisposition::Enqueued);
+    state.deterministic_ids_match = first_occurrence.occurrence.occurrence_id() == second_identity
+        && second_result.occurrences.is_empty();
+    state.deterministic_enqueued = first_result.occurrences.len() + second_result.occurrences.len();
     world.store = Some(store);
     Ok(())
 }
@@ -323,8 +329,8 @@ async fn when_safety_trigger_drives(world: &mut BddWorld) -> Result<(), String> 
             break;
         }
     }
-    // The fake store retains fair-owner accounting and operation receipts;
-    // those metadata records are not executable work after completion.
+    // Namespace journal frontiers, fence and fair-owner metadata are not
+    // executable work; successful completion leaves no per-job receipt.
     state.wake_snapshot_empty = !has_live_state;
     Ok(())
 }

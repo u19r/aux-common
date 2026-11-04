@@ -152,7 +152,7 @@ impl DriveBudget {
             max_concurrency: 2,
             max_payload_bytes_in_flight: crate::policy::TINY_MAX_PAYLOAD_BYTES_IN_FLIGHT,
             max_completion_details: crate::policy::TINY_MAX_COMPLETION_DETAILS,
-            max_store_operations: 32,
+            max_store_operations: 256,
             stop_claiming_after: Duration::from_millis(250),
             finish_after: Duration::from_millis(500),
         })
@@ -166,7 +166,7 @@ impl DriveBudget {
             max_concurrency: 8,
             max_payload_bytes_in_flight: 1024 * 1024,
             max_completion_details: 32,
-            max_store_operations: 128,
+            max_store_operations: 512,
             stop_claiming_after: Duration::from_secs(4),
             finish_after: Duration::from_secs(5),
         })
@@ -180,7 +180,7 @@ impl DriveBudget {
             max_concurrency: 4,
             max_payload_bytes_in_flight: 64 * 1024,
             max_completion_details: 16,
-            max_store_operations: 128,
+            max_store_operations: 512,
             stop_claiming_after: Duration::from_secs(20),
             finish_after: Duration::from_secs(25),
         })

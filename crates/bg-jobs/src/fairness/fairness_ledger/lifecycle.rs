@@ -171,6 +171,19 @@ impl FairnessLedger {
         );
     }
 
+    pub(crate) fn complete_candidate(&mut self, job_id: JobId) {
+        let permit = self.candidates.get(&job_id).and_then(|record| {
+            (record.state == FairCandidateState::Leased)
+                .then(|| permit_for_leased_record(job_id, record))
+        });
+        if let Some(permit) = permit {
+            self.record_service_units(job_id, u64::from(permit.cost_units.get()));
+            self.apply_settlement(&permit, PermitSettlement::Outcome(FairRelease::Complete));
+        } else {
+            self.remove_candidate(job_id);
+        }
+    }
+
     pub(crate) fn remove_candidate(&mut self, job_id: JobId) {
         let leased_permit = self
             .candidates

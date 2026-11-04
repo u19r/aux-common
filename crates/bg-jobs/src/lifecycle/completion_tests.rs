@@ -78,7 +78,7 @@ impl SettlementRaceStore {
             .unwrap()
             .transactions[0]
             .clone();
-        let result = self.inner.commit(&preceding).await;
+        let result = self.inner.transact(&preceding).await;
         let interference = self
             .interleaving
             .lock()
@@ -135,12 +135,21 @@ impl JobStore for SettlementRaceStore {
         self.inner.read_range(request).await
     }
 
-    async fn commit(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
+    async fn transact(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
         if self
             .fail_next_commit
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
             return Err(FakeStoreError::Poisoned);
+        }
+        let namespace = Namespace::try_new(b"jobs").unwrap();
+        if !transaction.mutations().iter().any(|mutation| {
+            crate::codec::KeyCodec::decode(&namespace, mutation.key())
+                .unwrap()
+                .tag
+                == crate::codec::KeyTag::Job
+        }) {
+            return self.inner.transact(transaction).await;
         }
         let position = {
             let mut guard = self.interleaving.lock().unwrap();
@@ -155,7 +164,7 @@ impl JobStore for SettlementRaceStore {
             Some(3) | None => {}
             Some(_) => panic!("settlement permits at most one fresh rebased commit"),
         }
-        let result = self.inner.commit(transaction).await;
+        let result = self.inner.transact(transaction).await;
         if position == Some(2) {
             assert_eq!(result, Ok(CommitOutcome::Conflict));
             self.interleaving
@@ -283,6 +292,8 @@ fn assert_rebased_settlement(transactions: &[StoreTransaction], namespace: &Name
     assert_ne!(original.operation_id(), rebased.operation_id());
     let is_wake = |key: &StoreKey| {
         crate::codec::KeyCodec::decode(namespace, key).unwrap().tag == crate::codec::KeyTag::Wake
+            || crate::codec::KeyCodec::decode(namespace, key).unwrap().tag
+                == crate::codec::KeyTag::Commit
     };
     assert_eq!(
         original
@@ -411,7 +422,8 @@ fn assert_earlier_enqueue_is_claimable(store: &SettlementRaceStore, namespace: &
 }
 
 #[test]
-fn given_replaced_authority_and_wake_when_settlement_rebases_then_the_stale_claim_still_fails() {
+fn given_replaced_authority_and_wake_when_settlement_conflicts_then_native_diagnostics_reject_without_rebasing()
+ {
     let store = SettlementRaceStore::new();
     let engine = settlement_system(store.clone());
     let [first, second] = prepare_settlement_claims(&engine);
@@ -427,9 +439,29 @@ fn given_replaced_authority_and_wake_when_settlement_rebases_then_the_stale_clai
     );
     let guard = store.interleaving.lock().unwrap();
     let state = guard.as_ref().unwrap();
-    assert_rebased_settlement(&state.transactions, engine.namespace());
+    assert_eq!(
+        state.transactions.len(),
+        2,
+        "failed authority cannot be repaired by refreshing the wake"
+    );
     assert_eq!(state.before_loser, state.after_loser);
-    assert_eq!(store.inner.snapshot().unwrap(), state.after_loser);
+    let application_rows = |rows: &[(StoreKey, Bytes)]| {
+        rows.iter()
+            .filter(|(key, _)| {
+                !matches!(
+                    crate::codec::KeyCodec::decode(engine.namespace(), key)
+                        .unwrap()
+                        .tag,
+                    crate::codec::KeyTag::Commit | crate::codec::KeyTag::CommitInput
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        crate::test_helper::application_snapshot(&store.inner),
+        application_rows(&state.after_loser)
+    );
     for tag in [crate::codec::KeyTag::Wake, crate::codec::KeyTag::Job] {
         assert!(
             state.transactions[1].checks().iter().any(|check| {
@@ -461,7 +493,7 @@ fn given_replaced_authority_and_wake_when_settlement_rebases_then_the_stale_clai
         .clone();
     let record = crate::codec::decode_job_record(&encoded).unwrap();
     assert_eq!(record.generation, 2);
-    assert!(matches!(record.state, JobState::Leased(lease) if lease.fence.get() == 2));
+    assert!(matches!(record.state, JobState::Leased(lease) if lease.fence.get() == 3));
 }
 
 fn successor_record(claim: &ClaimedJob) -> JobRecordV1 {
@@ -604,7 +636,7 @@ fn given_a_successor_due_job_when_earliest_completes_then_wake_moves_forward() {
 }
 
 #[test]
-fn given_completion_unknown_before_commit_when_reconciling_then_the_job_and_receipt_are_not_lost() {
+fn given_completion_unknown_before_commit_when_reconciling_then_the_job_is_preserved() {
     let store = FakeStore::new();
     let engine = system(store.clone(), FairnessPolicy::low_volume(), 1);
     let id = JobId::from([1; 16]);
@@ -617,6 +649,9 @@ fn given_completion_unknown_before_commit_when_reconciling_then_the_job_and_rece
     store
         .queue_unknown_before_commit()
         .expect("queue repeated unknown-before outcome");
+    store
+        .queue_unknown_before_commit()
+        .expect("ambiguous pending admission queues");
 
     assert!(matches!(
         block_on(engine.complete(claim, completion(), Timestamp::from_millis(1))),

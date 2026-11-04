@@ -13,8 +13,6 @@ mod runner;
 mod scheduler;
 
 pub(crate) use candidate::{HandlerContext, HandlerExecution, HandlerInvocation, execute_handler};
-#[cfg(test)]
-pub(crate) use constants::initial_completion_capacity;
 #[cfg(all(test, not(target_family = "wasm")))]
 pub(crate) use fair_dispatch::{
     FairDispatchCandidateSpec, fair_dispatch_batch_item, fair_dispatch_batch_start,
@@ -26,3 +24,6 @@ pub(crate) use runner::drive;
 pub(crate) use scheduler::DriveClock;
 #[cfg(test)]
 pub(crate) use scheduler::apply_buffered_results_for_test;
+
+#[cfg(test)]
+pub(crate) use crate::budget::initial_completion_capacity;

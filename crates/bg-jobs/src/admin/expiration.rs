@@ -12,10 +12,7 @@ use crate::{
     policy::OutcomeCode,
     store::{Check, JobStore, Mutation, StoreKey},
     time::Timestamp,
-    transition::{
-        checked_transaction, commit_record_without_claim, fresh_operation, next_revision,
-        wake_mutation,
-    },
+    transition::{checked_transaction, fresh_operation, next_revision, wake_mutation},
 };
 
 /// Applies the expiration policy to one job and returns only after its
@@ -50,9 +47,12 @@ async fn expire_scheduled<S: JobStore>(
     mut record: JobRecordV1,
     now: Timestamp,
 ) -> JobResult<ExpiryResult, S::Error> {
-    let (transaction, new_encoded) =
-        expired_transaction(system, &encoded, &mut record, now).await?;
-    commit_record_without_claim(system, transaction, &record.job_id, &encoded, &new_encoded)
+    let transaction = expired_transaction(system, &encoded, &mut record, now).await?;
+    system
+        .commit_terminal_transition(
+            transaction,
+            crate::transition::TransitionConflict::LeaseLost,
+        )
         .await?;
     system.observe(crate::observer::JobEvent::DeadLettered {
         queue: record.queue,
@@ -284,14 +284,12 @@ impl LeaseExpiration {
             checks.push(wake_check);
         }
         let transaction = checked_transaction(system, checks, mutations)?;
-        commit_record_without_claim(
-            system,
-            transaction,
-            &self.record.job_id,
-            &self.old_encoded,
-            &self.new_encoded,
-        )
-        .await?;
+        (system)
+            .commit_terminal_transition(
+                transaction,
+                crate::transition::TransitionConflict::LeaseLost,
+            )
+            .await?;
         Ok(self.recovery.result(system, &self.record))
     }
 }
@@ -319,7 +317,7 @@ async fn expired_transaction<S: JobStore>(
     encoded: &Bytes,
     record: &mut JobRecordV1,
     now: Timestamp,
-) -> JobResult<(crate::store::StoreTransaction, Bytes), S::Error> {
+) -> JobResult<crate::store::StoreTransaction, S::Error> {
     let (due_key, fair_key, markers) = load_scheduled_markers(system, record).await?;
     let job_id = record.job_id;
     let job_key = keys::job_key(system.namespace(), &job_id)?;
@@ -351,5 +349,5 @@ async fn expired_transaction<S: JobStore>(
     if let Some(wake_check) = wake_check {
         checks.push(wake_check);
     }
-    Ok((checked_transaction(system, checks, mutations)?, new_encoded))
+    checked_transaction(system, checks, mutations)
 }

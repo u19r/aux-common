@@ -172,13 +172,17 @@ fn given_joined_claim_reads_when_dropped_then_inflight_reads_are_cancelled() {
 #[test]
 fn given_a_malformed_fence_marker_when_claiming_then_fence_error_precedes_permit_result() {
     let fixture = ClaimFixture::build(2);
-    let operation_key = keys::operation_key(fixture.system.namespace(), &fixture.record.job_id)
-        .expect("operation key is valid");
+    let fence_key = crate::codec::KeyCodec::encode(
+        fixture.system.namespace(),
+        crate::codec::KeyTag::Fence,
+        &[],
+    )
+    .unwrap();
     fixture
         .store
         .inner
-        .put_raw(operation_key, Bytes::from_static(&[0x7f]))
-        .expect("malformed operation marker writes");
+        .put_raw(fence_key, Bytes::from_static(&[0x7f]))
+        .expect("malformed namespace fence writes");
     fixture.store.reset_metrics();
     let due_key = keys::due_key(
         fixture.system.namespace(),
@@ -365,7 +369,7 @@ async fn run_serial_reads<S: JobStore>(
     record: &JobRecordV1,
     capacity: std::num::NonZeroU16,
 ) -> JobResult<(u64, Option<Vec<StoreKey>>), S::Error> {
-    let fence = super::flow::load_fence_high_water(system, record.job_id).await?;
+    let fence = super::flow::load_fence_high_water(system).await?;
     let permits = crate::fairness::find_available_permit_keys(system, record, capacity).await?;
     Ok((fence, permits))
 }
@@ -559,11 +563,11 @@ impl JobStore for YieldingStore {
         self.inner.read_range(request)
     }
 
-    fn commit<'a>(
+    fn transact<'a>(
         &'a self,
         transaction: &'a StoreTransaction,
     ) -> impl Future<Output = Result<CommitOutcome, Self::Error>> + Send + 'a {
-        self.inner.commit(transaction)
+        self.inner.transact(transaction)
     }
 }
 

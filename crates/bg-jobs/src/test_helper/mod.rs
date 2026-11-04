@@ -21,7 +21,9 @@ pub use deterministic::TestProfile;
 pub(crate) use executor::block_on;
 pub use fake_store::{FakeStore, FakeStoreError};
 #[cfg(test)]
-pub(crate) use fixtures::{completion, dedupe, job, low_volume_job, one, scoped_fairness};
+pub(crate) use fixtures::{
+    application_snapshot, completion, dedupe, job, low_volume_job, one, scoped_fairness,
+};
 #[cfg(test)]
 pub(crate) use handler::CompletingHandler;
 #[cfg(test)]

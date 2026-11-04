@@ -14,10 +14,7 @@ use bytes::Bytes;
 
 use crate::{
     error::ValidationError,
-    ids::{
-        ExecutionId, JobId, JobKind, LeaseToken, Namespace, OperationId, OrderingKey, OwnerId,
-        QueueName,
-    },
+    ids::{ExecutionId, JobId, JobKind, LeaseToken, Namespace, OrderingKey, OwnerId, QueueName},
     model::constants::{
         MAX_CHECKPOINT_BYTES, MAX_COST_UNITS, MAX_INLINE_PAYLOAD_BYTES, PAYLOAD_DIGEST_BYTES,
     },
@@ -38,9 +35,9 @@ pub struct PayloadManifest {
 }
 
 impl PayloadManifest {
-    /// Practical bound on persisted chunk references. The wire count remains
-    /// `u16` for format compatibility, but decoding more than this many keys
-    /// would permit unnecessary allocation and fetch work before validation.
+    /// Practical bound on persisted chunk references. The wire count is `u16`,
+    /// but decoding more than this many keys would permit unnecessary
+    /// allocation and fetch work before validation.
     pub const MAX_CHUNKS: usize = 1_024;
 
     pub fn try_new(
@@ -505,41 +502,4 @@ impl JobPolicySnapshot {
         validate_execution_timeout("execution timeout", self.execution_timeout)?;
         Ok(())
     }
-}
-
-/// A bounded protocol receipt retained after successful completion deletes the
-/// live job. It is not an application audit record and contains no payload or
-/// checkpoint data.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OperationReceipt {
-    /// Immutable enqueue definition, excluding mutable controller schedule.
-    /// Legacy receipts lack this proof and cannot attest a stable seed replay.
-    pub definition_digest: Option<[u8; 32]>,
-    pub operation_id: OperationId,
-    pub job_id: JobId,
-    pub generation: u32,
-    pub revision: u64,
-    pub execution_id: ExecutionId,
-    pub attempt_id: crate::ids::AttemptId,
-    pub attempts: NonZeroU32,
-    pub kind: JobKind,
-    pub queue: QueueName,
-    pub effect_mode: EffectMode,
-    pub created_at: Timestamp,
-    pub completed_at: Timestamp,
-    pub owner: OwnerId,
-    pub token: LeaseToken,
-    pub fence: NonZeroU64,
-    pub terminal: TerminalDisposition,
-    pub outcome: OutcomeCode,
-}
-
-/// Terminal disposition recorded with a successful protocol transition.
-///
-/// This is lifecycle evidence, not an application audit record.  It contains
-/// only the bounded identity, authority, and outcome fields needed to
-/// reconcile an ambiguous commit after the live job has been deleted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TerminalDisposition {
-    Completed,
 }

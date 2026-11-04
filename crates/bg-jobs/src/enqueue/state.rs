@@ -1,4 +1,4 @@
-use super::authority::PriorFenceAuthority;
+use super::operation::ValidatedEnqueue;
 use crate::{
     codec::{ValueCodec, ValueTag, encode_job_record},
     engine::JobSystem,
@@ -9,26 +9,17 @@ use crate::{
     time::Timestamp,
 };
 
-pub(super) fn build_enqueue_state<S: JobStore>(
-    system: &JobSystem<S>,
-    job: &NewJob,
-    registration: &crate::registry::HandlerRegistration,
-    digest: [u8; 32],
-    now: Timestamp,
-    prior_fence: Option<&PriorFenceAuthority>,
-) -> JobResult<(JobRecordV1, Vec<Mutation>), S::Error> {
-    let chunk_capacity = payload_chunk_capacity(system)?;
-    let (chunk_keys, mut mutations) = build_payload_chunks(system, job, chunk_capacity)?;
-    let record = build_job_record(system, job, registration, digest, now, chunk_keys)?;
-    append_enqueue_indexes(
-        system,
-        job,
-        registration,
-        &record,
-        &mut mutations,
-        prior_fence,
-    )?;
-    Ok((record, mutations))
+impl ValidatedEnqueue<'_> {
+    pub(super) fn build_state<S: JobStore>(
+        &self,
+        system: &JobSystem<S>,
+    ) -> JobResult<(JobRecordV1, Vec<Mutation>), S::Error> {
+        let chunk_capacity = payload_chunk_capacity(system)?;
+        let (chunk_keys, mut mutations) = build_payload_chunks(system, &self.job, chunk_capacity)?;
+        let record = self.build_record(system, chunk_keys)?;
+        record.append_enqueue_indexes(&mut mutations)?;
+        Ok((record, mutations))
+    }
 }
 
 fn payload_chunk_capacity<S: JobStore>(system: &JobSystem<S>) -> JobResult<usize, S::Error> {
@@ -70,147 +61,93 @@ fn build_payload_chunks<S: JobStore>(
     Ok((chunk_keys, mutations))
 }
 
-fn build_job_record<S: JobStore>(
-    system: &JobSystem<S>,
-    job: &NewJob,
-    registration: &crate::registry::HandlerRegistration,
-    digest: [u8; 32],
-    now: Timestamp,
-    chunk_keys: Vec<StoreKey>,
-) -> JobResult<JobRecordV1, S::Error> {
-    let policy = build_policy(job, registration);
-    let execution_id =
-        crate::ids::ExecutionId::generate().map_err(|_| JobSystemError::EntropyUnavailable)?;
-    let total_length = u32::try_from(job.payload.len()).map_err(|_| {
-        JobSystemError::Validation(ValidationError::TooLong {
-            field: "payload",
-            maximum: crate::model::MAX_INLINE_PAYLOAD_BYTES,
-            actual: job.payload.len(),
+impl ValidatedEnqueue<'_> {
+    fn build_payload_manifest(
+        &self,
+        chunk_keys: Vec<StoreKey>,
+    ) -> Result<PayloadManifest, ValidationError> {
+        let total_length =
+            u32::try_from(self.job.payload.len()).map_err(|_| ValidationError::TooLong {
+                field: "payload",
+                maximum: crate::model::MAX_INLINE_PAYLOAD_BYTES,
+                actual: self.job.payload.len(),
+            })?;
+        PayloadManifest::try_new(total_length, self.digest, chunk_keys)
+    }
+
+    fn derive_retention_deadline(
+        &self,
+        policy: &JobPolicySnapshot,
+    ) -> Result<Timestamp, ValidationError> {
+        match self.job.expires_at {
+            Some(expiry) => Ok(expiry.max(self.now)),
+            None => self
+                .job
+                .scheduled_at
+                .max(self.now)
+                .checked_add(policy.retry_policy.maximum_age()),
+        }
+    }
+
+    fn build_record<S: JobStore>(
+        &self,
+        system: &JobSystem<S>,
+        chunk_keys: Vec<StoreKey>,
+    ) -> JobResult<JobRecordV1, S::Error> {
+        let job = &self.job;
+        let policy = self.registration.policy_with_retry(job.retry_override);
+        let execution_id =
+            crate::ids::ExecutionId::generate().map_err(|_| JobSystemError::EntropyUnavailable)?;
+        let payload = self.build_payload_manifest(chunk_keys)?;
+        let retention_deadline = self.derive_retention_deadline(&policy)?;
+        Ok(JobRecordV1 {
+            job_id: job.job_id,
+            namespace: system.namespace().clone(),
+            queue: self.registration.queue().clone(),
+            kind: job.kind.clone(),
+            schema_version: job.schema_version,
+            generation: 0,
+            execution_id,
+            payload,
+            fairness: job.fairness.clone(),
+            ordering_key: job.ordering_key.clone(),
+            priority: job.priority,
+            created_at: self.now,
+            scheduled_at: job.scheduled_at,
+            expires_at: job.expires_at,
+            policy,
+            attempts: None,
+            state: JobState::Scheduled,
+            checkpoint: None,
+            retention_deadline,
+            deduplication: job.deduplication.clone(),
+            revision: 0,
         })
-    })?;
-    let payload = PayloadManifest::try_new(total_length, digest, chunk_keys)?;
-    scheduled_record(
-        system,
-        job,
-        registration,
-        now,
-        policy,
-        execution_id,
-        payload,
-    )
-}
-
-pub(super) fn build_policy(
-    job: &NewJob,
-    registration: &crate::registry::HandlerRegistration,
-) -> JobPolicySnapshot {
-    JobPolicySnapshot {
-        effect_mode: registration.effect_mode(),
-        cost_units: registration.cost_units(),
-        execution_timeout: Some(registration.default_timeout()),
-        retry_policy: job
-            .retry_override
-            .unwrap_or(registration.default_retry())
-            .into(),
     }
 }
 
-fn scheduled_record<S: JobStore>(
-    system: &JobSystem<S>,
-    job: &NewJob,
-    registration: &crate::registry::HandlerRegistration,
-    now: Timestamp,
-    policy: JobPolicySnapshot,
-    execution_id: crate::ids::ExecutionId,
-    payload: PayloadManifest,
-) -> JobResult<JobRecordV1, S::Error> {
-    let retention_deadline = match job.expires_at {
-        Some(expiry) => expiry.max(now),
-        None => job
-            .scheduled_at
-            .max(now)
-            .checked_add(policy.retry_policy.maximum_age())?,
-    };
-    Ok(JobRecordV1 {
-        job_id: job.job_id,
-        namespace: system.namespace().clone(),
-        queue: registration.queue().clone(),
-        kind: job.kind.clone(),
-        schema_version: job.schema_version,
-        generation: 0,
-        execution_id,
-        payload,
-        fairness: job.fairness.clone(),
-        ordering_key: job.ordering_key.clone(),
-        priority: job.priority,
-        created_at: now,
-        scheduled_at: job.scheduled_at,
-        expires_at: job.expires_at,
-        policy,
-        attempts: None,
-        state: JobState::Scheduled,
-        checkpoint: None,
-        retention_deadline,
-        deduplication: job.deduplication.clone(),
-        revision: 0,
-    })
-}
-
-fn append_enqueue_indexes<S: JobStore>(
-    system: &JobSystem<S>,
-    job: &NewJob,
-    registration: &crate::registry::HandlerRegistration,
-    record: &JobRecordV1,
-    mutations: &mut Vec<Mutation>,
-    prior_fence: Option<&PriorFenceAuthority>,
-) -> JobResult<(), S::Error> {
-    mutations.push(Mutation::Put(
-        keys::job_key(system.namespace(), &job.job_id)?,
-        encode_job_record(record)?,
-    ));
-    append_due_and_fair_indexes(system, job, registration, mutations)?;
-    if let Some(prior_fence) = prior_fence {
+impl JobRecordV1 {
+    fn append_enqueue_indexes(
+        &self,
+        mutations: &mut Vec<Mutation>,
+    ) -> Result<(), crate::error::StoreDataError> {
         mutations.push(Mutation::Put(
-            keys::operation_key(system.namespace(), &job.job_id)?,
-            keys::operation_watermark_value(&job.job_id, prior_fence.fence_high_water)?,
+            keys::job_key(&self.namespace, &self.job_id)?,
+            encode_job_record(self)?,
         ));
+        mutations.push(Mutation::Put(
+            keys::due_key(
+                &self.namespace,
+                &self.queue,
+                self.scheduled_at,
+                &self.job_id,
+            )?,
+            keys::due_value(self.scheduled_at)?,
+        ));
+        mutations.push(Mutation::Put(
+            keys::fair_key(&self.namespace, &self.queue, &self.job_id)?,
+            keys::fair_value(&self.job_id)?,
+        ));
+        Ok(())
     }
-    append_dedupe_index(system, job, mutations)
-}
-
-fn append_due_and_fair_indexes<S: JobStore>(
-    system: &JobSystem<S>,
-    job: &NewJob,
-    registration: &crate::registry::HandlerRegistration,
-    mutations: &mut Vec<Mutation>,
-) -> JobResult<(), S::Error> {
-    mutations.push(Mutation::Put(
-        keys::due_key(
-            system.namespace(),
-            registration.queue(),
-            job.scheduled_at,
-            &job.job_id,
-        )?,
-        keys::due_value(job.scheduled_at)?,
-    ));
-    mutations.push(Mutation::Put(
-        keys::fair_key(system.namespace(), registration.queue(), &job.job_id)?,
-        keys::fair_value(&job.job_id)?,
-    ));
-    Ok(())
-}
-
-fn append_dedupe_index<S: JobStore>(
-    system: &JobSystem<S>,
-    job: &NewJob,
-    mutations: &mut Vec<Mutation>,
-) -> JobResult<(), S::Error> {
-    let Some(deduplication) = &job.deduplication else {
-        return Ok(());
-    };
-    mutations.push(Mutation::Put(
-        keys::dedupe_key(system.namespace(), deduplication.key())?,
-        keys::dedupe_value(&job.job_id, deduplication.retain_until())?,
-    ));
-    Ok(())
 }

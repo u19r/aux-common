@@ -191,7 +191,7 @@ pub struct DriveCounts {
     pub repair_actions: u32,
 }
 
-/// A registration-safe terminal completion receipt.
+/// Registration-safe details returned by an acknowledged successful completion.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionDetails {
     pub job_id: crate::ids::JobId,
@@ -215,4 +215,8 @@ pub struct DriveReport {
     pub has_immediately_visible_work: bool,
     pub next_wake: WakeHint,
     pub stop_reason: DriveStopReason,
+}
+
+pub(crate) fn initial_completion_capacity(max_completion_details: u32) -> usize {
+    (max_completion_details as usize).min(crate::transition::MAX_INDEX_RANGE_ITEMS)
 }

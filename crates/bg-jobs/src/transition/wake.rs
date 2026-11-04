@@ -9,7 +9,7 @@ use crate::{
     engine::JobSystem,
     error::{JobResult, JobSystemError},
     keys,
-    store::{Check, JobStore, Mutation, StoreKey, StoreTransaction},
+    store::{Check, JobStore, Mutation, StoreKey, StoreTransaction, StoreTransactionInput},
 };
 
 pub(crate) async fn wake_mutation<S: JobStore>(
@@ -83,51 +83,51 @@ async fn join_wake_and_due<S: JobStore>(
 /// Keeps the latest advisory lower bound after a known conditional conflict.
 /// A stale deletion must never erase an enqueue's newer wake. A stale put can
 /// only lower the current wake; all business and authority conditions survive.
-pub(super) async fn refresh_conflicted_wake<S: JobStore>(
+pub(crate) async fn refresh_conflicted_wake<S: JobStore>(
     system: &JobSystem<S>,
     transaction: &StoreTransaction,
-) -> JobResult<Option<StoreTransaction>, S::Error> {
+    draft: &mut StoreTransactionInput,
+) -> JobResult<(), S::Error> {
     let Some(check) = find_wake_check(system.namespace(), transaction)? else {
-        return Ok(None);
+        return Ok(());
     };
     let current = system
         .store()
         .get(check.key().clone())
         .await
         .map_err(JobSystemError::Store)?;
-    let unchanged = match check {
-        Check::Absent(_) => current.is_none(),
-        Check::Value(_, expected) => current.as_ref() == Some(expected),
-    };
-    if unchanged {
-        return Ok(None);
-    }
+    // A matching point read cannot identify the earlier failing check:
+    // reads may regress, and the wake can change back. The journal first
+    // verifies non-wake authority natively, then retries this advisory update.
     let next = retain_wake_bound(transaction, check.key(), current.as_deref())?;
-    let (mut checks, mut mutations) = retain_authority(transaction, check.key());
+    draft.remove_key(check.key());
     if let Some(next) = next
         && let Some(fresh_check) = crate::wake::apply(
             check.key().clone(),
             current,
             crate::wake::WakeUpdate::Lower(next),
-            &mut mutations,
+            &mut draft.mutations,
         )?
     {
-        checks.push(fresh_check);
+        draft.checks.push(fresh_check);
     }
-    super::checked_transaction(system, checks, mutations).map(Some)
+    Ok(())
 }
 
-fn find_wake_check<'a, E>(
+pub(crate) fn find_wake_check<'a, E>(
     namespace: &crate::ids::Namespace,
     transaction: &'a StoreTransaction,
 ) -> JobResult<Option<&'a Check>, E> {
+    let prefix = crate::codec::KeyCodec::encode(namespace, crate::codec::KeyTag::Wake, &[])?;
     for check in transaction.checks() {
-        if crate::codec::KeyCodec::decode_borrowed(namespace, check.key())?.tag
-            == crate::codec::KeyTag::Wake
-            && transaction
-                .mutations()
-                .iter()
-                .any(|mutation| mutation.key() == check.key())
+        if !check.key().as_bytes().starts_with(prefix.as_bytes()) {
+            continue;
+        }
+        crate::codec::KeyCodec::decode_borrowed(namespace, check.key())?;
+        if transaction
+            .mutations()
+            .iter()
+            .any(|mutation| mutation.key() == check.key())
         {
             return Ok(Some(check));
         }
@@ -155,23 +155,4 @@ fn retain_wake_bound<E>(
         }
         Some(Mutation::Delete(_)) | None => Ok(current_time),
     }
-}
-
-fn retain_authority(
-    transaction: &StoreTransaction,
-    wake_key: &StoreKey,
-) -> (Vec<Check>, Vec<Mutation>) {
-    let checks = transaction
-        .checks()
-        .iter()
-        .filter(|check| check.key() != wake_key)
-        .cloned()
-        .collect();
-    let mutations = transaction
-        .mutations()
-        .iter()
-        .filter(|mutation| mutation.key() != wake_key)
-        .cloned()
-        .collect();
-    (checks, mutations)
 }

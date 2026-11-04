@@ -7,6 +7,29 @@ use crate::{
     JobOutcome, NewJob, OutcomeCode, Priority, Timestamp,
 };
 
+/// Application-state assertions exclude the journal's namespace frontiers and
+/// recovery input. Journal tests independently assert their lifecycle.
+pub(crate) fn application_snapshot(
+    store: &super::FakeStore,
+) -> Vec<(crate::store::StoreKey, Bytes)> {
+    let namespace = crate::Namespace::try_new(b"jobs").expect("fixture namespace");
+    store
+        .snapshot()
+        .expect("snapshot")
+        .into_iter()
+        .filter(|(key, _)| {
+            crate::codec::KeyCodec::decode(&namespace, key)
+                .ok()
+                .is_none_or(|decoded| {
+                    !matches!(
+                        decoded.tag,
+                        crate::codec::KeyTag::Commit | crate::codec::KeyTag::CommitInput
+                    )
+                })
+        })
+        .collect()
+}
+
 pub(crate) fn job(
     id: u8,
     payload: Bytes,

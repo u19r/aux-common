@@ -4,11 +4,11 @@ use super::super::{
     candidate::Candidate,
     constants::{
         CANCELLATION_READ_STORE_OPERATIONS, CANDIDATE_WORST_CASE_STORE_OPERATIONS,
-        OWNER_SAVE_WORST_CASE_STORE_OPERATIONS, OperationBudget,
+        OWNER_SAVE_WORST_CASE_STORE_OPERATIONS,
     },
 };
 use crate::{
-    budget::{DriveRequest, DriveStopReason},
+    budget::{DriveRequest, DriveStopReason, OperationBudget},
     engine::JobSystem,
     error::{JobResult, JobSystemError},
     fairness::{FairDispatchOwner, FairPermit, FairRelease},

@@ -48,11 +48,11 @@ impl<S: JobStore> JobStore for ObservedStore<S> {
         self.inner.read_range(request).await
     }
 
-    async fn commit<'a>(
+    async fn transact<'a>(
         &'a self,
         transaction: &'a StoreTransaction,
     ) -> Result<CommitOutcome, Self::Error> {
         self.observe_call(StoreOperation::Commit);
-        self.inner.commit(transaction).await
+        self.inner.transact(transaction).await
     }
 }

@@ -20,11 +20,11 @@ use super::{
 };
 use crate::{
     JobSystem,
-    codec::{DecodedOperation, ValueCodec, ValueTag, decode_operation, encode_job_record},
+    codec::{ValueCodec, ValueTag, decode_operation, encode_job_record},
     ids::{ExecutionId, JobId, JobKind, LeaseToken, Namespace, OperationId, OwnerId},
     model::{
         AttemptHistory, HandlerDefinition, JobOutcome, JobPolicySnapshot, JobRecordV1, JobState,
-        LifecycleObservation, OperationReceipt, PayloadManifest,
+        LifecycleObservation, PayloadManifest,
     },
     policy::{
         BackoffMultiplier, FairnessClass, Priority, RetryPolicy, RetryPolicyInput, RetrySelection,
@@ -36,10 +36,14 @@ use crate::{
 };
 
 fn decode_marker_operation(encoded: &[u8]) -> Option<OperationId> {
-    match decode_operation(encoded).ok()? {
-        DecodedOperation::Live(authority) => authority.operation_id(),
-        DecodedOperation::Receipt(_) => None,
-    }
+    Some(decode_operation(encoded).ok()?.operation_id())
+}
+
+enum CallerResolution {
+    Completed,
+    Current,
+    Changed,
+    Conflict,
 }
 
 #[derive(Clone, Copy)]
@@ -178,6 +182,10 @@ pub(crate) struct LifecycleDriver {
     completion_detail: CompletionDetail,
     completion_detail_job: MJobId,
     completion_omissions: i64,
+    // Bounded caller evidence from successful public completion returns, not
+    // persisted per-job receipts. Clear/replace it when this finite job is
+    // reused.
+    completion_evidence: BTreeMap<MJobId, Job>,
     completion_receipt_jobs: BTreeSet<MJobId>,
     claim_pending: bool,
     claim_job: MJobId,
@@ -277,6 +285,7 @@ impl LifecycleDriver {
             completion_detail: CompletionDetail::NoCompletionDetail,
             completion_detail_job: MJobId::JobA,
             completion_omissions: 0,
+            completion_evidence: BTreeMap::new(),
             completion_receipt_jobs: BTreeSet::new(),
             claim_pending: false,
             claim_job: MJobId::JobA,
@@ -431,10 +440,7 @@ impl LifecycleDriver {
             LifecycleObservation::Current {
                 operation_id: Some(operation_id),
                 ..
-            }
-            | LifecycleObservation::Terminal(OperationReceipt { operation_id, .. }) => {
-                Ok(operation_id)
-            }
+            } => Ok(operation_id),
             LifecycleObservation::Current {
                 operation_id: None, ..
             }
@@ -457,10 +463,7 @@ impl LifecycleDriver {
             LifecycleObservation::Current {
                 operation_id: Some(operation_id),
                 ..
-            }
-            | LifecycleObservation::Terminal(OperationReceipt { operation_id, .. }) => {
-                Ok(operation_id)
-            }
+            } => Ok(operation_id),
             // A corrupt record is still repairable when its operation marker
             // is intact.  Lifecycle observation intentionally does not expose
             // that marker for an invalid record, so recover the opaque value
@@ -489,7 +492,6 @@ impl LifecycleDriver {
     fn register_observed_identifiers(&mut self, observation: &LifecycleObservation) {
         let execution_id = match observation {
             LifecycleObservation::Current { record, .. } => Some(record.execution_id),
-            LifecycleObservation::Terminal(receipt) => Some(receipt.execution_id),
             LifecycleObservation::Invalid {
                 record: Some(record),
                 ..
@@ -599,8 +601,13 @@ impl LifecycleDriver {
                 crate::model::LifecycleRecordStatus::Corrupt => RecordKind::Corrupt,
                 crate::model::LifecycleRecordStatus::UnknownVersion => RecordKind::UnknownVersion,
             },
-            LifecycleObservation::Terminal(_) => RecordKind::Valid,
-            LifecycleObservation::Missing => RecordKind::Missing,
+            LifecycleObservation::Missing => {
+                if self.completion_evidence.contains_key(&job) {
+                    RecordKind::Valid
+                } else {
+                    RecordKind::Missing
+                }
+            }
         })
     }
 
@@ -639,9 +646,6 @@ impl LifecycleDriver {
                 include_fence_high_water,
                 operation_label,
             }),
-            LifecycleObservation::Terminal(receipt) => {
-                self.project_terminal(model_job, receipt, operation_label)
-            }
             LifecycleObservation::Invalid {
                 status,
                 routes,
@@ -663,7 +667,19 @@ impl LifecycleDriver {
             } => Err(ProjectionError::Observation(format!(
                 "{model_job:?}: invalid persisted lifecycle state ({status:?}, routes={routes:?})"
             ))),
-            LifecycleObservation::Missing => Ok(missing_job()),
+            LifecycleObservation::Missing => {
+                let mut projected = if include_fence_high_water {
+                    self.completion_evidence
+                        .get(&model_job)
+                        .cloned()
+                        .unwrap_or_else(missing_job)
+                } else {
+                    missing_job()
+                };
+                projected.completion_receipt =
+                    include_fence_high_water && self.completion_receipt_jobs.contains(&model_job);
+                Ok(projected)
+            }
         }
     }
 
@@ -795,71 +811,67 @@ impl LifecycleDriver {
         else {
             return Ok(0);
         };
-        match decode_operation(&encoded)? {
-            DecodedOperation::Live(authority) if authority.matches_job(job_id) => {
-                Ok(i64::try_from(authority.fence_high_water()).unwrap_or(i64::MAX))
-            }
-            DecodedOperation::Live(_) => Err(ProjectionError::Observation(format!(
+        let authority = decode_operation(&encoded)?;
+        if !authority.matches_job(job_id) {
+            return Err(ProjectionError::Observation(format!(
                 "{model_job:?}: operation marker identity mismatch"
-            ))),
-            DecodedOperation::Receipt(receipt) => Err(ProjectionError::Observation(format!(
-                "{model_job:?}: terminal receipt on a live record (receipt revision={}, receipt \
-                 job={:?})",
-                receipt.revision, receipt.job_id,
-            ))),
+            )));
         }
+        Ok(i64::try_from(authority.fence_high_water()).unwrap_or(i64::MAX))
     }
 
-    fn project_terminal(
-        &self,
-        model_job: MJobId,
-        receipt: OperationReceipt,
-        operation_label: MOperationId,
-    ) -> std::result::Result<Job, ProjectionError> {
-        let attempts = i64::from(receipt.attempts.get());
-        Ok(Job {
-            state: MJobState::Absent,
-            node: model_node(receipt.owner.as_bytes()[0]),
-            revision: i64::try_from(receipt.revision).unwrap_or(i64::MAX),
-            generation: i64::from(receipt.generation),
-            fence: i64::try_from(receipt.fence.get()).unwrap_or(i64::MAX),
-            token: self.lease_token_label(model_job, receipt.token)?,
-            lease_until: 0,
-            due_at: 0,
-            expires_at: 0,
-            execution_id: self.execution_label(receipt.execution_id)?,
-            // The receipt preserves opaque identities; the model exposes the
-            // connector's finite operation and attempt labels.
-            attempt_id: attempts,
-            attempts,
-            record: RecordKind::Valid,
-            payload: false,
-            due_route: false,
-            lease_route: false,
-            fair_route: false,
-            wake_route: false,
-            checkpoint_bytes: 0,
-            failure_recorded: false,
-            completion_receipt: self.completion_receipt_jobs.contains(&model_job),
-            cancel_requested: false,
-            operation_id: operation_label,
-            enqueue_fingerprint: 0,
-        })
+    fn remember_completion(&mut self, job: MJobId, mut previous: Job) {
+        previous.state = MJobState::Absent;
+        previous.revision += 1;
+        previous.lease_until = 0;
+        previous.due_at = 0;
+        previous.expires_at = 0;
+        previous.payload = false;
+        previous.due_route = false;
+        previous.lease_route = false;
+        previous.fair_route = false;
+        previous.wake_route = false;
+        previous.checkpoint_bytes = 0;
+        previous.failure_recorded = false;
+        previous.completion_receipt = false;
+        previous.cancel_requested = false;
+        previous.enqueue_fingerprint = 0;
+        self.completion_evidence.insert(job, previous);
+    }
+
+    fn project_fence_high_water(&self) -> std::result::Result<i64, ProjectionError> {
+        let key = crate::codec::KeyCodec::encode(
+            self.system_a.namespace(),
+            crate::codec::KeyTag::Fence,
+            &[],
+        )?;
+        let Some(encoded) = self
+            .store
+            .snapshot()?
+            .into_iter()
+            .find(|(stored, _)| stored == &key)
+            .map(|(_, value)| value)
+        else {
+            return Ok(0);
+        };
+        let bytes = encoded
+            .as_ref()
+            .try_into()
+            .map_err(|_| crate::error::StoreDataError::Malformed("namespace fence"))?;
+        Ok(i64::try_from(u64::from_be_bytes(bytes)).unwrap_or(i64::MAX))
     }
 
     fn project_meta(
         &self,
         observations: &[(MJobId, LifecycleObservation)],
     ) -> std::result::Result<Meta, ProjectionError> {
-        // Terminal membership is a durable public observation, not a
-        // connector-side history flag. A receipt projects as an absent job,
-        // so derive this set directly from the observations shared with the
-        // live-job projection.
-        let committed_terminal_jobs = observations
+        // Retained terminal records and exact caller completion results
+        // establish terminal membership. Missing rows alone do not prove
+        // completion.
+        let mut committed_terminal_jobs: BTreeSet<_> = observations
             .iter()
             .filter_map(|(job, observation)| {
                 let committed = match observation {
-                    LifecycleObservation::Terminal(_) => true,
                     LifecycleObservation::Current { record, .. } => {
                         matches!(
                             record.state,
@@ -871,6 +883,7 @@ impl LifecycleDriver {
                 committed.then_some(*job)
             })
             .collect();
+        committed_terminal_jobs.extend(self.completion_evidence.keys().copied());
         let unknown_version_jobs = observations
             .iter()
             .filter_map(|(job, observation)| {
@@ -890,6 +903,7 @@ impl LifecycleDriver {
         let quarantine_snapshot = self.project_quarantine_snapshot()?;
         Ok(Meta {
             now: self.now,
+            fence_high_water: self.project_fence_high_water()?,
             paused: false,
             dedupe_active: false,
             dedupe_job: MJobId::JobA,
@@ -1174,6 +1188,20 @@ impl LifecycleDriver {
         else {
             return Err(std::io::Error::other("selected fair permit owner disappeared").into());
         };
+        if matches!(
+            release,
+            crate::fairness::FairRelease::Complete
+                | crate::fairness::FairRelease::DeadLetter
+                | crate::fairness::FairRelease::Cancelled
+        ) {
+            if owner.candidate_state(actual_job_id(job)).is_some() {
+                return Err(std::io::Error::other(
+                    "terminal lifecycle retained its fair candidate",
+                )
+                .into());
+            }
+            return Ok(());
+        }
         owner
             .release(permit, release)
             .map_err(|error| std::io::Error::other(format!("fair permit release: {error:?}")))?;
@@ -1400,6 +1428,8 @@ impl LifecycleDriver {
                         // projection so a newly generated opaque execution
                         // ID receives the next bijective model label.
                         if receipt.disposition == crate::EnqueueDisposition::Enqueued {
+                            self.completion_evidence.remove(&job);
+                            self.completion_receipt_jobs.remove(&job);
                             self.operation_labels.insert(job, MOperationId::OperationA);
                         }
                         self.sync_execution_id(job)?;
@@ -1740,6 +1770,7 @@ impl LifecycleDriver {
                     );
                     return Ok(());
                 }
+                let previous = self.project_jobs()?[&input.job].clone();
                 let (claim, authority, owner) = self.take_completion_claim(&input)?;
                 let outcome = match handler {
                     HandlerResult::Success => {
@@ -1770,6 +1801,7 @@ impl LifecycleDriver {
                     crate::test_helper::block_on(system.apply_outcome(claim, outcome, now));
                 match result {
                     Ok(crate::OutcomeResult::Completed(_)) => {
+                        self.remember_completion(input.job, previous);
                         self.record_completion(input.job, &input, authority)?;
                         // Handler completion records the attempted job in the
                         // model; direct Complete intentionally leaves the
@@ -1868,6 +1900,7 @@ impl LifecycleDriver {
                     );
                     return Ok(());
                 }
+                let previous = self.project_jobs()?[&input.job].clone();
                 let (claim, authority, owner) = self.take_completion_claim(&input)?;
                 let result = {
                     let system = self.system_for_node(owner);
@@ -1879,6 +1912,7 @@ impl LifecycleDriver {
                 };
                 match result {
                     Ok(_) => {
+                        self.remember_completion(input.job, previous);
                         self.record_completion(input.job, &input, authority)?;
                         self.finish(
                             Command::LifecycleComplete(input.clone()),
@@ -1925,9 +1959,8 @@ impl LifecycleDriver {
                     && current.revision == revision
                     && current.generation == generation;
                 // Completion detail exposure is not persisted after terminal
-                // deletion. Track only the model's bounded exposure bit; the
-                // terminal receipt itself is always read from the public
-                // observation boundary.
+                // deletion. Track the model's bounded exposure bit from the
+                // exact successful caller result.
                 let detail = if allowed {
                     if self.completion_receipt_jobs.len() < MAX_COMPLETION_RECEIPTS {
                         self.completion_receipt_jobs.insert(job);
@@ -2259,7 +2292,9 @@ impl LifecycleDriver {
                 } else {
                     self.store.queue_unknown_before_commit()?;
                     self.store.queue_unknown_before_commit()?;
+                    self.store.queue_unknown_before_commit()?;
                 }
+                let previous = self.project_jobs()?[&input.job].clone();
                 let claim = self
                     .claims
                     .remove(&input.job)
@@ -2273,6 +2308,9 @@ impl LifecycleDriver {
                     ))
                 };
                 Self::validate_unknown_completion_result(committed, &result)?;
+                if result.is_ok() {
+                    self.remember_completion(input.job, previous);
+                }
                 let observed = self.project_jobs()?[&input.job].clone();
                 let after_commit = observed.state == MJobState::Absent;
                 // An unknown completion has already consumed the local claim
@@ -2330,35 +2368,31 @@ impl LifecycleDriver {
                     && job == self.unknown_job
                     && operation_id == self.unknown_operation
                     && observed == self.unknown_readback;
-                // Generated operation IDs are opaque.  For the exact
-                // reconciliation command, use the ID read from the durable
-                // operation receipt/marker rather than manufacturing bytes
-                // from the finite model label.  Deliberately wrong commands
-                // retain their synthetic ID so the public API can reject
-                // them.
-                let reconcile_operation = if exact_request {
-                    self.observed_operation_id(job)?
+                // A successful journal result belongs to this exact pending
+                // call. Missing job state alone supplies no completion proof.
+                let result = if exact_request && self.completion_evidence.contains_key(&job) {
+                    CallerResolution::Completed
                 } else {
-                    operation(operation_id)
+                    let reconcile_operation = if exact_request {
+                        self.observed_operation_id(job)?
+                    } else {
+                        operation(operation_id)
+                    };
+                    match self.observe_job(job)? {
+                        LifecycleObservation::Current {
+                            operation_id: Some(current),
+                            ..
+                        } if current == reconcile_operation => CallerResolution::Current,
+                        LifecycleObservation::Current { .. } => CallerResolution::Changed,
+                        LifecycleObservation::Invalid { .. } | LifecycleObservation::Missing => {
+                            CallerResolution::Conflict
+                        }
+                    }
                 };
-                let result = crate::test_helper::block_on(
-                    self.system_a
-                        .reconcile(actual_job_id(job), reconcile_operation),
-                );
                 let exact = exact_request;
                 let outcome = match result {
-                    Ok(crate::ReconciliationOutcome::AlreadyCommitted)
-                        if exact && observed == StoreResult::Committed =>
-                    {
-                        let terminal = matches!(
-                            self.observe_job(job)?,
-                            LifecycleObservation::Terminal(OperationReceipt {
-                                operation_id,
-                                job_id,
-                                ..
-                            }) if operation_id == reconcile_operation
-                                && job_id == actual_job_id(job)
-                        );
+                    CallerResolution::Completed if exact && observed == StoreResult::Committed => {
+                        let terminal = self.completion_evidence.contains_key(&job);
                         if !terminal {
                             (
                                 ResultClass::ConflictClass,
@@ -2367,9 +2401,8 @@ impl LifecycleDriver {
                                 CompletionDetail::NoCompletionDetail,
                             )
                         } else {
-                            // The receipt is a durable public observation.
-                            // Reconciliation may expose its detail only while
-                            // the model's bounded exposure budget has room.
+                            // The exact caller result is retained within the
+                            // model's bounded completion exposure budget.
                             let detail =
                                 if self.completion_receipt_jobs.len() < MAX_COMPLETION_RECEIPTS {
                                     self.completion_receipt_jobs.insert(job);
@@ -2395,9 +2428,7 @@ impl LifecycleDriver {
                             )
                         }
                     }
-                    Ok(crate::ReconciliationOutcome::RetryCommit)
-                        if exact && observed == StoreResult::Conflict =>
-                    {
+                    CallerResolution::Current if exact && observed == StoreResult::Conflict => {
                         self.unknown_pending = false;
                         (
                             ResultClass::AppliedClass,
@@ -2406,7 +2437,7 @@ impl LifecycleDriver {
                             CompletionDetail::NoCompletionDetail,
                         )
                     }
-                    Ok(crate::ReconciliationOutcome::LeaseLost) if exact => {
+                    CallerResolution::Changed if exact => {
                         self.unknown_pending = false;
                         (
                             ResultClass::AppliedClass,
@@ -2415,7 +2446,7 @@ impl LifecycleDriver {
                             CompletionDetail::NoCompletionDetail,
                         )
                     }
-                    Ok(crate::ReconciliationOutcome::Conflict) | Err(_) => (
+                    CallerResolution::Conflict => (
                         ResultClass::ConflictClass,
                         StoreResult::Conflict,
                         LifecycleOutcome::CompletionRejected,
@@ -2716,7 +2747,8 @@ impl LifecycleDriver {
         };
         let current_operation = self.model_operation(MJobId::JobB);
         let public_operation = if expected_operation == current_operation {
-            self.observed_operation_id(MJobId::JobB)?
+            self.observed_operation_id(MJobId::JobB)
+                .unwrap_or_else(|_| operation(expected_operation))
         } else {
             operation(expected_operation)
         };

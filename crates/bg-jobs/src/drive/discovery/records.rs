@@ -2,7 +2,7 @@ use bytes::Bytes;
 
 use super::{Discovery, budget::DiscoveryBudget, queue_selected};
 use crate::{
-    budget::{DriveRequest, DriveStopReason},
+    budget::{DriveRequest, DriveStopReason, OperationBudget},
     codec::{KeyCodec, KeyTag, ValueTag, decode_job_record},
     engine::JobSystem,
     error::{JobResult, JobSystemError},
@@ -176,7 +176,7 @@ pub(super) struct RecordCandidateContext<'a, S: JobStore> {
     pub(super) record_entries: &'a [DiscoveryRoute],
     pub(super) record_keys: &'a [crate::store::StoreKey],
     pub(super) discovery_budget: &'a mut DiscoveryBudget,
-    pub(super) operation_budget: &'a mut super::super::constants::OperationBudget,
+    pub(super) operation_budget: &'a mut OperationBudget,
 }
 
 impl<S: JobStore> RecordCandidateContext<'_, S> {

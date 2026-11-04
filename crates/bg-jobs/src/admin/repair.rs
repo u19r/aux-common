@@ -9,7 +9,7 @@ use crate::{
     keys,
     model::{JobRecordV1, JobState},
     store::{Check, JobStore, Mutation, StoreKey, StoreTransaction},
-    transition::{checked_transaction, commit_record_without_claim, next_revision, wake_mutation},
+    transition::{checked_transaction, next_revision, wake_mutation},
 };
 
 /// Restores routing for an understood, revision-checked corrupt record.
@@ -41,14 +41,12 @@ pub(crate) async fn repair_job<S: JobStore>(
     };
     let (record, new_encoded) = prepare_repair_record(system, record)?;
     let transaction = build_repair_transaction(system, &authority, &record, &new_encoded).await?;
-    commit_record_without_claim(
-        system,
-        transaction,
-        &job_id,
-        &authority.encoded,
-        &new_encoded,
-    )
-    .await?;
+    system
+        .commit_transition(
+            transaction,
+            crate::transition::TransitionConflict::LeaseLost,
+        )
+        .await?;
     system.observe(crate::observer::JobEvent::Repaired {
         queue: record.queue,
     });

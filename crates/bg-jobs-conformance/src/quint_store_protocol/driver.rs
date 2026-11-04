@@ -1876,7 +1876,7 @@ impl StoreProtocolDriver {
             mutations,
             limits: transaction_limits(self.store.capabilities()),
         })?;
-        match persist::block_on(self.store.commit(&transaction))? {
+        match persist::block_on(self.store.transact(&transaction))? {
             CommitOutcome::Committed => Ok(()),
             CommitOutcome::Conflict => {
                 Err(std::io::Error::other("connector raw-state commit conflicted").into())
@@ -1956,7 +1956,7 @@ impl StoreProtocolDriver {
             mutations: Vec::new(),
             limits: transaction_limits(self.store.capabilities()),
         })?;
-        match persist::block_on(self.store.commit(&transaction))? {
+        match persist::block_on(self.store.transact(&transaction))? {
             CommitOutcome::Committed => Ok(()),
             CommitOutcome::Conflict => {
                 Err(std::io::Error::other("connector raw-state check conflicted").into())

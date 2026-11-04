@@ -21,8 +21,6 @@ mod builder;
 #[cfg(test)]
 mod builder_tests;
 mod catalog;
-#[cfg(test)]
-mod catalog_tests;
 mod codec;
 mod drive;
 mod engine;
@@ -33,6 +31,7 @@ mod error;
 mod failure;
 mod fairness;
 mod ids;
+mod journal;
 mod keys;
 mod lifecycle;
 pub mod metrics_observer;
@@ -58,7 +57,7 @@ pub use crate::model::MAX_INLINE_PAYLOAD_BYTES;
 /// The small, routine construction surface for application-owned jobs.
 pub use crate::{
     budget::{DriveBudget, DriveBudgetInput, DriveReport, DriveStopReason, QueueSelection},
-    catalog::JobCatalog,
+    catalog::{CatalogManifest, CatalogRevision, JobCatalog},
     error::{JobResult, JobSystemError, ValidationError},
     ids::{
         AttemptId, DeduplicationKey, ExecutionId, FairnessKey, IdentifierError, JobId, JobKind,
@@ -90,8 +89,16 @@ pub mod runtime {
     pub use crate::{
         builder::JobSystemBuilder,
         engine::JobSystem,
+        ids::ScheduleId,
         model::{WakeFuture, WakeScheduler, WakeSchedulerError},
-        time::MonotonicDeadline,
+        policy::{Cadence, MisfirePolicy, OverlapPolicy},
+        schedule::{
+            JobTemplate, JobTemplateInput, MaterializedOccurrence, RecurringSchedule,
+            RecurringScheduleInput, ScheduleControl, ScheduleControlResult, ScheduleCursor,
+            ScheduleEvaluation, ScheduleMaterialization, ScheduleMaterializationBudget,
+            ScheduleMaterializationRequest, ScheduleOccurrence,
+        },
+        time::{CronExpression, MonotonicDeadline},
     };
 }
 
@@ -116,7 +123,7 @@ pub(crate) use crate::{
     metrics_observer::{BatchMetricOutcome, HttpMetricOutcome, MetricsObserver},
     model::{
         HandlerDefinition, JobRecordV1, Lease, LifecycleRecordStatus, NewJob, PayloadManifest,
-        TerminalDisposition, WakeFuture, WakeScheduler, WakeSchedulerError,
+        WakeFuture, WakeScheduler, WakeSchedulerError,
     },
     observer::AttemptBucket,
     policy::{
@@ -127,7 +134,7 @@ pub(crate) use crate::{
     schedule::{
         JobTemplate, JobTemplateInput, RecurringSchedule, RecurringScheduleInput, ScheduleControl,
         ScheduleControlResult, ScheduleCursor, ScheduleEvaluation, ScheduleMaterializationBudget,
-        ScheduleOccurrence,
+        ScheduleMaterializationRequest, ScheduleOccurrence,
     },
     store::{
         CommitOutcome, RangePage, RangeRequest, StoreCapabilities, StoreCapabilitiesInput,
@@ -135,7 +142,6 @@ pub(crate) use crate::{
     },
     test_helper::{FakeStore, FakeStoreError},
     time::{CronExpression, MonotonicDeadline},
-    transition::ReconciliationOutcome,
     wake::{WakeCandidates, WakeWatermark},
 };
 pub(crate) use crate::{
@@ -188,7 +194,7 @@ pub mod test_support {
                 AttemptHistory, CancellationToken, HandlerDefinition, JobPolicySnapshot,
                 JobRecordV1, Lease, LifecycleObservation, LifecyclePayload, LifecycleRecord,
                 LifecycleRecordStatus, LifecycleRoutes, MAX_CHECKPOINT_BYTES, MAX_COST_UNITS,
-                NewJob, OperationReceipt, PayloadManifest, TerminalDisposition,
+                NewJob, PayloadManifest,
             },
             policy::{
                 BackoffMultiplier, Cadence, FullJitter, MisfirePolicy, OverlapPolicy, RetryPolicy,
@@ -201,7 +207,7 @@ pub mod test_support {
                 ScheduleOccurrence,
             },
             time::CronExpression,
-            transition::{ReconciliationOutcome, TransitionAuthority},
+            transition::TransitionAuthority,
             wake::{WakeCandidates, WakeWatermark},
         };
     }

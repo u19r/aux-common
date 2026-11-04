@@ -78,3 +78,10 @@ pub(crate) const METERING_MODE_LABELS: [&str; 4] =
     ["buffered", "synchronous", "draining", "stopped"];
 #[cfg(all(feature = "buffered-metering", not(target_arch = "wasm32")))]
 pub(crate) const METERING_HEALTH_LABELS: [&str; 3] = ["closed", "open", "half_open"];
+
+// Request attribution uses only router-owned operation templates.
+pub(crate) const UNMATCHED_REQUEST_OPERATION: &str = "_unmatched";
+#[cfg(feature = "request-cost")]
+pub(crate) const LABEL_API_OPERATION: &str = "api_operation";
+#[cfg(feature = "request-cost")]
+pub(crate) const LABEL_STORAGE_OPERATION: &str = "storage_operation";

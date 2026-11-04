@@ -24,9 +24,7 @@ pub fn encode_job_record(record: &JobRecordV1) -> Result<Bytes, StoreDataError> 
     ValueCodec::encode(ValueTag::Job, &writer.bytes)
 }
 
-/// Version-one canonical immutable definition. Preserve its encoding when the
-/// live job codec changes: terminal receipts retain this digest across
-/// upgrades.
+/// Canonical immutable definition digest used by the current catalog ledger.
 pub(crate) fn job_definition_digest(
     definition: &JobDefinition<'_>,
 ) -> Result<[u8; 32], StoreDataError> {

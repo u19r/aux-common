@@ -5,8 +5,15 @@ pub use crate::{
     ids::CommitOperationId,
 };
 
+mod binding;
+#[cfg(test)]
+mod binding_tests;
 mod capabilities;
+mod constants;
 mod contract;
+mod encoding;
+#[cfg(test)]
+mod encoding_tests;
 mod key;
 mod range;
 mod transaction;

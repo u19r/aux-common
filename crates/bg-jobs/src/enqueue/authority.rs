@@ -12,26 +12,17 @@ use crate::{
     time::Timestamp,
 };
 
-pub(super) struct PriorFenceAuthority {
-    pub(super) encoded: Bytes,
-    pub(super) fence_high_water: u64,
-}
-
 #[derive(Clone, Copy)]
 pub(super) enum ExistingJobMatch {
     ExactRequest,
     StableSeed,
+    ConfiguredSeed,
 }
 
 pub(super) enum EnqueueAuthority {
     Existing(Bytes),
-    Deduplicated {
-        job_id: JobId,
-    },
-    Missing {
-        expected_dedupe: Option<Bytes>,
-        prior_fence: Option<PriorFenceAuthority>,
-    },
+    Deduplicated { job_id: JobId },
+    Missing { expected_dedupe: Option<Bytes> },
 }
 
 pub(super) async fn read_enqueue_authority<S: JobStore>(
@@ -45,7 +36,7 @@ pub(super) async fn read_enqueue_authority<S: JobStore>(
     if values.len() != read_keys.len() {
         return Err(JobSystemError::PayloadCorrupt);
     }
-    classify_enqueue_values(values, has_dedupe, job, now)
+    classify_enqueue_values(values, has_dedupe, now)
 }
 
 fn enqueue_read_keys<S: JobStore>(
@@ -60,14 +51,12 @@ fn enqueue_read_keys<S: JobStore>(
     } else {
         false
     };
-    read_keys.push(keys::operation_key(system.namespace(), &job.job_id)?);
     Ok((read_keys, has_dedupe))
 }
 
 fn classify_enqueue_values<E>(
     values: Vec<Option<Bytes>>,
     has_dedupe: bool,
-    job: &NewJob,
     now: Timestamp,
 ) -> JobResult<EnqueueAuthority, E> {
     let mut values = values.into_iter();
@@ -89,23 +78,7 @@ fn classify_enqueue_values<E>(
         },
         false => None,
     };
-    let prior_fence = values
-        .next()
-        .flatten()
-        .map(|encoded| decode_prior_fence(encoded, &job.job_id))
-        .transpose()?;
-    Ok(EnqueueAuthority::Missing {
-        expected_dedupe,
-        prior_fence,
-    })
-}
-
-fn decode_prior_fence<E>(encoded: Bytes, job_id: &JobId) -> JobResult<PriorFenceAuthority, E> {
-    let fence_high_water = keys::decode_operation_fence_high_water(&encoded, job_id)?;
-    Ok(PriorFenceAuthority {
-        encoded,
-        fence_high_water,
-    })
+    Ok(EnqueueAuthority::Missing { expected_dedupe })
 }
 
 pub(super) fn reconcile_record<S: JobStore>(
@@ -125,7 +98,7 @@ pub(super) fn reconcile_record<S: JobStore>(
     )?;
     let matches_schedule = match request.existing_match {
         ExistingJobMatch::ExactRequest => record.scheduled_at == request.job.scheduled_at,
-        ExistingJobMatch::StableSeed => true,
+        ExistingJobMatch::StableSeed | ExistingJobMatch::ConfiguredSeed => true,
     };
     if !matches_schedule
         || crate::model::JobDefinition::from(&record) != request.definition(system.namespace())?
@@ -145,25 +118,14 @@ pub(super) async fn reconcile_after_commit<S: JobStore>(
     request: &ValidatedEnqueue<'_>,
     disposition: EnqueueDisposition,
 ) -> JobResult<EnqueueResult, S::Error> {
-    let keys = [
-        keys::job_key(system.namespace(), &request.job.job_id)?,
-        keys::operation_key(system.namespace(), &request.job.job_id)?,
-    ];
-    let values = system.read_many(&keys).await?;
-    if values.len() != keys.len() {
-        return Err(JobSystemError::PayloadCorrupt);
-    }
-    let mut values = values.into_iter();
-    if let Some(encoded) = values.next().flatten() {
+    let key = keys::job_key(system.namespace(), &request.job.job_id)?;
+    if let Some(encoded) = system
+        .store()
+        .get(key)
+        .await
+        .map_err(JobSystemError::Store)?
+    {
         return reconcile_record(system, request, &encoded, disposition);
-    }
-    if let Some(encoded) = values.next().flatten() {
-        let prior = decode_prior_fence(encoded, &request.job.job_id)?;
-        if let Some(result) =
-            reconcile_completed_seed(request, system.namespace(), &prior, disposition)?
-        {
-            return Ok(result);
-        }
     }
     Err(JobSystemError::UnknownCommit)
 }
@@ -179,37 +141,4 @@ fn enqueue_result_at(
         disposition,
         wake: crate::time::WakeHint::from_timestamp(scheduled_at, now),
     }
-}
-
-/// A terminal receipt reserves a completed seed identity. Startup must not
-/// recreate executable work when its live row has already been removed.
-pub(super) fn reconcile_completed_seed<E>(
-    request: &ValidatedEnqueue<'_>,
-    namespace: &crate::ids::Namespace,
-    prior: &PriorFenceAuthority,
-    disposition: EnqueueDisposition,
-) -> JobResult<Option<EnqueueResult>, E> {
-    if !matches!(request.existing_match, ExistingJobMatch::StableSeed) {
-        return Ok(None);
-    }
-    let crate::codec::DecodedOperation::Receipt(receipt) =
-        crate::codec::decode_operation(&prior.encoded)?
-    else {
-        return Ok(None);
-    };
-    if receipt.kind != request.job.kind
-        || receipt.queue != *request.registration.queue()
-        || receipt.effect_mode != request.registration.effect_mode()
-        || receipt.definition_digest
-            != Some(crate::codec::job_definition_digest(
-                &request.definition(namespace)?,
-            )?)
-    {
-        return Err(JobSystemError::JobIdConflict);
-    }
-    Ok(Some(EnqueueResult {
-        job_id: receipt.job_id,
-        disposition,
-        wake: crate::time::WakeHint::None,
-    }))
 }

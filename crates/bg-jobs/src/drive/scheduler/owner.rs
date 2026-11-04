@@ -2,13 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::{
     candidate::Candidate,
-    constants::{
-        CANDIDATE_WORST_CASE_STORE_OPERATIONS, OWNER_LOAD_STORE_OPERATIONS, OperationBudget,
-    },
+    constants::{CANDIDATE_WORST_CASE_STORE_OPERATIONS, OWNER_LOAD_STORE_OPERATIONS},
     discovery::Discovery,
 };
 use crate::{
-    budget::DriveRequest,
+    budget::{DriveRequest, OperationBudget},
     engine::JobSystem,
     error::JobResult,
     fairness::{

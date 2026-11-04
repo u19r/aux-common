@@ -31,7 +31,8 @@ pub use telemetry_impl::{
 };
 pub use trace_context::{SpanId, TraceContext, TraceFlags, TraceId};
 pub use trace_layer::{
-    RequestTraceLayer, SlowOperationLogState, request_trace_layer, slow_operation_log,
+    RequestTraceLayer, SlowOperationLogState, request_operation_scope, request_trace_layer,
+    slow_operation_log,
 };
 pub use wide_log::{WideLogInitError, WideLogLayer, WideLogSink};
 

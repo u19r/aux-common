@@ -1,132 +1,90 @@
 //! Atomic claim checks and mutations.
 
-use bytes::Bytes;
-
 use crate::{
     engine::JobSystem,
     error::{JobResult, JobSystemError},
-    ids::OperationId,
     keys,
-    lifecycle::claim::{ClaimRoute, types::ClaimTransactionInput},
+    lifecycle::claim::types::ClaimTransactionInput,
     model::{AttemptHistory, JobRecordV1, JobState},
-    store::{Check, JobStore, Mutation, StoreTransaction},
+    store::{Check, JobStore, Mutation, StoreKey, StoreTransaction},
     time::Timestamp,
 };
 
-pub(super) fn claim_transaction<S: JobStore>(
-    system: &JobSystem<S>,
-    input: ClaimTransactionInput<'_>,
-) -> JobResult<
-    (
-        crate::store::StoreKey,
-        crate::store::StoreKey,
-        crate::store::StoreKey,
-        StoreTransaction,
-    ),
-    S::Error,
-> {
-    let ClaimTransactionInput {
-        record,
-        encoded,
-        route,
-        new_encoded,
-        operation_id,
-        permit_keys,
-        existing_permit_value,
-    } = input;
-    let (job_key, fair_key, lease_key, mutations) = claim_mutations(
-        system,
-        record,
-        &route,
-        new_encoded,
-        operation_id,
-        &permit_keys,
-    )?;
-    let mut checks = claim_checks(
-        job_key.clone(),
-        encoded.clone(),
-        route.key().clone(),
-        route.value().clone(),
-        &permit_keys,
-        existing_permit_value.as_ref(),
-    );
-    // A committed cooperative cancellation supersedes retry/reclaim
-    // authority.  Keep this guard in the claim transaction so an expired
-    // lease cannot be handed to a new handler before the cancellation is
-    // acknowledged.
-    checks.push(Check::Absent(keys::cancellation_key(
-        system.namespace(),
-        &record.job_id,
-    )?));
-    let transaction = crate::transition::checked_transaction(system, checks, mutations)?;
-    Ok((job_key, fair_key, lease_key, transaction))
-}
+impl ClaimTransactionInput<'_> {
+    pub(super) fn build_transaction<S: JobStore>(
+        self,
+        system: &JobSystem<S>,
+    ) -> JobResult<(StoreKey, StoreKey, StoreTransaction), S::Error> {
+        let (job_key, fair_key, lease_key, mut mutations) = self.build_mutations(system)?;
+        let mut checks = self.build_checks(system, job_key)?;
+        let next = match &self.record.state {
+            JobState::Leased(lease) => lease.fence,
+            _ => return Err(JobSystemError::LeaseLost),
+        };
+        let (check, mutation) = self.fence.advance(next);
+        checks.push(check);
+        mutations.push(mutation);
+        let transaction = crate::transition::checked_transaction(system, checks, mutations)?;
+        Ok((fair_key, lease_key, transaction))
+    }
 
-fn claim_checks(
-    job_key: crate::store::StoreKey,
-    encoded: Bytes,
-    route_key: crate::store::StoreKey,
-    route_value: Bytes,
-    permit_keys: &[crate::store::StoreKey],
-    existing_permit_value: Option<&Bytes>,
-) -> Vec<Check> {
-    let mut checks = vec![
-        Check::Value(job_key.clone(), encoded.clone()),
-        Check::Value(route_key, route_value),
-    ];
-    checks.extend(
-        permit_keys
-            .iter()
-            .cloned()
-            .map(|key| match existing_permit_value {
+    fn build_checks<S: JobStore>(
+        &self,
+        system: &JobSystem<S>,
+        job_key: StoreKey,
+    ) -> JobResult<Vec<Check>, S::Error> {
+        let mut checks = vec![
+            Check::Value(job_key, self.encoded.clone()),
+            Check::Value(self.route.key().clone(), self.route.value().clone()),
+        ];
+        checks.extend(self.permit_keys.iter().cloned().map(
+            |key| match &self.existing_permit_value {
                 Some(value) => Check::Value(key, value.clone()),
                 None => Check::Absent(key),
-            }),
-    );
-    checks
-}
+            },
+        ));
+        // Cancellation and claim race in the same native transaction: a
+        // committed cancellation cannot hand an expired lease to a new handler.
+        checks.push(Check::Absent(keys::cancellation_key(
+            system.namespace(),
+            &self.record.job_id,
+        )?));
+        Ok(checks)
+    }
 
-fn claim_mutations<S: JobStore>(
-    system: &JobSystem<S>,
-    record: &JobRecordV1,
-    route: &ClaimRoute,
-    new_encoded: Bytes,
-    operation_id: OperationId,
-    permit_keys: &[crate::store::StoreKey],
-) -> JobResult<
-    (
-        crate::store::StoreKey,
-        crate::store::StoreKey,
-        crate::store::StoreKey,
-        Vec<Mutation>,
-    ),
-    S::Error,
-> {
-    let job_key = keys::job_key(system.namespace(), &record.job_id)?;
-    let fair_key = keys::fair_key(system.namespace(), &record.queue, &record.job_id)?;
-    let lease_key = keys::lease_key(system.namespace(), &record.queue, &record.job_id)?;
-    let fence_high_water = match &record.state {
-        JobState::Leased(lease) => lease.fence.get(),
-        _ => return Err(JobSystemError::LeaseLost),
-    };
-    let mut mutations = vec![
-        Mutation::Put(job_key.clone(), new_encoded),
-        Mutation::Delete(route.key().clone()),
-        Mutation::Delete(fair_key.clone()),
-        Mutation::Put(lease_key.clone(), keys::lease_value(&record.job_id)?),
-        Mutation::Put(
-            keys::operation_key(system.namespace(), &record.job_id)?,
-            keys::operation_value(&record.job_id, &operation_id, fence_high_water)?,
-        ),
-    ];
-    let permit_value = keys::permit_value_for_record(record)?;
-    for permit_key in permit_keys {
-        mutations.push(Mutation::Put(permit_key.clone(), permit_value.clone()));
+    fn build_mutations<S: JobStore>(
+        &self,
+        system: &JobSystem<S>,
+    ) -> JobResult<(StoreKey, StoreKey, StoreKey, Vec<Mutation>), S::Error> {
+        let record = self.record;
+        let job_key = keys::job_key(system.namespace(), &record.job_id)?;
+        let fair_key = keys::fair_key(system.namespace(), &record.queue, &record.job_id)?;
+        let lease_key = keys::lease_key(system.namespace(), &record.queue, &record.job_id)?;
+        let fence_high_water = match &record.state {
+            JobState::Leased(lease) => lease.fence.get(),
+            _ => return Err(JobSystemError::LeaseLost),
+        };
+        let mut mutations = vec![
+            Mutation::Put(job_key.clone(), self.new_encoded.clone()),
+            Mutation::Delete(fair_key.clone()),
+            Mutation::Put(lease_key.clone(), keys::lease_value(&record.job_id)?),
+            Mutation::Put(
+                keys::operation_key(system.namespace(), &record.job_id)?,
+                keys::operation_value(&record.job_id, &self.operation_id, fence_high_water)?,
+            ),
+        ];
+        if self.route.removes_route() {
+            mutations.push(Mutation::Delete(self.route.key().clone()));
+        }
+        let permit_value = keys::permit_value_for_record(record)?;
+        mutations.extend(
+            self.permit_keys
+                .iter()
+                .cloned()
+                .map(|key| Mutation::Put(key, permit_value.clone())),
+        );
+        Ok((job_key, fair_key, lease_key, mutations))
     }
-    if !route.removes_route() {
-        mutations.remove(1);
-    }
-    Ok((job_key, fair_key, lease_key, mutations))
 }
 
 pub(super) fn claimable(record: &JobRecordV1, now: Timestamp) -> bool {

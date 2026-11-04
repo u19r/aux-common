@@ -9,6 +9,9 @@ mod commands;
 mod constants;
 mod discovery;
 mod persistence;
+mod settlement;
+#[cfg(all(test, not(target_family = "wasm")))]
+mod settlement_tests;
 mod state;
 
 #[cfg(test)]

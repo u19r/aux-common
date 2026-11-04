@@ -33,7 +33,7 @@ pub trait JobStore: Send + Sync + 'static {
     /// A missing key is `Ok(None)` and a present value is `Ok(Some(value))`.
     /// The adapter must enforce its declared key/value limits and return its
     /// typed error for unavailable or invalid operations. Point-read freshness
-    /// is an adapter property; callers revalidate mutable state in `commit`.
+    /// is an adapter property; callers revalidate mutable state in `transact`.
     fn get(
         &self,
         key: StoreKey,
@@ -83,25 +83,20 @@ pub trait JobStore: Send + Sync + 'static {
     /// post-dispatch timeout or transport loss whose outcome cannot be proven
     /// must return `Ok(CommitOutcome::Unknown)` instead.
     ///
-    /// [`StoreTransaction::operation_id`] identifies one logical commit across
-    /// transport and caller retries. The first accepted use binds that ID to
-    /// the exact checks and mutations. Reusing it with the same transaction
-    /// must return the already established `Committed` or `Conflict` outcome
-    /// without applying mutations again. Reusing it with different transaction
-    /// content must return a typed adapter error and apply nothing. If the
-    /// adapter still cannot establish the original outcome, it returns
-    /// `Unknown`; callers must reconcile rather than invent a new ID and retry
-    /// blindly.
-    /// The adapter enforces transaction limits and preserves the complete
-    /// check/mutation set for conformance and reconciliation.
-    fn commit<'a>(
+    /// This primitive creates no replay receipt or durable history. A retry
+    /// evaluates the current checks again. Engine commands obtain finite
+    /// replay and producer-death recovery through the JobSystem journal.
+    /// `operation_id` identifies the logical command for journal encoding.
+    /// Adapters must not use a cached result that bypasses current checks.
+    fn transact<'a>(
         &'a self,
         transaction: &'a StoreTransaction,
     ) -> impl Future<Output = Result<CommitOutcome, Self::Error>> + Send + 'a;
 }
 
-/// Result of an atomic commit. `Unknown` requires reconciliation with the
-/// transaction's stable commit operation ID.
+/// Result of an atomic attempt. `Unknown` requires reconciliation before
+/// assuming an outcome. Engine commands use their journal; idempotent
+/// maintenance can retry from its existing durable source records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CommitOutcome {
     Committed,

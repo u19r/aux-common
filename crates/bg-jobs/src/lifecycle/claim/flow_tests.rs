@@ -102,7 +102,7 @@ fn given_a_due_index_record_mismatch_when_driving_then_the_stale_candidate_is_no
         max_payload_bytes_in_flight: std::num::NonZeroUsize::new(1024)
             .expect("payload budget is non-zero"),
         max_completion_details: 1,
-        max_store_operations: crate::test_helper::one(64),
+        max_store_operations: crate::test_helper::one(512),
         stop_claiming_at: MonotonicDeadline::from_nanos(1),
         finish_by: MonotonicDeadline::from_nanos(u64::MAX),
     })
@@ -212,7 +212,11 @@ fn given_a_claim_commit_conflict_when_claiming_then_no_lease_or_route_is_partial
     block_on(engine.enqueue_raw(low_volume_job(1, Timestamp::ZERO), Timestamp::ZERO))
         .expect("enqueue commits");
     store
-        .queue_commit_outcome(CommitOutcome::Conflict)
+        .queue_commit_for_key(
+            crate::keys::job_key(engine.namespace(), &id).unwrap(),
+            CommitOutcome::Conflict,
+            false,
+        )
         .expect("queue conflict outcome");
 
     assert!(matches!(
@@ -257,15 +261,15 @@ fn given_a_maxed_fence_high_water_when_claiming_then_overflow_is_rejected_withou
     let id = JobId::from([11; 16]);
     block_on(engine.enqueue_raw(low_volume_job(11, Timestamp::ZERO), Timestamp::ZERO))
         .expect("enqueue commits");
-    let operation_key =
-        crate::keys::operation_key(engine.namespace(), &id).expect("operation key is valid");
+    let counter_key =
+        crate::codec::KeyCodec::encode(engine.namespace(), crate::codec::KeyTag::Fence, &[])
+            .unwrap();
     store
         .put_raw(
-            operation_key.clone(),
-            crate::keys::operation_value(&id, &OperationId::from([0xaa; 16]), u64::MAX)
-                .expect("maxed operation marker encodes"),
+            counter_key.clone(),
+            Bytes::copy_from_slice(&u64::MAX.to_be_bytes()),
         )
-        .expect("maxed operation marker writes");
+        .unwrap();
     let before = store.snapshot().expect("snapshot succeeds");
 
     assert!(matches!(
@@ -274,7 +278,7 @@ fn given_a_maxed_fence_high_water_when_claiming_then_overflow_is_rejected_withou
     ));
     assert_eq!(store.snapshot().expect("snapshot succeeds"), before);
     assert!(
-        block_on(engine.store().get(operation_key))
+        block_on(engine.store().get(counter_key))
             .expect("operation read succeeds")
             .is_some()
     );
@@ -558,5 +562,35 @@ fn given_a_persisted_manifest_with_another_jobs_chunk_key_when_claiming_then_reb
         block_on(engine.store().get(due_key))
             .expect("due read succeeds")
             .is_some()
+    );
+}
+
+#[test]
+fn given_retired_job_evidence_when_reusing_job_id_then_namespace_fence_keeps_increasing() {
+    let store = FakeStore::new();
+    let engine = system(store.clone(), FairnessPolicy::low_volume(), 1);
+    let id = JobId::from([91; 16]);
+    block_on(engine.enqueue_raw(low_volume_job(91, Timestamp::ZERO), Timestamp::ZERO))
+        .expect("first job enqueues");
+    let claim = block_on(engine.claim(id, Timestamp::ZERO)).expect("first claim commits");
+    let previous = claim.authority().expect("leased authority").fence;
+    block_on(engine.complete(
+        claim,
+        JobOutcome::Complete(OutcomeCode::try_new("done").unwrap()),
+        Timestamp::ZERO,
+    ))
+    .expect("first job completes");
+    store
+        .delete_raw(&keys::operation_key(engine.namespace(), &id).unwrap())
+        .expect("settled operation evidence is removed");
+    block_on(engine.enqueue_raw(low_volume_job(91, Timestamp::ZERO), Timestamp::ZERO))
+        .expect("same ID can enqueue after settlement");
+    let replacement = block_on(engine.claim(id, Timestamp::ZERO)).expect("replacement claims");
+    assert!(
+        replacement
+            .authority()
+            .expect("replacement authority")
+            .fence
+            > previous
     );
 }

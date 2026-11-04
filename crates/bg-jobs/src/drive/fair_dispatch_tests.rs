@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     num::{NonZeroU16, NonZeroU32, NonZeroUsize},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -203,7 +204,7 @@ fn one_claim_drive_request() -> DriveRequest {
         max_concurrency: nz16(1),
         max_payload_bytes_in_flight: nz_usize(1024),
         max_completion_details: 1,
-        max_store_operations: nz32(64),
+        max_store_operations: nz32(512),
         stop_claiming_at: MonotonicDeadline::from_nanos(1),
         finish_by: MonotonicDeadline::from_nanos(u64::MAX),
     })
@@ -1469,4 +1470,45 @@ fn given_consistent_family_weights_when_driving_then_direct_and_child_work_compl
             b"second-child".to_vec()
         ]
     );
+}
+
+#[test]
+fn given_sustained_partial_discovery_when_unique_jobs_complete_then_fair_owner_retains_no_completed_candidates()
+ {
+    let store = crate::FakeStore::distributed();
+    let executions = Arc::new(Mutex::new(Vec::new()));
+    let system =
+        recording_scoped_system_with_store(store.clone(), OwnerId::from([81; 16]), executions);
+    for id in 1..=40 {
+        let mut job = crate::test_helper::job(
+            id,
+            Bytes::from(vec![id]),
+            scope(id, None),
+            Timestamp::ZERO,
+            None,
+            None,
+        );
+        job.ordering_key = Some(OrderingKey::try_new([id]).unwrap());
+        block_on(system.enqueue_raw(job, Timestamp::ZERO)).unwrap();
+    }
+    let mut completed = BTreeSet::new();
+    for _ in 0..12 {
+        let report = block_on(
+            system.drive(one_claim_drive_request(), Timestamp::ZERO, || {
+                MonotonicDeadline::ZERO
+            }),
+        )
+        .unwrap();
+        assert_eq!(report.counts.succeeded, 1);
+        completed.insert(report.completions[0].job_id);
+        let owner = block_on(FairDispatchOwner::load(&system)).unwrap().unwrap();
+        let retained = owner
+            .candidate_ids()
+            .filter(|id| completed.contains(id))
+            .collect::<Vec<_>>();
+        assert!(
+            retained.is_empty(),
+            "completed jobs must not accumulate in a partial-discovery owner: {retained:?}"
+        );
+    }
 }

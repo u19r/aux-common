@@ -53,16 +53,22 @@ impl FairDispatchOwner {
         let expected_old = self.loaded_value.clone();
         let transaction =
             build_save_transaction(system, key.clone(), expected_old.as_ref(), &value)?;
-        crate::transition::commit_transition(
-            system,
-            transaction,
-            key,
-            expected_old.as_ref(),
-            Some(&value),
-            crate::transition::TransitionConflict::LeaseConflict,
-        )
-        .await?;
+        (system)
+            .commit_transition(
+                transaction,
+                crate::transition::TransitionConflict::LeaseConflict,
+            )
+            .await?;
         self.loaded_value = Some(value);
+        Ok(())
+    }
+
+    /// A terminal lifecycle transaction now persists this same settlement.
+    /// Use the locally derived bytes as a CAS expectation; competing changes
+    /// still reject the next reservation instead of being overwritten.
+    pub(crate) fn acknowledge_terminal_projection(&mut self) -> Result<(), StoreDataError> {
+        self.compact_terminal_candidates();
+        self.loaded_value = Some(encode_value(self)?);
         Ok(())
     }
 
@@ -82,7 +88,7 @@ async fn load_value<S: JobStore>(
     system.store().get(key).await.map_err(JobSystemError::Store)
 }
 
-fn decode_value(encoded: &[u8]) -> Result<&[u8], StoreDataError> {
+pub(super) fn decode_value(encoded: &[u8]) -> Result<&[u8], StoreDataError> {
     let (tag, body) = ValueCodec::decode_body(encoded)?;
     if tag != ValueTag::FairReady || !body.starts_with(FAIR_OWNER_MARKER) {
         return Err(StoreDataError::Malformed("fair owner value"));
@@ -90,7 +96,7 @@ fn decode_value(encoded: &[u8]) -> Result<&[u8], StoreDataError> {
     Ok(&body[FAIR_OWNER_MARKER.len()..])
 }
 
-fn encode_value(owner: &FairDispatchOwner) -> Result<Bytes, StoreDataError> {
+pub(super) fn encode_value(owner: &FairDispatchOwner) -> Result<Bytes, StoreDataError> {
     let mut body = Vec::with_capacity(FAIR_OWNER_MARKER.len() + 1024);
     body.extend_from_slice(FAIR_OWNER_MARKER);
     body.extend_from_slice(&owner.encode()?);

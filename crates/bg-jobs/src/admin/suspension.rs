@@ -15,10 +15,7 @@ use crate::{
     keys,
     model::JobState,
     store::{Check, JobStore, Mutation, StoreTransaction},
-    transition::{
-        checked_transaction, commit_record_without_claim, fresh_operation, next_revision,
-        wake_mutation,
-    },
+    transition::{checked_transaction, fresh_operation, next_revision, wake_mutation},
 };
 
 pub(crate) async fn suspend_job<S: JobStore>(
@@ -53,7 +50,12 @@ pub(crate) async fn resume_job<S: JobStore>(
     authority.record.revision = next_revision(system, &authority.record)?;
     let encoded = encode_job_record(&authority.record)?;
     let transaction = authority.resume_transaction(system, &encoded).await?;
-    commit_record_without_claim(system, transaction, &job_id, &authority.encoded, &encoded).await?;
+    system
+        .commit_transition(
+            transaction,
+            crate::transition::TransitionConflict::LeaseLost,
+        )
+        .await?;
     system.observe(crate::observer::JobEvent::Resumed {
         queue: authority.record.queue,
     });

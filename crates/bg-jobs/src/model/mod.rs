@@ -45,8 +45,7 @@ pub use observation::{
 pub(crate) use panic_boundary::{HandlerPanic, PanicSafeFuture};
 pub use record::{
     AttemptHistory, CancellationToken, EnqueueDisposition, EnqueueResult, HandlerDefinition,
-    JobOutcome, JobPolicySnapshot, JobRecordV1, JobState, Lease, NewJob, OperationReceipt,
-    PayloadManifest, TerminalDisposition,
+    JobOutcome, JobPolicySnapshot, JobRecordV1, JobState, Lease, NewJob, PayloadManifest,
 };
 pub use remote_claim::RemoteJobClaim;
 pub use spec::{EnqueueOptions, JobHandle, JobSeed, JobSpec};

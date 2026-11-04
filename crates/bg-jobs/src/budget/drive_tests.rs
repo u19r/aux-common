@@ -66,7 +66,7 @@ fn given_machine_sized_store_limits_when_discovering_then_range_requests_stay_li
         max_payload_bytes_in_flight: NonZeroUsize::new(usize::MAX)
             .expect("maximum payload bytes are non-zero"),
         max_completion_details: 0,
-        max_store_operations: one(3),
+        max_store_operations: one(5),
         stop_claiming_at: MonotonicDeadline::ZERO,
         finish_by: MonotonicDeadline::from_nanos(u64::MAX),
     })
@@ -75,9 +75,18 @@ fn given_machine_sized_store_limits_when_discovering_then_range_requests_stay_li
     block_on(system.drive(request, Timestamp::ZERO, || MonotonicDeadline::ZERO))
         .expect("empty discovery reports");
 
-    assert_eq!(store.calls(), 3, "two index reads and one owner load");
-    assert_eq!(store.ranges().len(), 2, "due and lease each read one page");
-    for (items, bytes) in store.ranges() {
+    assert_eq!(
+        store.calls(),
+        5,
+        "journal, expiry, two index reads, and one owner load"
+    );
+    assert_eq!(
+        store.ranges().len(),
+        4,
+        "journal, expiry, due, and lease each read one page"
+    );
+    assert_eq!(store.ranges()[1], (8, 16 * 1024));
+    for (items, bytes) in store.ranges().into_iter().skip(2) {
         assert!(
             items == crate::transition::MAX_INDEX_RANGE_ITEMS as u32,
             "machine-sized backend must be capped at the library item limit"
@@ -98,7 +107,7 @@ fn given_empty_discovery_when_driving_then_idle_selection_is_attempted_once() {
         MonotonicDeadline::ZERO,
         MonotonicDeadline::from_nanos(u64::MAX),
     );
-    input.max_store_operations = one(3);
+    input.max_store_operations = one(5);
     let request = DriveRequest::try_from(input).expect("bounded request is valid");
 
     crate::fairness::FairDispatchOwner::reset_selection_passes();
@@ -138,7 +147,7 @@ fn given_many_records_and_a_machine_sized_value_limit_when_discovering_then_get_
         max_payload_bytes_in_flight: NonZeroUsize::new(usize::MAX)
             .expect("maximum payload bytes are non-zero"),
         max_completion_details: 0,
-        max_store_operations: one(6),
+        max_store_operations: one(7),
         stop_claiming_at: MonotonicDeadline::ZERO,
         finish_by: MonotonicDeadline::from_nanos(u64::MAX),
     })
@@ -149,8 +158,8 @@ fn given_many_records_and_a_machine_sized_value_limit_when_discovering_then_get_
 
     assert_eq!(
         store.calls(),
-        5,
-        "two index reads and three bounded record operations: {:?}",
+        7,
+        "journal, expiry, two index reads and three bounded record operations: {:?}",
         store.get_many_batches()
     );
     let batches = store.get_many_batches();
@@ -328,10 +337,11 @@ fn given_one_claim_budget_when_first_candidate_conflicts_then_both_scheduler_wid
         block_on(system.enqueue_raw(low_volume_job(2, Timestamp::ZERO), Timestamp::ZERO))
             .expect("second enqueue commits");
         store
-            .queue_commit_outcome(CommitOutcome::Committed)
-            .expect("owner reservation commit is queued");
-        store
-            .queue_commit_outcome(CommitOutcome::Conflict)
+            .queue_commit_for_key(
+                crate::keys::job_key(system.namespace(), &JobId::from([1; 16])).unwrap(),
+                CommitOutcome::Conflict,
+                false,
+            )
             .expect("first claim conflict is queued");
         let request = DriveRequest::try_from(DriveRequestInput {
             queues: QueueSelection::all(),
@@ -340,7 +350,7 @@ fn given_one_claim_budget_when_first_candidate_conflicts_then_both_scheduler_wid
             max_payload_bytes_in_flight: NonZeroUsize::new(1024)
                 .expect("payload budget is non-zero"),
             max_completion_details: 1,
-            max_store_operations: one(64),
+            max_store_operations: one(512),
             stop_claiming_at: MonotonicDeadline::from_nanos(1),
             finish_by: MonotonicDeadline::from_nanos(u64::MAX),
         })
@@ -369,7 +379,7 @@ fn given_registered_low_volume_backlog_when_driving_again_then_the_next_job_is_a
     let first = block_on(system.drive(
         permissive_request(
             2,
-            128,
+            512,
             MonotonicDeadline::from_nanos(1),
             MonotonicDeadline::from_nanos(u64::MAX),
         ),
@@ -386,7 +396,7 @@ fn given_registered_low_volume_backlog_when_driving_again_then_the_next_job_is_a
     let second = block_on(system.drive(
         permissive_request(
             2,
-            128,
+            512,
             MonotonicDeadline::from_nanos(1),
             MonotonicDeadline::from_nanos(u64::MAX),
         ),
@@ -415,7 +425,7 @@ fn given_a_recurring_low_volume_job_when_the_same_system_drives_then_it_runs_aga
     let first_report = block_on(system.drive(
         permissive_request(
             1,
-            64,
+            512,
             MonotonicDeadline::from_nanos(1),
             MonotonicDeadline::from_nanos(u64::MAX),
         ),
@@ -426,7 +436,7 @@ fn given_a_recurring_low_volume_job_when_the_same_system_drives_then_it_runs_aga
     let second_report = block_on(system.drive(
         permissive_request(
             1,
-            64,
+            512,
             MonotonicDeadline::from_nanos(1),
             MonotonicDeadline::from_nanos(u64::MAX),
         ),
@@ -460,13 +470,17 @@ fn given_owner_reservation_conflict_when_drive_starts_then_no_handler_or_job_eff
     block_on(system.enqueue_raw(low_volume_job(43, Timestamp::ZERO), Timestamp::ZERO))
         .expect("enqueue commits");
     store
-        .queue_commit_outcome(CommitOutcome::Conflict)
+        .queue_commit_for_key(
+            crate::keys::fair_state_key(&Namespace::try_new(b"jobs").unwrap()).unwrap(),
+            CommitOutcome::Conflict,
+            false,
+        )
         .expect("owner reservation conflict is queued");
 
     let result = block_on(system.drive(
         permissive_request(
             1,
-            64,
+            512,
             MonotonicDeadline::from_nanos(1),
             MonotonicDeadline::from_nanos(u64::MAX),
         ),
@@ -491,7 +505,7 @@ fn given_owner_reservation_conflict_when_drive_starts_then_no_handler_or_job_eff
     let resumed = block_on(system.drive(
         permissive_request(
             1,
-            64,
+            512,
             MonotonicDeadline::from_nanos(1),
             MonotonicDeadline::from_nanos(u64::MAX),
         ),
@@ -530,12 +544,22 @@ fn given_admitted_work_when_another_owner_reservation_conflicts_then_drive_drain
         .expect("enqueue commits");
     }
     store
-        .queue_commit_outcome(CommitOutcome::Committed)
+        .queue_commit_for_key(
+            crate::keys::fair_state_key(&Namespace::try_new(b"jobs").unwrap()).unwrap(),
+            CommitOutcome::Committed,
+            true,
+        )
         .unwrap();
-    store.queue_commit_outcome(CommitOutcome::Conflict).unwrap();
+    store
+        .queue_commit_for_key(
+            crate::keys::fair_state_key(&Namespace::try_new(b"jobs").unwrap()).unwrap(),
+            CommitOutcome::Conflict,
+            false,
+        )
+        .unwrap();
     let request = permissive_request_with_concurrency(
         2,
-        128,
+        512,
         MonotonicDeadline::from_nanos(1),
         MonotonicDeadline::from_nanos(u64::MAX),
         2,
@@ -568,15 +592,19 @@ fn given_unresolved_owner_commit_when_drive_starts_then_error_is_retained_withou
     );
     block_on(system.enqueue_raw(low_volume_job(47, Timestamp::ZERO), Timestamp::ZERO))
         .expect("enqueue commits");
-    for _ in 0..2 {
+    for _ in 0..3 {
         store
-            .queue_unknown_before_commit()
+            .queue_commit_for_key(
+                crate::keys::fair_state_key(&Namespace::try_new(b"jobs").unwrap()).unwrap(),
+                CommitOutcome::Unknown,
+                false,
+            )
             .expect("lost acknowledgement is queued");
     }
     let result = block_on(system.drive(
         permissive_request(
             1,
-            64,
+            512,
             MonotonicDeadline::from_nanos(1),
             MonotonicDeadline::from_nanos(u64::MAX),
         ),
@@ -622,11 +650,15 @@ fn given_two_drives_at_the_same_owner_version_when_one_reservation_conflicts_the
     block_on(system_a.enqueue_raw(low_volume_job(44, Timestamp::ZERO), Timestamp::ZERO))
         .expect("enqueue commits");
     inner
-        .queue_commit_outcome(CommitOutcome::Conflict)
+        .queue_commit_for_key(
+            crate::keys::fair_state_key(&Namespace::try_new(b"jobs").unwrap()).unwrap(),
+            CommitOutcome::Conflict,
+            false,
+        )
         .expect("one reservation conflict is queued");
     let request = permissive_request(
         1,
-        64,
+        512,
         MonotonicDeadline::from_nanos(1),
         MonotonicDeadline::from_nanos(u64::MAX),
     );
@@ -657,7 +689,7 @@ fn given_two_drives_at_the_same_owner_version_when_one_reservation_conflicts_the
             assert_eq!(report.next_wake, WakeHint::Now);
         }
     }
-    assert_eq!(barrier_store.reservation_commits(), 2);
+    assert_eq!(barrier_store.reservation_commits(), 3);
     assert!(barrier_store.owner_reads() >= 2);
     assert_eq!(conflicts, 1);
     assert_eq!(completed, 1);
@@ -687,7 +719,7 @@ fn given_an_expired_stop_deadline_when_driving_through_the_public_api_then_no_wo
         .expect("enqueue commits");
     let request = permissive_request(
         1,
-        64,
+        512,
         MonotonicDeadline::ZERO,
         MonotonicDeadline::from_nanos(u64::MAX),
     );
@@ -715,7 +747,7 @@ fn given_an_expired_finish_deadline_when_driving_through_the_public_api_then_no_
         .expect("enqueue commits");
     let request = permissive_request(
         1,
-        64,
+        512,
         MonotonicDeadline::ZERO,
         MonotonicDeadline::from_nanos(1),
     );
@@ -745,7 +777,7 @@ fn given_time_advances_between_candidates_when_driving_then_new_claims_stop_at_t
     }
     let request = permissive_request(
         2,
-        64,
+        512,
         MonotonicDeadline::from_nanos(10),
         MonotonicDeadline::from_nanos(u64::MAX),
     );
@@ -777,7 +809,7 @@ fn given_insufficient_handler_time_when_driving_then_execution_is_not_started() 
         .expect("enqueue commits");
     let request = permissive_request(
         1,
-        64,
+        512,
         MonotonicDeadline::from_nanos(1),
         MonotonicDeadline::from_nanos(1),
     );
@@ -807,7 +839,7 @@ fn given_a_panicking_handler_when_public_drive_buffers_another_candidate_then_re
     }
     let request = permissive_request_with_concurrency(
         2,
-        128,
+        512,
         MonotonicDeadline::from_nanos(u64::MAX / 2),
         MonotonicDeadline::from_nanos(u64::MAX),
         2,
@@ -826,7 +858,7 @@ fn given_a_panicking_handler_when_public_drive_buffers_another_candidate_then_re
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     let retry_request = permissive_request(
         1,
-        128,
+        512,
         MonotonicDeadline::from_nanos(u64::MAX / 2),
         MonotonicDeadline::from_nanos(u64::MAX),
     );
@@ -848,14 +880,6 @@ fn given_exact_store_operation_budgets_when_public_drive_runs_then_calls_stay_wi
         block_on(system.enqueue_raw(low_volume_job(40, Timestamp::ZERO), Timestamp::ZERO))
             .expect("enqueue commits");
         store.reset();
-        if budget == 29 {
-            store
-                .queue_commit_outcome(CommitOutcome::Committed)
-                .expect("owner reservation commit is queued");
-            store
-                .queue_commit_outcome(CommitOutcome::Conflict)
-                .expect("claim conflict is queued");
-        }
         let request = permissive_request(
             1,
             budget,
@@ -865,12 +889,8 @@ fn given_exact_store_operation_budgets_when_public_drive_runs_then_calls_stay_wi
 
         let report = block_on(system.drive(request, Timestamp::ZERO, || MonotonicDeadline::ZERO))
             .expect("drive reports");
-        if budget == 29 {
-            assert_eq!(report.counts.lease_conflicts, 1);
-        } else {
-            assert_eq!(report.counts.claimed, 0);
-            assert_eq!(report.stop_reason, DriveStopReason::Capacity);
-        }
+        assert_eq!(report.counts.claimed, 0);
+        assert_eq!(report.stop_reason, DriveStopReason::Capacity);
         if store.calls() > budget {
             violations.push((budget, store.calls()));
         }
@@ -913,7 +933,11 @@ fn given_permit_discovery_would_exhaust_the_operation_budget_then_drive_stops_be
 
     assert_eq!(report.counts.claimed, 0);
     assert_eq!(report.stop_reason, DriveStopReason::Capacity);
-    assert_eq!(store.calls(), 3, "the permit probe must not consume a call");
+    assert_eq!(
+        store.calls(),
+        5,
+        "journal, expiry and discovery stop before the permit probe"
+    );
 }
 
 #[test]
@@ -980,7 +1004,7 @@ fn given_due_work_beyond_the_first_range_page_when_driving_then_each_due_item_is
     let report = block_on(system.drive(
         permissive_request(
             2,
-            64,
+            512,
             MonotonicDeadline::from_nanos(1),
             MonotonicDeadline::from_nanos(u64::MAX),
         ),
@@ -1015,7 +1039,7 @@ fn given_expired_leases_beyond_the_first_range_page_when_driving_then_each_lease
     let report = block_on(system.drive(
         permissive_request(
             2,
-            64,
+            512,
             MonotonicDeadline::from_nanos(1),
             MonotonicDeadline::from_nanos(u64::MAX),
         ),
@@ -1081,12 +1105,12 @@ fn given_a_mismatched_complete_permit_set_when_reclaiming_expired_lease_then_con
             .put_raw(key, live_permit_value.clone())
             .expect("mismatched permit writes");
     }
-    let before = store.snapshot().expect("snapshot before reclaim succeeds");
+    let before = crate::test_helper::application_snapshot(&store);
 
     let report = block_on(system.drive(
         permissive_request(
             1,
-            128,
+            512,
             MonotonicDeadline::from_nanos(1),
             MonotonicDeadline::from_nanos(u64::MAX),
         ),
@@ -1101,7 +1125,7 @@ fn given_a_mismatched_complete_permit_set_when_reclaiming_expired_lease_then_con
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let fair_state_key =
         crate::keys::fair_state_key(system.namespace()).expect("fair owner key is valid");
-    let after = store.snapshot().expect("snapshot after reclaim succeeds");
+    let after = crate::test_helper::application_snapshot(&store);
     // The scheduler commits its advisory owner reservation before attempting
     // the authoritative claim. Compare all lifecycle-owned entries here; the
     // owner projection is expected to contain that committed reservation.
@@ -1141,7 +1165,7 @@ fn given_a_malformed_due_entry_before_valid_work_when_driving_then_valid_work_st
         .expect("malformed due entry writes");
 
     let report = block_on(system.drive(
-        permissive_queue_request(queue, 1, 128),
+        permissive_queue_request(queue, 1, 512),
         Timestamp::ZERO,
         || MonotonicDeadline::ZERO,
     ))
@@ -1182,7 +1206,7 @@ fn given_a_malformed_lease_entry_before_valid_work_when_driving_then_valid_work_
         .expect("malformed lease entry writes");
 
     let report = block_on(system.drive(
-        permissive_queue_request(queue, 1, 128),
+        permissive_queue_request(queue, 1, 512),
         Timestamp::from_millis(2_000),
         || MonotonicDeadline::ZERO,
     ))
@@ -1241,7 +1265,7 @@ fn given_a_transplanted_lease_route_for_job_a_when_it_fetches_job_b_then_job_b_i
     block_on(system.claim(job_c, Timestamp::ZERO)).expect("job C claim commits");
 
     let report = block_on(system.drive(
-        permissive_queue_request(queue, 1, 128),
+        permissive_queue_request(queue, 1, 512),
         Timestamp::from_millis(2_000),
         || MonotonicDeadline::ZERO,
     ))
@@ -1294,7 +1318,7 @@ fn given_a_malformed_job_record_before_valid_expired_work_when_driving_then_vali
         .expect("malformed job lease route writes");
 
     let report = block_on(system.drive(
-        permissive_queue_request(queue, 1, 128),
+        permissive_queue_request(queue, 1, 512),
         Timestamp::from_millis(2_000),
         || MonotonicDeadline::ZERO,
     ))
@@ -1336,7 +1360,7 @@ fn given_a_terminal_record_missing_from_discovery_when_driving_then_the_durable_
     let seeded = block_on(system.drive(
         permissive_request(
             2,
-            64,
+            512,
             MonotonicDeadline::from_nanos(1),
             MonotonicDeadline::from_nanos(u64::MAX),
         ),
@@ -1354,7 +1378,7 @@ fn given_a_terminal_record_missing_from_discovery_when_driving_then_the_durable_
     let report = block_on(system.drive(
         permissive_request(
             1,
-            64,
+            512,
             MonotonicDeadline::from_nanos(1),
             MonotonicDeadline::from_nanos(u64::MAX),
         ),
@@ -1386,7 +1410,7 @@ fn given_shutdown_after_owner_reservation_when_the_lease_expires_then_drive_recl
         block_on(runner.drive(
             permissive_request(
                 1,
-                128,
+                512,
                 MonotonicDeadline::from_nanos(1),
                 MonotonicDeadline::from_nanos(u64::MAX),
             ),
@@ -1415,7 +1439,7 @@ fn given_shutdown_after_owner_reservation_when_the_lease_expires_then_drive_recl
     let second_report = block_on(system.drive(
         permissive_request(
             1,
-            128,
+            512,
             MonotonicDeadline::from_nanos(1),
             MonotonicDeadline::from_nanos(u64::MAX),
         ),
@@ -1447,7 +1471,7 @@ fn given_queue_only_after_completion_when_same_scope_work_arrives_then_drive_cla
         max_concurrency: NonZeroU16::new(1).expect("concurrency is non-zero"),
         max_payload_bytes_in_flight: NonZeroUsize::new(1024).expect("payload budget is non-zero"),
         max_completion_details: 1,
-        max_store_operations: one(128),
+        max_store_operations: one(512),
         stop_claiming_at: MonotonicDeadline::from_nanos(1),
         finish_by: MonotonicDeadline::from_nanos(u64::MAX),
     })
@@ -1565,7 +1589,7 @@ fn given_queue_only_drive_when_a_foreign_owner_candidate_exists_then_its_project
     let foreign_due = block_on(store.get(foreign_due_key.clone())).expect("foreign due reads");
 
     let report = block_on(system.drive(
-        permissive_queue_request(queue_a, 1, 128),
+        permissive_queue_request(queue_a, 1, 512),
         Timestamp::ZERO,
         || MonotonicDeadline::ZERO,
     ))
@@ -1897,6 +1921,7 @@ struct ReservationBarrierStore {
     inner: FakeStore,
     fair_state_key: StoreKey,
     reservation_barrier: Arc<Barrier>,
+    recovery_barrier: Arc<Barrier>,
     reservation_commits: Arc<AtomicUsize>,
     owner_reads: Arc<AtomicUsize>,
 }
@@ -1907,6 +1932,7 @@ impl ReservationBarrierStore {
             inner,
             fair_state_key,
             reservation_barrier: Arc::new(Barrier::new(2)),
+            recovery_barrier: Arc::new(Barrier::new(2)),
             reservation_commits: Arc::new(AtomicUsize::new(0)),
             owner_reads: Arc::new(AtomicUsize::new(0)),
         }
@@ -1940,19 +1966,39 @@ impl JobStore for ReservationBarrierStore {
     }
 
     async fn read_range(&self, request: RangeRequest) -> Result<RangePage, Self::Error> {
-        self.inner.read_range(request).await
+        let is_recovery = request.start().is_some_and(|key| {
+            crate::codec::KeyCodec::decode(&Namespace::try_new(b"jobs").unwrap(), key)
+                .unwrap()
+                .tag
+                == crate::codec::KeyTag::Commit
+        });
+        let page = self.inner.read_range(request).await;
+        if is_recovery {
+            // Both recovery observations must complete before either actor
+            // starts the owner-version race that this fixture controls.
+            self.recovery_barrier.wait();
+        }
+        page
     }
 
-    async fn commit(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
+    async fn transact(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
         let is_reservation = transaction
             .mutations()
             .iter()
             .any(|mutation| mutation.key() == &self.fair_state_key);
-        if is_reservation {
-            self.reservation_commits.fetch_add(1, Ordering::SeqCst);
-            self.reservation_barrier.wait();
+        let changes_job = transaction.mutations().iter().any(|mutation| {
+            crate::codec::KeyCodec::decode(&Namespace::try_new(b"jobs").unwrap(), mutation.key())
+                .unwrap()
+                .tag
+                == crate::codec::KeyTag::Job
+        });
+        if is_reservation && !changes_job {
+            let attempt = self.reservation_commits.fetch_add(1, Ordering::SeqCst);
+            if attempt < 2 {
+                self.reservation_barrier.wait();
+            }
         }
-        self.inner.commit(transaction).await
+        self.inner.transact(transaction).await
     }
 }
 
@@ -2022,10 +2068,6 @@ impl CountingStore {
     fn count_call(&self) {
         self.calls.fetch_add(1, Ordering::SeqCst);
     }
-
-    fn queue_commit_outcome(&self, outcome: CommitOutcome) -> Result<(), FakeStoreError> {
-        self.inner.queue_commit_outcome(outcome)
-    }
 }
 
 impl JobStore for CountingStore {
@@ -2050,9 +2092,9 @@ impl JobStore for CountingStore {
         self.inner.read_range(request).await
     }
 
-    async fn commit(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
+    async fn transact(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
         self.count_call();
-        self.inner.commit(transaction).await
+        self.inner.transact(transaction).await
     }
 }
 
@@ -2186,9 +2228,9 @@ impl JobStore for RangeLimitStore {
         self.inner.read_range(request).await
     }
 
-    async fn commit(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
+    async fn transact(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
         self.count_call();
-        self.inner.commit(transaction).await
+        self.inner.transact(transaction).await
     }
 }
 

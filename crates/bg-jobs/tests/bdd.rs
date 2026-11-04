@@ -25,6 +25,17 @@ pub(crate) fn build_system<S: JobStore>(
     owner: OwnerId,
     observer: Option<Arc<dyn bg_jobs::observer::JobObserver>>,
 ) -> Result<JobSystem<S>, String> {
+    let catalog = catalog.with_manifest(
+        bg_jobs::CatalogManifest::try_new(
+            bg_jobs::CatalogRevision::from(std::num::NonZeroU64::MIN),
+            Vec::new(),
+            vec![
+                bg_jobs::runtime::ScheduleId::from([9; 16]),
+                bg_jobs::runtime::ScheduleId::from([91; 16]),
+            ],
+        )
+        .map_err(|error| error.to_string())?,
+    );
     let mut builder = JobSystemBuilder::new(store)
         .catalog(catalog)
         .namespace(Namespace::try_new(b"bdd-jobs").map_err(|error| error.to_string())?)
@@ -83,6 +94,8 @@ pub(crate) struct RecoveryEvidence {
 
 #[derive(Default)]
 pub(crate) struct FairnessEvidence {
+    pub(crate) overlap_schedule: Option<bg_jobs::runtime::RecurringSchedule>,
+    pub(crate) overlap_successor_admitted: bool,
     pub(crate) selected: Vec<JobId>,
     pub(crate) fairness_bound: Option<u64>,
     pub(crate) batch: Option<Batch>,

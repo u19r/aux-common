@@ -10,7 +10,7 @@ use bytes::Bytes;
 
 use super::{
     ClaimRecordInput, ClaimRoute, ClaimedJob, authority::prepare_claim_record,
-    transaction::claim_transaction, types::ClaimTransactionInput,
+    types::ClaimTransactionInput,
 };
 use crate::{
     codec::{decode_job_record, encode_job_record},
@@ -129,7 +129,8 @@ pub(crate) async fn claim_record_with_capacity<S: JobStore>(
         fence_result,
         permit_result,
     } = read_claim_state(system, input).await?;
-    let fence_high_water = fence_result?;
+    let fence = fence_result?;
+    let fence_high_water = fence.high_water();
     let record = prepare_claim_record(
         system,
         record,
@@ -144,6 +145,7 @@ pub(crate) async fn claim_record_with_capacity<S: JobStore>(
     let (fair_key, lease_key) = commit_claim(
         system,
         ClaimTransactionInput {
+            fence,
             record: &record,
             encoded: &encoded,
             route: route.clone(),
@@ -172,7 +174,7 @@ struct ClaimReadState<E> {
     route: ClaimRoute,
     now: Timestamp,
     existing_permit_value: Option<Bytes>,
-    fence_result: JobResult<u64, E>,
+    fence_result: JobResult<crate::lifecycle::fence::FenceReservation, E>,
     permit_result: JobResult<Option<Vec<StoreKey>>, E>,
 }
 
@@ -253,18 +255,13 @@ async fn commit_claim<S: JobStore>(
     system: &JobSystem<S>,
     input: ClaimTransactionInput<'_>,
 ) -> JobResult<(StoreKey, StoreKey), S::Error> {
-    let expected_old = input.encoded;
-    let expected_new = input.new_encoded.clone();
-    let (job_key, fair_key, lease_key, transaction) = claim_transaction(system, input)?;
-    crate::transition::commit_transition(
-        system,
-        transaction,
-        job_key,
-        Some(expected_old),
-        Some(&expected_new),
-        crate::transition::TransitionConflict::LeaseConflict,
-    )
-    .await?;
+    let (fair_key, lease_key, transaction) = input.build_transaction(system)?;
+    system
+        .commit_transition(
+            transaction,
+            crate::transition::TransitionConflict::LeaseConflict,
+        )
+        .await?;
     Ok((fair_key, lease_key))
 }
 
@@ -305,20 +302,13 @@ fn validate_claim_route<S: JobStore>(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) async fn load_fence_high_water<S: JobStore>(
     system: &JobSystem<S>,
-    job_id: JobId,
 ) -> JobResult<u64, S::Error> {
-    let operation_key = keys::operation_key(system.namespace(), &job_id)?;
-    let Some(encoded) = system
-        .store()
-        .get(operation_key)
-        .await
-        .map_err(JobSystemError::Store)?
-    else {
-        return Ok(0);
-    };
-    Ok(keys::decode_operation_fence_high_water(&encoded, &job_id)?)
+    Ok(crate::lifecycle::fence::FenceReservation::load(system)
+        .await?
+        .high_water())
 }
 
 #[cfg(test)]
@@ -330,7 +320,8 @@ pub(super) async fn join_claim_reads<S: JobStore>(
     JobResult<u64, S::Error>,
     JobResult<Option<Vec<StoreKey>>, S::Error>,
 ) {
-    join_claim_reads_with_mode(system, record, capacity, false).await
+    let (fence, permits) = join_claim_reads_with_mode(system, record, capacity, false).await;
+    (fence.map(|value| value.high_water()), permits)
 }
 
 async fn join_claim_reads_with_mode<S: JobStore>(
@@ -339,10 +330,10 @@ async fn join_claim_reads_with_mode<S: JobStore>(
     capacity: NonZeroU16,
     reclaiming_expired_lease: bool,
 ) -> (
-    JobResult<u64, S::Error>,
+    JobResult<crate::lifecycle::fence::FenceReservation, S::Error>,
     JobResult<Option<Vec<StoreKey>>, S::Error>,
 ) {
-    let fence_future = load_fence_high_water(system, record.job_id);
+    let fence_future = crate::lifecycle::fence::FenceReservation::load(system);
     let permit_future = find_claim_permit_keys(system, record, capacity, reclaiming_expired_lease);
     let mut fence = std::pin::pin!(fence_future);
     let mut permits = std::pin::pin!(permit_future);
