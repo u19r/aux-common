@@ -392,7 +392,6 @@ fn given_all_metric_variants_when_names_are_registered_then_names_are_static_and
         HistogramMetric::MetricFederatedProvisionStageLatencyMs,
         HistogramMetric::LimitsExpirySweepDurationMs,
         HistogramMetric::LimitsTransitionDurationMs,
-        HistogramMetric::MetricHttpRequestLatencyMs,
         HistogramMetric::MetricOauthUserinfoFallbackLatencyMs,
         HistogramMetric::MetricQueueMessageDelayMs,
         HistogramMetric::MetricSamlAcsIssuerOrgResolutionLatencyMs,
@@ -638,7 +637,6 @@ fn given_all_metric_variants_when_names_are_registered_then_names_are_static_and
         "authn.federated.provision_stage_latency_ms",
         "limits.expiry.sweep.duration.ms",
         "limits.transition.duration.ms",
-        "http.request.latency.ms",
         "authn.oauth.userinfo_fallback_latency_ms",
         "jobs.immediate.queue.message.delay.ms",
         "authn.saml.acs.issuer_org_resolution_latency_ms",
@@ -669,13 +667,6 @@ fn given_all_metric_variants_when_names_are_registered_then_names_are_static_and
     for (metric, expected) in histograms.iter().zip(expected_histogram_names) {
         assert_eq!(metric.name(), expected);
     }
-    // The two request-latency variants intentionally share one histogram
-    // series.
-    assert_eq!(
-        HistogramMetric::MetricHttpRequestLatencyMs.name(),
-        HistogramMetric::RequestLatencyMetric.name()
-    );
-
     // Then no customer-controlled value can create a new name or collide with a
     // sibling.
     let counter_names: Vec<_> = counters.into_iter().map(CounterMetric::name).collect();
@@ -686,7 +677,7 @@ fn given_all_metric_variants_when_names_are_registered_then_names_are_static_and
     // sibling.
     assert_eq!(counter_names.len(), 177);
     assert_eq!(gauge_names.len(), 24);
-    assert_eq!(histogram_names.len(), 38);
+    assert_eq!(histogram_names.len(), 37);
     for (names, expected_unique_names) in [
         (&counter_names, 177),
         (&gauge_names, 24),

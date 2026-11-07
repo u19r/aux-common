@@ -15,6 +15,8 @@ mod constants;
 mod fault_store;
 mod fault_suite;
 mod lifecycle_growth;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod lifecycle_growth_tests;
 mod model;
 mod recovery_fixture;
 mod recovery_store;

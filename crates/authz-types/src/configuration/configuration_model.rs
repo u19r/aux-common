@@ -485,6 +485,12 @@ impl ConfigurationModel {
                     });
                 }
             }
+            if provider.is_missing_audience_policy() {
+                errors.push(ValidationError::InvalidFormat {
+                    field: "authn_providers[].audiences",
+                    message: "audiences are required unless allow_any_audience is true".into(),
+                });
+            }
             if let Some(auds) = &provider.audiences
                 && auds.is_empty()
             {

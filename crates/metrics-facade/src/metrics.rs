@@ -605,7 +605,6 @@ pub enum HistogramMetric {
     MetricFederatedProvisionStageLatencyMs,
     LimitsExpirySweepDurationMs,
     LimitsTransitionDurationMs,
-    MetricHttpRequestLatencyMs,
     MetricOauthUserinfoFallbackLatencyMs,
     MetricQueueMessageDelayMs,
     MetricSamlAcsIssuerOrgResolutionLatencyMs,
@@ -666,9 +665,7 @@ impl HistogramMetric {
             }
             Self::LimitsExpirySweepDurationMs => "limits.expiry.sweep.duration.ms",
             Self::LimitsTransitionDurationMs => "limits.transition.duration.ms",
-            Self::MetricHttpRequestLatencyMs | Self::RequestLatencyMetric => {
-                "http.request.latency.ms"
-            }
+            Self::RequestLatencyMetric => "http.request.latency.ms",
             Self::MetricOauthUserinfoFallbackLatencyMs => {
                 "authn.oauth.userinfo_fallback_latency_ms"
             }

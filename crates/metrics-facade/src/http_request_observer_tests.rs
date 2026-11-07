@@ -144,10 +144,8 @@ fn given_http_client_with_metrics_observer_when_request_retries_once_and_succeed
         events,
         vec![
             "counter:http.request.attempts:method=GET|outcome=retry|status_class=5xx:1",
-            "histogram:http.request.latency.ms:method=GET|outcome=retry|status_class=5xx",
             "counter:http.request.retries:method=GET:1",
             "counter:http.request.attempts:method=GET|outcome=success|status_class=2xx:1",
-            "histogram:http.request.latency.ms:method=GET|outcome=success|status_class=2xx",
         ]
     );
 }
@@ -192,7 +190,6 @@ fn given_http_client_with_metrics_observer_when_transport_fails_then_error_count
         vec![
             "counter:http.request.errors:method=POST:1",
             "counter:http.request.attempts:method=POST|outcome=error|status_class=error:1",
-            "histogram:http.request.latency.ms:method=POST|outcome=error|status_class=error",
         ]
     );
 }

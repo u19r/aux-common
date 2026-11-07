@@ -447,6 +447,7 @@ fn given_empty_authn_provider_urls_when_validated_then_all_provider_boundaries_f
             jwks_uri: "https://issuer.example.test/jwks.json".into(),
             algorithms: Some(vec!["RS256".into()]),
             audiences: None,
+            allow_any_audience: true,
             subject_claim: "sub".into(),
             org_claim: None,
             cache_ttl_seconds: 300,
@@ -457,6 +458,7 @@ fn given_empty_authn_provider_urls_when_validated_then_all_provider_boundaries_f
         jwks_uri: String::new(),
         algorithms: Some(vec!["RS256".into()]),
         audiences: None,
+        allow_any_audience: true,
         subject_claim: String::new(),
         org_claim: Some(String::new()),
         cache_ttl_seconds: 0,
@@ -1292,6 +1294,7 @@ fn authn_providers_must_use_https_and_supported_algorithms() {
         jwks_uri: "https://issuer.example.test/jwks.json".into(),
         algorithms: Some(vec!["PS256".into()]),
         audiences: Some(Vec::new()),
+        allow_any_audience: false,
         subject_claim: "sub".into(),
         org_claim: None,
         cache_ttl_seconds: 300,
@@ -1334,6 +1337,7 @@ fn given_authn_provider_urls_with_whitespace_when_validating_then_https_fields_f
         jwks_uri: "https://issuer.example.test/\njwks.json".into(),
         algorithms: None,
         audiences: None,
+        allow_any_audience: true,
         subject_claim: "sub".into(),
         org_claim: None,
         cache_ttl_seconds: 300,
@@ -1367,6 +1371,7 @@ fn authn_provider_declared_bounds_are_enforced() {
         jwks_uri: format!("https://{}", "j".repeat(2048)),
         algorithms: Some((0..=6).map(|_| "RS256".to_string()).collect()),
         audiences: Some((0..=25).map(|_| "auxfn-api".to_string()).collect()),
+        allow_any_audience: false,
         subject_claim: " ".into(),
         org_claim: Some("o".repeat(59)),
         cache_ttl_seconds: 86_401,
@@ -1546,4 +1551,72 @@ fn base_model() -> ConfigurationModel {
 fn permanent_policy_spec() -> AccessAssignmentPolicySpec {
     AccessAssignmentPolicySpec::try_new(AccessAssignmentMode::PermanentOrTemporary, None)
         .expect("valid permanent-or-temporary policy")
+}
+
+fn provider_with_audience_policy(
+    audiences: Option<Vec<String>>,
+    allow_any_audience: bool,
+) -> AuthnProviderConfig {
+    AuthnProviderConfig {
+        issuer: "https://issuer.example.test".into(),
+        jwks_uri: "https://issuer.example.test/jwks.json".into(),
+        algorithms: Some(vec!["RS256".into()]),
+        audiences,
+        allow_any_audience,
+        subject_claim: "sub".into(),
+        org_claim: None,
+        cache_ttl_seconds: 300,
+    }
+}
+
+#[test]
+fn given_provider_without_audiences_when_not_opted_in_then_validation_rejects_it() {
+    // Given a provider with no audiences and no explicit opt-in.
+    let mut model = base_model();
+    model
+        .authn_providers
+        .push(provider_with_audience_policy(None, false));
+
+    // When the configuration is validated.
+    let errors = model.validate().expect_err("missing audience must fail");
+
+    // Then the audience requirement is reported.
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidFormat { field, message }
+            if *field == "authn_providers[].audiences"
+                && message.contains("allow_any_audience")
+    )));
+}
+
+#[test]
+fn given_provider_without_audiences_when_opted_in_then_validation_accepts_it() {
+    let mut model = base_model();
+    model
+        .authn_providers
+        .push(provider_with_audience_policy(None, true));
+
+    model.validate().expect("explicit opt-in is accepted");
+}
+
+#[test]
+fn given_provider_with_audiences_when_validated_then_flag_is_not_required() {
+    let mut model = base_model();
+    model
+        .authn_providers
+        .push(provider_with_audience_policy(Some(vec!["api".into()]), false));
+
+    model.validate().expect("configured audiences are accepted");
+}
+
+#[test]
+fn given_provider_json_without_flag_when_deserialized_then_allow_any_audience_is_false() {
+    let provider: AuthnProviderConfig = serde_json::from_value(serde_json::json!({
+        "issuer": "https://issuer.example.test",
+        "jwks_uri": "https://issuer.example.test/jwks.json"
+    }))
+    .expect("provider deserializes");
+
+    assert!(!provider.allow_any_audience);
+    assert!(provider.is_missing_audience_policy());
 }

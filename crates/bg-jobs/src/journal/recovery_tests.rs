@@ -48,7 +48,8 @@ fn reserve(engine: &crate::JobSystem<FakeStore>, index: u8, input: &StoreTransac
 }
 
 #[test]
-fn given_completed_witness_when_only_scan_budget_remains_then_recovery_acknowledges_without_writes() {
+fn given_completed_witness_when_only_scan_budget_remains_then_recovery_acknowledges_without_writes()
+{
     let store = FakeStore::new();
     let original = system(store.clone(), FairnessPolicy::low_volume(), 1);
     assert_eq!(

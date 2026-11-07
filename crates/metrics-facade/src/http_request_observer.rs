@@ -3,14 +3,13 @@ use std::sync::{Arc, OnceLock};
 use http_request::{HttpRequestAttempt, HttpRequestAttemptOutcome, HttpRequestObserver};
 
 use crate::{
-    CounterMetric, HistogramMetric,
+    CounterMetric,
     constants::{LABEL_HTTP_METHOD, LABEL_HTTP_OUTCOME, LABEL_HTTP_STATUS_CLASS},
-    counter, histogram,
+    counter,
 };
 
-/// Projects [`HttpRequestAttempt`] observations into [`CounterMetric`] and
-/// [`HistogramMetric`] handles without introducing a `http-request ->
-/// metrics-facade` dependency edge.
+/// Projects [`HttpRequestAttempt`] observations into [`CounterMetric`] handles
+/// without introducing a `http-request -> metrics-facade` dependency edge.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HttpRequestMetricsObserver;
 
@@ -40,14 +39,6 @@ impl HttpRequestMetricsObserver {
             LABEL_HTTP_STATUS_CLASS => status_label
         )
         .increment(1);
-
-        histogram!(
-            HistogramMetric::MetricHttpRequestLatencyMs,
-            LABEL_HTTP_METHOD => method,
-            LABEL_HTTP_OUTCOME => outcome,
-            LABEL_HTTP_STATUS_CLASS => status_label
-        )
-        .record(attempt.latency_ms());
 
         if attempt.is_retrying() {
             counter!(
