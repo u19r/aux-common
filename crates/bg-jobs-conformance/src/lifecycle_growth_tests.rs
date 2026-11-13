@@ -114,6 +114,8 @@ async fn assert_growth(store: GrowthFaultStore, deduplicated: bool) {
     let execution = GrowthExecution {
         system: &system,
         calls: &calls,
+        store: &store,
+        namespace: &namespace,
     };
     let workload = if deduplicated {
         GrowthWorkload::ExpiringDeduplication

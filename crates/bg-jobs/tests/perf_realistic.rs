@@ -593,7 +593,7 @@ fn repeat_legacy_validation(
                     .mutations()
                     .iter()
                     .filter_map(|mutation| match mutation {
-                        Mutation::Delete(_) => None,
+                        Mutation::Delete(_) | Mutation::ClearEffectReceipts(_) => None,
                         Mutation::Put(_, value) => Some(value.len()),
                     }),
             )

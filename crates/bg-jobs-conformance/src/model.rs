@@ -105,6 +105,7 @@ impl StoreModel {
                 Mutation::Delete(key) => {
                     next.remove(key);
                 }
+                Mutation::ClearEffectReceipts(group) => next.retain(|key, _| !group.contains(key)),
             }
         }
         self.entries = next;

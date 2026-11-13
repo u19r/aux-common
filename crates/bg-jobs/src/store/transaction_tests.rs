@@ -3,9 +3,15 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use bytes::Bytes;
 
 use super::{
-    Check, Mutation, StoreKey, StoreTransaction, StoreTransactionInput, TransactionLimits,
+    Check, EffectReceiptGroup, EffectReceiptKind, Mutation, StoreCapabilities,
+    StoreCapabilitiesInput, StoreKey, StoreLevel, StoreTransaction, StoreTransactionInput,
+    TransactionLimits,
 };
-use crate::{CommitOperationId, error::StoreContractError};
+use crate::{
+    CommitOperationId,
+    error::{StoreContractError, ValidationError},
+    ids::{ExecutionId, JobId, Namespace},
+};
 
 fn key(value: &'static [u8]) -> StoreKey {
     StoreKey::try_from(value).expect("fixture key is valid")
@@ -69,4 +75,107 @@ fn given_one_check_and_one_mutation_for_the_same_key_when_constructing_then_cas_
 
     assert_eq!(transaction.checks().len(), 1);
     assert_eq!(transaction.mutations().len(), 1);
+}
+
+fn group(execution: u8) -> EffectReceiptGroup {
+    EffectReceiptGroup::new(
+        &Namespace::try_new(b"ns").expect("test namespace is valid"),
+        JobId::from([1; 16]),
+        ExecutionId::from([execution; 16]),
+    )
+    .expect("test group is valid")
+}
+
+#[test]
+fn given_clear_and_put_inside_its_group_when_validating_then_transaction_is_rejected() {
+    let group = group(2);
+    let member = group
+        .member_key(EffectReceiptKind::Effect, &[1; 32])
+        .unwrap();
+    let error = transaction(
+        Vec::new(),
+        vec![
+            Mutation::ClearEffectReceipts(group),
+            Mutation::Put(member, Bytes::from_static(b"x")),
+        ],
+    )
+    .expect_err("a clear and a write in one group are contradictory");
+    assert!(matches!(
+        error,
+        StoreContractError::Validation(ValidationError::InvalidValue {
+            field: "effect receipt clear overlaps a mutation"
+        })
+    ));
+}
+
+#[test]
+fn given_clear_and_put_outside_its_group_when_validating_then_transaction_is_accepted() {
+    let other_member = group(3)
+        .member_key(EffectReceiptKind::Effect, &[1; 32])
+        .unwrap();
+    transaction(
+        Vec::new(),
+        vec![
+            Mutation::ClearEffectReceipts(group(2)),
+            Mutation::Put(other_member, Bytes::from_static(b"x")),
+        ],
+    )
+    .expect("another execution's group does not overlap");
+}
+
+#[test]
+fn given_two_clears_of_one_group_when_validating_then_duplicate_key_is_rejected() {
+    let error = transaction(
+        Vec::new(),
+        vec![
+            Mutation::ClearEffectReceipts(group(2)),
+            Mutation::ClearEffectReceipts(group(2)),
+        ],
+    )
+    .expect_err("one group is cleared once");
+    assert!(matches!(
+        error,
+        StoreContractError::DuplicateTransactionKey("mutations")
+    ));
+}
+
+#[test]
+fn given_clear_when_measuring_then_it_counts_one_mutation_and_prefix_bytes() {
+    let group = group(2);
+    let prefix_bytes = group.prefix().as_bytes().len();
+    let transaction = transaction(Vec::new(), vec![Mutation::ClearEffectReceipts(group)]).unwrap();
+    assert_eq!(transaction.mutations().len(), 1);
+    assert_eq!(transaction.encoded_bytes(), prefix_bytes);
+}
+
+#[test]
+fn given_capabilities_without_effect_receipt_groups_when_validating_clear_then_capability_is_exceeded()
+ {
+    let capabilities = StoreCapabilities::try_from(StoreCapabilitiesInput {
+        level: StoreLevel::Local,
+        max_key_bytes: NonZeroUsize::new(1_024).unwrap(),
+        max_value_bytes: NonZeroUsize::new(1_024).unwrap(),
+        max_get_many_keys: NonZeroU32::new(16).unwrap(),
+        max_get_many_key_bytes: NonZeroUsize::new(4_096).unwrap(),
+        max_transaction_bytes: NonZeroUsize::new(4_096).unwrap(),
+        max_transaction_keys: NonZeroU32::new(16).unwrap(),
+        max_range_items: NonZeroU32::new(16).unwrap(),
+        max_range_bytes: NonZeroUsize::new(4_096).unwrap(),
+        max_transaction_duration: std::time::Duration::from_secs(5),
+    })
+    .unwrap();
+    let transaction =
+        transaction(Vec::new(), vec![Mutation::ClearEffectReceipts(group(2))]).unwrap();
+    assert!(matches!(
+        capabilities.validate_transaction(&transaction),
+        Err(StoreContractError::CapabilityExceeded(
+            "effect receipt groups"
+        ))
+    ));
+    assert!(
+        capabilities
+            .with_effect_receipt_groups()
+            .validate_transaction(&transaction)
+            .is_ok()
+    );
 }

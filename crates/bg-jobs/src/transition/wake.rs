@@ -153,6 +153,6 @@ fn retain_wake_bound<E>(
                 .map(Some)
                 .map_err(Into::into)
         }
-        Some(Mutation::Delete(_)) | None => Ok(current_time),
+        Some(Mutation::Delete(_) | Mutation::ClearEffectReceipts(_)) | None => Ok(current_time),
     }
 }

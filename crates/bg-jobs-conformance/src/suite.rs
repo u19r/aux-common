@@ -4,10 +4,14 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use bg_jobs::store::{
-    Check, CommitOperationId, CommitOutcome, JobStore, Mutation, RangeDirection, RangePage,
-    RangeRequest, RangeRequestInput, StoreContractError, StoreKey, StoreTransaction,
-    StoreTransactionInput, TransactionLimits,
+use bg_jobs::{
+    ExecutionId, JobId, Namespace,
+    store::{
+        Check, CommitOperationId, CommitOutcome, EffectReceiptGroup, EffectReceiptKind, JobStore,
+        Mutation, RangeDirection, RangePage, RangeRequest, RangeRequestInput, StoreContractError,
+        StoreKey, StoreTransaction, StoreTransactionInput, TransactionLimits,
+    },
+    test_support::codec::KeyCodec,
 };
 use bytes::Bytes;
 
@@ -571,6 +575,170 @@ async fn basic_conditional_retries<S: JobStore>(
         values == vec![None, Some(Bytes::from_static(b"wrong"))],
         "native retry did not apply its exact mutations",
     )
+}
+
+/// Proves that one atomic `ClearEffectReceipts` mutation removes exactly one
+/// execution's receipt group, composes with an ordinary put, is a no-op on an
+/// empty group, and is discarded with the rest of a conflicting transaction.
+///
+/// The caller supplies a unique, empty namespace.
+pub async fn run_effect_receipt_clear<S: JobStore>(
+    store: &S,
+    namespace: &Namespace,
+) -> Result<ConformanceReport, ConformanceError<S::Error>> {
+    let job = JobId::from([1; 16]);
+    let g1 = receipt_group::<S>(namespace, job, ExecutionId::from([2; 16]))?;
+    let g2 = receipt_group::<S>(namespace, job, ExecutionId::from([3; 16]))?;
+    let g3 = receipt_group::<S>(namespace, JobId::from([4; 16]), ExecutionId::from([2; 16]))?;
+    let g1_members = [
+        receipt_member::<S>(&g1, EffectReceiptKind::Effect, 1)?,
+        receipt_member::<S>(&g1, EffectReceiptKind::Effect, 2)?,
+        receipt_member::<S>(&g1, EffectReceiptKind::TerminalProjection, 3)?,
+    ];
+    let g2_member = receipt_member::<S>(&g2, EffectReceiptKind::Effect, 1)?;
+    let g3_member = receipt_member::<S>(&g3, EffectReceiptKind::Effect, 1)?;
+    let job_key = KeyCodec::job(namespace, &job)
+        .map_err(|_| ConformanceError::Invalid("effect receipt job key"))?;
+    let all_keys = [
+        g1_members[0].clone(),
+        g1_members[1].clone(),
+        g1_members[2].clone(),
+        g2_member.clone(),
+        g3_member.clone(),
+        job_key.clone(),
+    ];
+    cleanup(store, &all_keys).await?;
+    let mut report = ConformanceReport::default();
+
+    let seed = transaction(
+        store,
+        vec![],
+        all_keys
+            .iter()
+            .map(|key| {
+                let value: &'static [u8] = if *key == job_key { b"row" } else { b"receipt" };
+                Mutation::Put(key.clone(), Bytes::from_static(value))
+            })
+            .collect(),
+    )?;
+    expect_committed(store, &seed, "effect receipt seed did not commit").await?;
+    report.commits += 1;
+
+    let clear_and_put = transaction(
+        store,
+        vec![],
+        vec![
+            Mutation::ClearEffectReceipts(g1.clone()),
+            Mutation::Put(job_key.clone(), Bytes::from_static(b"row2")),
+        ],
+    )?;
+    expect_committed(store, &clear_and_put, "effect receipt clear did not commit").await?;
+    report.commits += 1;
+
+    let values = store
+        .get_many(&[
+            g1_members[0].clone(),
+            g1_members[1].clone(),
+            g1_members[2].clone(),
+            g2_member.clone(),
+            g3_member.clone(),
+        ])
+        .await
+        .map_err(ConformanceError::Store)?;
+    report.get_many += 1;
+    for value in &values[..3] {
+        report = report.assertion(value.is_none(), "cleared receipt remained readable")?;
+    }
+    for value in &values[3..] {
+        report = report.assertion(value.is_some(), "clear removed another group's receipt")?;
+    }
+
+    let request = RangeRequest::try_from(RangeRequestInput {
+        start: Some(g1.prefix().clone()),
+        end: Some(g1.end().clone()),
+        direction: RangeDirection::Forward,
+        item_limit: NonZeroU32::MIN,
+        byte_limit: NonZeroUsize::new(1_024).unwrap_or(NonZeroUsize::MIN),
+        continuation: None,
+    })
+    .map_err(|_| ConformanceError::Invalid("effect receipt range request"))?;
+    let page = store
+        .read_range(request)
+        .await
+        .map_err(ConformanceError::Store)?;
+    report.ranges += 1;
+    report = report.assertion(page.entries.is_empty(), "cleared group range was not empty")?;
+
+    let empty_clear = transaction(store, vec![], vec![Mutation::ClearEffectReceipts(g1)])?;
+    let outcome = store
+        .transact(&empty_clear)
+        .await
+        .map_err(ConformanceError::Store)?;
+    report.commits += 1;
+    report = report.assertion(
+        outcome == CommitOutcome::Committed,
+        "clear of an empty group did not commit",
+    )?;
+
+    let conflicting = transaction(
+        store,
+        vec![Check::Value(job_key, Bytes::from_static(b"wrong"))],
+        vec![Mutation::ClearEffectReceipts(g2)],
+    )?;
+    let outcome = store
+        .transact(&conflicting)
+        .await
+        .map_err(ConformanceError::Store)?;
+    report.commits += 1;
+    report.conflicts += 1;
+    report = report.assertion(
+        outcome == CommitOutcome::Conflict,
+        "conflicting clear did not conflict",
+    )?;
+    let survivor = store
+        .get(g2_member)
+        .await
+        .map_err(ConformanceError::Store)?;
+    report.reads += 1;
+    report = report.assertion(survivor.is_some(), "conflicting clear removed receipts")?;
+
+    cleanup(store, &all_keys).await?;
+    Ok(report)
+}
+
+fn receipt_member<S: JobStore>(
+    group: &EffectReceiptGroup,
+    kind: EffectReceiptKind,
+    digest: u8,
+) -> Result<StoreKey, ConformanceError<S::Error>> {
+    group
+        .member_key(kind, &[digest; 32])
+        .map_err(|_| ConformanceError::Invalid("effect receipt member key"))
+}
+
+fn receipt_group<S: JobStore>(
+    namespace: &Namespace,
+    job: JobId,
+    execution: ExecutionId,
+) -> Result<EffectReceiptGroup, ConformanceError<S::Error>> {
+    EffectReceiptGroup::new(namespace, job, execution)
+        .map_err(|_| ConformanceError::Invalid("effect receipt group"))
+}
+
+async fn expect_committed<S: JobStore>(
+    store: &S,
+    transaction: &StoreTransaction,
+    message: &'static str,
+) -> Result<(), ConformanceError<S::Error>> {
+    let outcome = store
+        .transact(transaction)
+        .await
+        .map_err(ConformanceError::Store)?;
+    if outcome == CommitOutcome::Committed {
+        Ok(())
+    } else {
+        Err(ConformanceError::Invalid(message))
+    }
 }
 
 /// Runs the basic contract against an operation-counting wrapper and returns

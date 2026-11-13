@@ -703,3 +703,98 @@ fn given_renewal_loss_when_completing_with_old_time_then_authority_cannot_be_reu
     ));
     assert_eq!(store.snapshot().expect("snapshot succeeds"), before);
 }
+
+/// Writes two `Effect` members and one `TerminalProjection` member into the
+/// group of `job_id`/`execution_id`, and returns their keys.
+fn put_receipts(
+    store: &FakeStore,
+    namespace: &Namespace,
+    job_id: JobId,
+    execution_id: ExecutionId,
+) -> Vec<StoreKey> {
+    use crate::store::{EffectReceiptGroup, EffectReceiptKind};
+    let group =
+        EffectReceiptGroup::new(namespace, job_id, execution_id).expect("receipt group is valid");
+    let keys: Vec<StoreKey> = [
+        (EffectReceiptKind::Effect, 1),
+        (EffectReceiptKind::Effect, 2),
+        (EffectReceiptKind::TerminalProjection, 3),
+    ]
+    .into_iter()
+    .map(|(kind, digest)| group.member_key(kind, &[digest; 32]).expect("member key"))
+    .collect();
+    for key in &keys {
+        store
+            .put_raw(key.clone(), Bytes::from_static(b"receipt"))
+            .expect("receipt writes");
+    }
+    keys
+}
+
+fn execution_of(claim: &ClaimedJob) -> ExecutionId {
+    claim.record().execution_id
+}
+
+fn capabilities_without_groups() -> StoreCapabilities {
+    StoreCapabilities::try_from(crate::store::StoreCapabilitiesInput {
+        level: crate::store::StoreLevel::Local,
+        max_key_bytes: std::num::NonZeroUsize::new(4_096).unwrap(),
+        max_value_bytes: std::num::NonZeroUsize::new(1_048_576).unwrap(),
+        max_get_many_keys: std::num::NonZeroU32::new(1_024).unwrap(),
+        max_get_many_key_bytes: std::num::NonZeroUsize::new(2 * 1_048_576).unwrap(),
+        max_transaction_bytes: std::num::NonZeroUsize::new(2 * 1_048_576).unwrap(),
+        max_transaction_keys: std::num::NonZeroU32::new(1_024).unwrap(),
+        max_range_items: std::num::NonZeroU32::new(1_024).unwrap(),
+        max_range_bytes: std::num::NonZeroUsize::new(2 * 1_048_576).unwrap(),
+        max_transaction_duration: std::time::Duration::from_secs(5),
+    })
+    .expect("capabilities are valid")
+}
+
+#[test]
+fn given_completed_job_with_effect_receipts_when_completion_commits_then_only_its_group_is_cleared()
+{
+    let store = FakeStore::new();
+    let engine = system(store.clone(), FairnessPolicy::low_volume(), 1);
+    let id = JobId::from([1; 16]);
+    block_on(engine.enqueue_raw(low_volume_job(1, Timestamp::ZERO), Timestamp::ZERO))
+        .expect("enqueue commits");
+    let claim = block_on(engine.claim(id, Timestamp::ZERO)).expect("claim commits");
+    let own = put_receipts(&store, engine.namespace(), id, execution_of(&claim));
+    let other = put_receipts(
+        &store,
+        engine.namespace(),
+        JobId::from([2; 16]),
+        ExecutionId::from([2; 16]),
+    );
+    block_on(engine.complete(claim, completion(), Timestamp::from_millis(1)))
+        .expect("completion commits");
+
+    for key in &own {
+        assert!(!store.contains(key).unwrap());
+    }
+    for key in &other {
+        assert!(store.contains(key).unwrap());
+    }
+    let job_key = crate::keys::job_key(engine.namespace(), &id).expect("job key is valid");
+    assert!(!store.contains(&job_key).unwrap());
+}
+
+#[test]
+fn given_store_without_effect_receipt_groups_when_completing_then_receipts_remain() {
+    let store = FakeStore::with_capabilities(capabilities_without_groups());
+    let engine = system(store.clone(), FairnessPolicy::low_volume(), 1);
+    let id = JobId::from([1; 16]);
+    block_on(engine.enqueue_raw(low_volume_job(1, Timestamp::ZERO), Timestamp::ZERO))
+        .expect("enqueue commits");
+    let claim = block_on(engine.claim(id, Timestamp::ZERO)).expect("claim commits");
+    let own = put_receipts(&store, engine.namespace(), id, execution_of(&claim));
+    block_on(engine.complete(claim, completion(), Timestamp::from_millis(1)))
+        .expect("completion commits without a clear");
+
+    for key in &own {
+        assert!(store.contains(key).unwrap());
+    }
+    let job_key = crate::keys::job_key(engine.namespace(), &id).expect("job key is valid");
+    assert!(!store.contains(&job_key).unwrap());
+}

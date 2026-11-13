@@ -42,7 +42,9 @@ impl CatalogTransition {
             .iter()
             .find_map(|mutation| match mutation {
                 Mutation::Put(key, value) if key == catalog.key() => Some(value),
-                Mutation::Put(_, _) | Mutation::Delete(_) => None,
+                Mutation::Put(_, _) | Mutation::Delete(_) | Mutation::ClearEffectReceipts(_) => {
+                    None
+                }
             })
             .ok_or(JobSystemError::PayloadCorrupt)?;
         Ok(Self::Configure(CatalogLedger::decode(next)?.manifest))

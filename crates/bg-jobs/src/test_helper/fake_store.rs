@@ -108,7 +108,7 @@ impl FakeStore {
             max_transaction_duration: std::time::Duration::from_secs(5),
         });
         match capabilities {
-            Ok(value) => Self::with_capabilities(value),
+            Ok(value) => Self::with_capabilities(value.with_effect_receipt_groups()),
             Err(_) => unreachable!("default fake-store capabilities are valid"),
         }
     }
@@ -361,6 +361,7 @@ fn apply_mutations(entries: &mut BTreeMap<StoreKey, Bytes>, mutations: &[Mutatio
             Mutation::Delete(key) => {
                 entries.remove(key);
             }
+            Mutation::ClearEffectReceipts(group) => entries.retain(|key, _| !group.contains(key)),
         }
     }
 }

@@ -1602,9 +1602,10 @@ fn given_provider_without_audiences_when_opted_in_then_validation_accepts_it() {
 #[test]
 fn given_provider_with_audiences_when_validated_then_flag_is_not_required() {
     let mut model = base_model();
-    model
-        .authn_providers
-        .push(provider_with_audience_policy(Some(vec!["api".into()]), false));
+    model.authn_providers.push(provider_with_audience_policy(
+        Some(vec!["api".into()]),
+        false,
+    ));
 
     model.validate().expect("configured audiences are accepted");
 }

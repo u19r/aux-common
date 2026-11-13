@@ -6,7 +6,7 @@ use crate::{
     keys,
     lifecycle::validate_persisted_identity,
     model::{JobState, JobTerminalAuthority},
-    store::JobStore,
+    store::{EffectReceiptGroup, JobStore},
 };
 
 impl<S: JobStore> JobSystem<S> {
@@ -36,12 +36,14 @@ impl<S: JobStore> JobSystem<S> {
                 encoded_job.clone(),
                 JobState::DeadLettered,
                 record.attempts.and_then(|attempts| attempts.last_outcome),
+                EffectReceiptGroup::new(self.namespace(), record.job_id, record.execution_id)?,
             ))),
             JobState::Cancelled => Ok(Some(JobTerminalAuthority::from_terminal_record(
                 observation_keys,
                 encoded_job.clone(),
                 JobState::Cancelled,
                 None,
+                EffectReceiptGroup::new(self.namespace(), record.job_id, record.execution_id)?,
             ))),
             JobState::Scheduled | JobState::Leased(_) | JobState::Suspended => Ok(None),
         }

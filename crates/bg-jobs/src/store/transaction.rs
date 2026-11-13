@@ -5,7 +5,11 @@ use std::{
 
 use bytes::Bytes;
 
-use crate::{error::StoreContractError, ids::CommitOperationId, store::StoreKey};
+use crate::{
+    error::{StoreContractError, ValidationError},
+    ids::CommitOperationId,
+    store::{EffectReceiptGroup, StoreKey},
+};
 
 /// A conditional value check evaluated atomically by a store.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,12 +39,15 @@ impl Check {
 pub enum Mutation {
     Put(StoreKey, Bytes),
     Delete(StoreKey),
+    /// Removes every key of one execution's effect receipt group.
+    ClearEffectReceipts(EffectReceiptGroup),
 }
 
 impl Mutation {
     pub fn key(&self) -> &StoreKey {
         match self {
             Self::Put(key, _) | Self::Delete(key) => key,
+            Self::ClearEffectReceipts(group) => group.prefix(),
         }
     }
 
@@ -48,7 +55,7 @@ impl Mutation {
         self.key().as_bytes().len()
             + match self {
                 Self::Put(_, value) => value.len(),
-                Self::Delete(_) => 0,
+                Self::Delete(_) | Self::ClearEffectReceipts(_) => 0,
             }
     }
 }
@@ -185,6 +192,7 @@ fn validate_counts(input: &StoreTransactionInput) -> Result<(), StoreContractErr
     }
     validate_unique_keys(&input.checks, Check::key, "checks")?;
     validate_unique_keys(&input.mutations, Mutation::key, "mutations")?;
+    validate_effect_receipt_clears(&input.mutations)?;
     Ok(())
 }
 
@@ -200,6 +208,26 @@ fn validate_unique_keys<T>(
     Ok(())
 }
 
+fn validate_effect_receipt_clears(mutations: &[Mutation]) -> Result<(), StoreContractError> {
+    for group in mutations.iter().filter_map(|mutation| match mutation {
+        Mutation::ClearEffectReceipts(group) => Some(group),
+        Mutation::Put(_, _) | Mutation::Delete(_) => None,
+    }) {
+        let overlaps = mutations.iter().any(|mutation| match mutation {
+            Mutation::Put(key, _) | Mutation::Delete(key) => group.contains(key),
+            Mutation::ClearEffectReceipts(_) => false,
+        });
+        if overlaps {
+            return Err(StoreContractError::Validation(
+                ValidationError::InvalidValue {
+                    field: "effect receipt clear overlaps a mutation",
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_binding_lengths(input: &StoreTransactionInput) -> Result<(), StoreContractError> {
     let lengths = input
         .checks
@@ -211,6 +239,7 @@ fn validate_binding_lengths(input: &StoreTransactionInput) -> Result<(), StoreCo
         .chain(input.mutations.iter().flat_map(|mutation| match mutation {
             Mutation::Put(key, value) => [key.as_bytes().len(), value.len()],
             Mutation::Delete(key) => [key.as_bytes().len(), 0],
+            Mutation::ClearEffectReceipts(group) => [group.namespace().as_bytes().len(), 0],
         }));
     if lengths
         .into_iter()
@@ -260,7 +289,7 @@ fn max_value_bytes(input: &StoreTransactionInput) -> usize {
                 .mutations
                 .iter()
                 .filter_map(|mutation| match mutation {
-                    Mutation::Delete(_) => None,
+                    Mutation::Delete(_) | Mutation::ClearEffectReceipts(_) => None,
                     Mutation::Put(_, value) => Some(value.len()),
                 }),
         )

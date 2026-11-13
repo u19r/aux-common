@@ -114,3 +114,50 @@ fn given_redriven_job_when_stale_terminal_settlement_arrives_then_live_payload_a
     assert_eq!(crate::test_helper::application_snapshot(&store), before);
     block_on(engine.claim(id, Timestamp::ZERO)).unwrap();
 }
+
+#[test]
+fn given_dead_lettered_job_with_receipts_when_dead_lettered_then_receipts_remain_and_when_retired_then_group_is_cleared()
+ {
+    use crate::store::{EffectReceiptGroup, EffectReceiptKind};
+    let store = FakeStore::distributed();
+    let engine = system(store.clone(), FairnessPolicy::low_volume(), 1);
+    let id = JobId::from([1; 16]);
+    block_on(engine.enqueue_raw(low_volume_job(1, Timestamp::ZERO), Timestamp::ZERO)).unwrap();
+    let claim = block_on(engine.claim(id, Timestamp::ZERO)).unwrap();
+    let group =
+        EffectReceiptGroup::new(engine.namespace(), id, claim.record().execution_id).unwrap();
+    let members: Vec<_> = [
+        (EffectReceiptKind::Effect, 1),
+        (EffectReceiptKind::Effect, 2),
+        (EffectReceiptKind::TerminalProjection, 3),
+    ]
+    .into_iter()
+    .map(|(kind, digest)| group.member_key(kind, &[digest; 32]).unwrap())
+    .collect();
+    for member in &members {
+        store
+            .put_raw(member.clone(), Bytes::from_static(b"receipt"))
+            .unwrap();
+    }
+
+    block_on(engine.apply_outcome(
+        claim,
+        JobOutcome::DeadLetter {
+            code: OutcomeCode::try_new("failed").unwrap(),
+        },
+        Timestamp::ZERO,
+    ))
+    .unwrap();
+    for member in &members {
+        assert!(
+            store.contains(member).unwrap(),
+            "a dead letter keeps its receipts for redrive"
+        );
+    }
+
+    let authority = block_on(engine.terminal_authority(id)).unwrap().unwrap();
+    block_on(engine.settle_terminal(authority)).unwrap();
+    for member in &members {
+        assert!(!store.contains(member).unwrap());
+    }
+}

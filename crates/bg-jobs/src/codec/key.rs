@@ -26,6 +26,7 @@ pub enum KeyTag {
     CommitInput = b'K',
     Fence = b'H',
     Catalog = b'A',
+    EffectReceipt = b'Y',
 }
 
 impl KeyTag {
@@ -52,6 +53,7 @@ impl KeyTag {
             b'K' => Self::CommitInput,
             b'H' => Self::Fence,
             b'A' => Self::Catalog,
+            b'Y' => Self::EffectReceipt,
             other => return Err(StoreDataError::UnknownTag(other)),
         };
         Ok(tag)

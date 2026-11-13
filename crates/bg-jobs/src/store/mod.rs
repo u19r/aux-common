@@ -11,6 +11,9 @@ mod binding_tests;
 mod capabilities;
 mod constants;
 mod contract;
+mod effect_receipt;
+#[cfg(test)]
+mod effect_receipt_tests;
 mod encoding;
 #[cfg(test)]
 mod encoding_tests;
@@ -25,6 +28,8 @@ mod capabilities_tests;
 
 pub use capabilities::{StoreCapabilities, StoreCapabilitiesInput, StoreLevel};
 pub use contract::{CommitOutcome, JobStore};
+pub(crate) use effect_receipt::member_key as effect_receipt_member_key;
+pub use effect_receipt::{EffectReceiptGroup, EffectReceiptKind};
 pub use key::StoreKey;
 pub use range::{RangeDirection, RangeEntry, RangePage, RangeRequest, RangeRequestInput};
 pub use transaction::{

@@ -299,3 +299,81 @@ fn given_a_dead_letter_with_a_foreign_payload_chunk_when_redriving_then_payload_
         "payload identity rejection must not resurrect or rewrite the dead letter"
     );
 }
+
+fn put_receipts(
+    store: &FakeStore,
+    namespace: &Namespace,
+    id: JobId,
+    execution: ExecutionId,
+) -> Vec<crate::store::StoreKey> {
+    use crate::store::{EffectReceiptGroup, EffectReceiptKind};
+    let group = EffectReceiptGroup::new(namespace, id, execution).expect("group is valid");
+    let keys: Vec<_> = [
+        (EffectReceiptKind::Effect, 1),
+        (EffectReceiptKind::Effect, 2),
+        (EffectReceiptKind::TerminalProjection, 3),
+    ]
+    .into_iter()
+    .map(|(kind, digest)| group.member_key(kind, &[digest; 32]).expect("member key"))
+    .collect();
+    for key in &keys {
+        store
+            .put_raw(key.clone(), bytes::Bytes::from_static(b"receipt"))
+            .expect("receipt writes");
+    }
+    keys
+}
+
+#[test]
+fn given_dead_lettered_job_with_receipts_when_redriven_with_new_execution_then_old_group_is_cleared()
+ {
+    use crate::store::{EffectReceiptGroup, EffectReceiptKind};
+    let store = FakeStore::new();
+    let system = system(store.clone(), FairnessPolicy::low_volume(), 1);
+    let (id, execution, revision, operation) = dead_lettered(&system, 5);
+    let old = put_receipts(&store, system.namespace(), id, execution);
+    let result = block_on(system.redrive_job(
+        id,
+        RedriveRequest::new(
+            revision,
+            operation,
+            RedriveExecution::NewExecutionId,
+            Timestamp::from_millis(10),
+        ),
+    ))
+    .expect("redrive commits");
+    assert_ne!(result.execution_id, execution);
+    for key in &old {
+        assert!(!store.contains(key).unwrap());
+    }
+    let new_member = EffectReceiptGroup::new(system.namespace(), id, result.execution_id)
+        .expect("new group is valid")
+        .member_key(EffectReceiptKind::Effect, &[9; 32])
+        .expect("member key");
+    store
+        .put_raw(new_member.clone(), bytes::Bytes::from_static(b"receipt"))
+        .expect("receipt writes");
+    assert!(store.contains(&new_member).unwrap());
+}
+
+#[test]
+fn given_dead_lettered_job_with_receipts_when_redriven_reusing_execution_then_receipts_remain() {
+    let store = FakeStore::new();
+    let system = system(store.clone(), FairnessPolicy::low_volume(), 1);
+    let (id, execution, revision, operation) = dead_lettered(&system, 6);
+    let members = put_receipts(&store, system.namespace(), id, execution);
+    let result = block_on(system.redrive_job(
+        id,
+        RedriveRequest::new(
+            revision,
+            operation,
+            RedriveExecution::ReuseExecutionId,
+            Timestamp::from_millis(10),
+        ),
+    ))
+    .expect("redrive commits");
+    assert_eq!(result.execution_id, execution);
+    for key in &members {
+        assert!(store.contains(key).unwrap());
+    }
+}

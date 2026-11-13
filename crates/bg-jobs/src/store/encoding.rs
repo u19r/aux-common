@@ -4,10 +4,14 @@
 use bytes::Bytes;
 
 use super::{
-    Check, CommitOperationId, Mutation, StoreCapabilities, StoreKey, StoreTransaction,
-    StoreTransactionInput, TransactionLimits, constants::TRANSACTION_BINDING_VERSION,
+    Check, CommitOperationId, EffectReceiptGroup, Mutation, StoreCapabilities, StoreKey,
+    StoreTransaction, StoreTransactionInput, TransactionLimits,
+    constants::TRANSACTION_BINDING_VERSION,
 };
-use crate::error::StoreDataError;
+use crate::{
+    error::StoreDataError,
+    ids::{ExecutionId, JobId, Namespace},
+};
 
 impl StoreTransaction {
     pub(crate) fn encode_intent(&self) -> Bytes {
@@ -127,13 +131,24 @@ impl<'a> IntentReader<'a> {
         let mut mutations = Vec::with_capacity(count);
         for _ in 0..count {
             let tag = self.take(1)?[0];
-            let key = self.read_key()?;
             mutations.push(match tag {
-                2 => Mutation::Put(key, self.read_value()?),
-                3 => Mutation::Delete(key),
+                2 => {
+                    let key = self.read_key()?;
+                    Mutation::Put(key, self.read_value()?)
+                }
+                3 => Mutation::Delete(self.read_key()?),
+                4 => Mutation::ClearEffectReceipts(self.read_effect_receipt_group()?),
                 _ => return Err(StoreDataError::Malformed("commit intent mutation tag")),
             });
         }
         Ok(mutations)
+    }
+
+    fn read_effect_receipt_group(&mut self) -> Result<EffectReceiptGroup, StoreDataError> {
+        let length = self.read_u32()? as usize;
+        let namespace = Namespace::try_new(self.take(length)?)?;
+        let job_id = JobId::try_from_slice(self.take(16)?)?;
+        let execution_id = ExecutionId::try_from_slice(self.take(16)?)?;
+        EffectReceiptGroup::new(&namespace, job_id, execution_id)
     }
 }

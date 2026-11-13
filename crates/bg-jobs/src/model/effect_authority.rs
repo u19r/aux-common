@@ -5,7 +5,9 @@ use crate::{
     ids::{ExecutionId, JobId, LeaseToken, Namespace, OwnerId},
     keys,
     model::{ExecutionContext, JobState},
-    store::{StoreDataError, StoreKey},
+    store::{
+        EffectReceiptGroup, EffectReceiptKind, StoreDataError, StoreKey, effect_receipt_member_key,
+    },
     time::Timestamp,
 };
 
@@ -79,6 +81,25 @@ impl JobEffectAuthority {
             .extend_from_slice(&(self.observation_keys[0].as_bytes().len() as u64).to_be_bytes());
         identity.extend_from_slice(self.observation_keys[0].as_bytes());
         identity.extend_from_slice(self.execution_id.as_bytes());
+    }
+
+    /// The receipt key of an effect identified by `digest` (sha256 of the
+    /// caller's idempotency token). The key lives in this execution's group,
+    /// so it is removed when the job row is deleted or redriven with a new
+    /// execution id.
+    pub fn receipt_key(&self, digest: &[u8; 32]) -> Result<StoreKey, StoreDataError> {
+        effect_receipt_member_key(
+            &self.namespace,
+            &self.job_id,
+            &self.execution_id,
+            EffectReceiptKind::Effect,
+            digest,
+        )
+    }
+
+    /// This execution's receipt group, for diagnostics and tests.
+    pub fn receipt_group(&self) -> Result<EffectReceiptGroup, StoreDataError> {
+        EffectReceiptGroup::new(&self.namespace, self.job_id, self.execution_id)
     }
 }
 

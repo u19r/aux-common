@@ -29,7 +29,8 @@ pub use fault_store::{
 };
 pub use fault_suite::run_faults;
 pub use lifecycle_growth::{
-    LifecycleGrowthReport, RetainedJobStorage, run_deduplication_growth, run_lifecycle_growth,
+    LifecycleGrowthReport, RetainedJobStorage, run_deduplication_growth, run_effect_receipt_growth,
+    run_lifecycle_growth,
 };
 pub use model::{
     RepairAction, RepairBudget, RepairEntry, RepairPlan, RepairReason, StoreModel, StoreModelError,
@@ -37,7 +38,7 @@ pub use model::{
 pub use recovery_suite::{RecoveryReport, run_recovery};
 pub use suite::{
     ConformanceConfig, ConformanceConfigError, ConformanceError, ConformanceReport,
-    OperationProfile, run_basic, run_operation_profile,
+    OperationProfile, run_basic, run_effect_receipt_clear, run_operation_profile,
 };
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

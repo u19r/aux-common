@@ -23,7 +23,7 @@ use bg_jobs::{
 use bg_jobs_conformance::{
     CommitFaultKind, ConformanceConfig, ConformanceConfigError, ConformanceError, FaultOperation,
     FaultStore, FaultStoreError, ReadFaultKind, RepairBudget, RepairEntry, RepairReason,
-    StoreModel, run_basic, run_faults, run_operation_profile,
+    StoreModel, run_basic, run_effect_receipt_clear, run_faults, run_operation_profile,
 };
 use bytes::Bytes;
 
@@ -40,6 +40,17 @@ fn given_empty_prefix_when_constructing_conformance_config_then_rejected_before_
             .expect("a non-empty prefix creates a validated configuration");
     let store = FakeStore::local();
     block_on(run_basic(&store, &config)).expect("validated configuration should run");
+}
+
+#[test]
+fn given_fake_store_when_running_effect_receipt_clear_then_only_its_group_is_removed() {
+    let store = FakeStore::distributed();
+    let namespace = bg_jobs::Namespace::try_new(b"effect-receipt-clear").expect("namespace");
+    let report = block_on(run_effect_receipt_clear(&store, &namespace))
+        .expect("effect receipt clear conformance should pass");
+    assert_eq!(report.assertions, 9);
+    assert_eq!(report.conflicts, 1);
+    assert_eq!(report.unknowns, 0);
 }
 
 #[test]

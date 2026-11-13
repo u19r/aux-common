@@ -47,6 +47,7 @@ impl<S: JobStore> JobSystem<S> {
                 continue;
             }
             let kind = match mutation {
+                Mutation::ClearEffectReceipts(_) => continue,
                 Mutation::Delete(_) => TerminalEffectKind::Completed,
                 Mutation::Put(_, value) => match decode_job_record(value)?.state {
                     JobState::Cancelled => TerminalEffectKind::Cancelled,

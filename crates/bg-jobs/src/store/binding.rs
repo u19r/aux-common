@@ -9,9 +9,11 @@ impl StoreTransaction {
     ///
     /// Each collection starts with its unsigned 32-bit big-endian count.
     /// Each entry starts with its tag: absent check 0, value check 1, put 2,
-    /// or delete 3. Each key and value starts with its unsigned 32-bit
-    /// big-endian byte length. Version 2 preserves the remote adapter's
-    /// persisted binding. Construction validates these encoding bounds.
+    /// delete 3, or effect receipt clear 4. Each key and value starts with
+    /// its unsigned 32-bit big-endian byte length. A clear is its namespace
+    /// (length-prefixed), then the 16-byte job id and the 16-byte execution
+    /// id. Version 3 added tag 4. Construction validates these encoding
+    /// bounds.
     ///
     /// Operation IDs and caller limits are excluded: neither changes the
     /// transaction's effects. The digest permits compact reuse detection
@@ -55,6 +57,12 @@ fn write_mutations(write: &mut impl FnMut(&[u8]), mutations: &[Mutation]) {
             Mutation::Delete(key) => {
                 write(&[3]);
                 write_bytes(write, key.as_bytes());
+            }
+            Mutation::ClearEffectReceipts(group) => {
+                write(&[4]);
+                write_bytes(write, group.namespace().as_bytes());
+                write(group.job_id().as_bytes());
+                write(group.execution_id().as_bytes());
             }
         }
     }

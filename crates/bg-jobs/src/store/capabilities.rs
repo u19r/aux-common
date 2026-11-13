@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     error::{StoreContractError, ValidationError},
-    store::{RangeRequest, StoreKey, StoreTransaction},
+    store::{Mutation, RangeRequest, StoreKey, StoreTransaction},
 };
 
 /// Whether a store can safely be used by one process or multiple nodes.
@@ -28,6 +28,7 @@ pub struct StoreCapabilities {
     max_range_items: NonZeroU32,
     max_range_bytes: NonZeroUsize,
     max_transaction_duration: Duration,
+    effect_receipt_groups: bool,
 }
 
 /// Inputs for constructing backend capabilities.
@@ -77,6 +78,7 @@ impl TryFrom<StoreCapabilitiesInput> for StoreCapabilities {
             max_range_items: input.max_range_items,
             max_range_bytes: input.max_range_bytes,
             max_transaction_duration: input.max_transaction_duration,
+            effect_receipt_groups: false,
         })
     }
 }
@@ -99,6 +101,16 @@ impl StoreCapabilities {
         }
         if transaction.max_value_bytes() > self.max_value_bytes.get() {
             return Err(StoreContractError::CapabilityExceeded("value bytes"));
+        }
+        if !self.effect_receipt_groups
+            && transaction
+                .mutations()
+                .iter()
+                .any(|mutation| matches!(mutation, Mutation::ClearEffectReceipts(_)))
+        {
+            return Err(StoreContractError::CapabilityExceeded(
+                "effect receipt groups",
+            ));
         }
         Ok(())
     }
@@ -191,5 +203,17 @@ impl StoreCapabilities {
 
     pub const fn max_transaction_duration(self) -> Duration {
         self.max_transaction_duration
+    }
+
+    /// The store applies `Mutation::ClearEffectReceipts` as one atomic range
+    /// removal in the same native transaction.
+    #[must_use]
+    pub const fn with_effect_receipt_groups(mut self) -> Self {
+        self.effect_receipt_groups = true;
+        self
+    }
+
+    pub const fn effect_receipt_groups(self) -> bool {
+        self.effect_receipt_groups
     }
 }

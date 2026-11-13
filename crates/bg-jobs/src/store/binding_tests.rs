@@ -3,9 +3,10 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use bytes::Bytes;
 
 use super::{
-    Check, CommitOperationId, Mutation, StoreKey, StoreTransaction, StoreTransactionInput,
-    TransactionLimits,
+    Check, CommitOperationId, EffectReceiptGroup, Mutation, StoreKey, StoreTransaction,
+    StoreTransactionInput, TransactionLimits,
 };
+use crate::ids::{ExecutionId, JobId, Namespace};
 
 fn input() -> StoreTransactionInput {
     StoreTransactionInput {
@@ -35,7 +36,7 @@ fn binding(input: StoreTransactionInput) -> [u8; 32] {
 }
 
 #[test]
-fn given_all_entry_tags_when_binding_then_the_independent_version_two_vector_matches() {
+fn given_all_entry_tags_when_binding_then_the_independent_version_three_vector_matches() {
     // Vector computed independently from the documented byte grammar with
     // Python hashlib.sha256, rather than another Rust encoder.
     let actual: String = binding(input())
@@ -44,7 +45,31 @@ fn given_all_entry_tags_when_binding_then_the_independent_version_two_vector_mat
         .collect();
     assert_eq!(
         actual,
-        "9bb04f64bae3375778b934d48cf6e35d371ac2f5e9284e0692e3322bf798db0b"
+        "8c37a55c89d14effd0aa9f43f0c1b10a974a0c365248c51aeb29a414c78289ab"
+    );
+}
+
+#[test]
+fn given_effect_receipt_clear_when_binding_then_the_independent_vector_matches() {
+    // Vector computed independently with Python hashlib.sha256 from the
+    // documented byte grammar (second hash printed by the C5-E script).
+    let mut request = input();
+    request.checks = Vec::new();
+    request.mutations = vec![Mutation::ClearEffectReceipts(
+        EffectReceiptGroup::new(
+            &Namespace::try_new(b"ns").unwrap(),
+            JobId::from([1; 16]),
+            ExecutionId::from([2; 16]),
+        )
+        .unwrap(),
+    )];
+    let actual: String = binding(request)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        actual,
+        "2900dd6ddb2e0a9bf4986df155d01255c13989b0c8d404191378e587be326073"
     );
 }
 

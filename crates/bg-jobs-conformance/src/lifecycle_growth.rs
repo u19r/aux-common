@@ -13,7 +13,10 @@ use bg_jobs::{
     DriveBudget, JobId, JobState, JobSystemError, LifecycleObservation, Namespace, QueueSelection,
     Timestamp,
     runtime::{JobSystem, MonotonicDeadline, ScheduleCursor, ScheduleOccurrence},
-    store::{JobStore, RangeDirection, RangeRequest, RangeRequestInput, StoreKey},
+    store::{
+        CommitOutcome, EffectReceiptGroup, EffectReceiptKind, JobStore, RangeDirection,
+        RangeRequest, RangeRequestInput, StoreKey,
+    },
     test_support::codec::{KeyCodec, KeyTag},
 };
 
@@ -21,6 +24,7 @@ use crate::{
     ConformanceError, CountingStore,
     constants::GROWTH_RESOLUTION_ATTEMPTS,
     recovery_fixture::{recovery_job, recovery_schedule, recovery_system},
+    suite::put_transaction,
 };
 
 type GrowthResult<T, E> = Result<T, ConformanceError<JobSystemError<E>>>;
@@ -68,9 +72,26 @@ pub async fn run_deduplication_growth<S: JobStore + Clone>(
     .await
 }
 
+/// Runs equal batches of completed recurring jobs that each wrote an effect
+/// receipt in their execution group. Completion must leave no `'Y'` key.
+pub async fn run_effect_receipt_growth<S: JobStore + Clone>(
+    store: S,
+    namespace: Namespace,
+    batch_size: NonZeroU32,
+) -> GrowthResult<LifecycleGrowthReport, S::Error> {
+    run_growth(
+        store,
+        namespace,
+        batch_size,
+        GrowthWorkload::RecurringWithEffectReceipts,
+    )
+    .await
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum GrowthWorkload {
     Recurring,
+    RecurringWithEffectReceipts,
     ExpiringDeduplication,
 }
 
@@ -87,6 +108,8 @@ async fn run_growth<S: JobStore + Clone>(
     let execution = GrowthExecution {
         system: &system,
         calls: &calls,
+        store: &counted,
+        namespace: &namespace,
     };
     execution.resolve(|| system.initialize_catalog()).await?;
     execution
@@ -120,6 +143,8 @@ async fn run_growth<S: JobStore + Clone>(
 pub(super) struct GrowthExecution<'a, S: JobStore> {
     pub(super) system: &'a JobSystem<S>,
     pub(super) calls: &'a AtomicU32,
+    pub(super) store: &'a S,
+    pub(super) namespace: &'a Namespace,
 }
 
 impl<S: JobStore> GrowthExecution<'_, S> {
@@ -161,12 +186,61 @@ impl<S: JobStore> GrowthExecution<'_, S> {
                     let job = self.admit_occurrence(&schedule, &initial, now).await?;
                     self.drive_one(now, Some(job)).await?
                 }
+                GrowthWorkload::RecurringWithEffectReceipts => {
+                    let job = self.admit_occurrence(&schedule, &initial, now).await?;
+                    self.write_effect_receipt(job, index).await?;
+                    self.drive_one(now, Some(job)).await?
+                }
                 GrowthWorkload::ExpiringDeduplication => {
                     self.execute_deduplicated_job(index, now).await?
                 }
             };
         }
         Ok(settled_at)
+    }
+
+    /// Commits one `Effect` receipt into the job's current execution group.
+    async fn write_effect_receipt(&self, job: JobId, index: u32) -> GrowthResult<(), S::Error> {
+        let execution_id = match self
+            .system
+            .observe_lifecycle(job)
+            .await
+            .map_err(ConformanceError::Store)?
+        {
+            LifecycleObservation::Current { record, .. } => record.execution_id,
+            _ => {
+                return Err(ConformanceError::Invalid(
+                    "growth receipt job has no current execution",
+                ));
+            }
+        };
+        let key = EffectReceiptGroup::new(self.namespace, job, execution_id)
+            .and_then(|group| group.member_key(EffectReceiptKind::Effect, &[index as u8; 32]))
+            .map_err(|_| ConformanceError::Invalid("growth receipt key"))?;
+        let transaction =
+            put_transaction(self.store, &key, b"receipt").map_err(|error| match error {
+                ConformanceError::Contract(error) => ConformanceError::Contract(error),
+                ConformanceError::Invalid(message) => ConformanceError::Invalid(message),
+                ConformanceError::Store(error) => {
+                    ConformanceError::Store(JobSystemError::Store(error))
+                }
+            })?;
+        // The put is idempotent, so an unknown outcome is retried as written.
+        for _ in 0..GROWTH_RESOLUTION_ATTEMPTS {
+            match self
+                .store
+                .transact(&transaction)
+                .await
+                .map_err(|error| ConformanceError::Store(JobSystemError::Store(error)))?
+            {
+                CommitOutcome::Committed => return Ok(()),
+                CommitOutcome::Unknown => {}
+                CommitOutcome::Conflict => {
+                    return Err(ConformanceError::Invalid("growth receipt put conflicted"));
+                }
+            }
+        }
+        Err(ConformanceError::Store(JobSystemError::UnknownCommit))
     }
 
     async fn admit_occurrence(

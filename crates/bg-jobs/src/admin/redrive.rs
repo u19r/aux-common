@@ -9,7 +9,7 @@ use crate::{
     ids::{ExecutionId, JobId, OperationId},
     keys,
     model::{JobRecordV1, JobState},
-    store::{Check, JobStore, Mutation},
+    store::{Check, EffectReceiptGroup, JobStore, Mutation},
     transition::{checked_transaction, fresh_operation, next_revision, wake_mutation},
 };
 
@@ -37,8 +37,17 @@ pub(crate) async fn redrive_job<S: JobStore>(
         .contains(&authority.record.kind, authority.record.schema_version)
         .then_some(())
         .ok_or(JobSystemError::UnregisteredHandler)?;
+    let previous_execution_id = authority.record.execution_id;
     let next = prepare_redrive(system, authority.record, &request)?;
-    commit_redrive(system, authority.encoded, next, request, fence_high_water).await
+    commit_redrive(
+        system,
+        authority.encoded,
+        next,
+        request,
+        fence_high_water,
+        previous_execution_id,
+    )
+    .await
 }
 
 pub(super) fn prepare_redrive<S: JobStore>(
@@ -81,9 +90,17 @@ async fn commit_redrive<S: JobStore>(
     next: JobRecordV1,
     request: RedriveRequest,
     fence_high_water: u64,
+    previous_execution_id: ExecutionId,
 ) -> JobResult<RedriveResult, S::Error> {
-    let transaction =
-        redrive_transaction(system, &encoded, &next, &request, fence_high_water).await?;
+    let transaction = redrive_transaction(
+        system,
+        &encoded,
+        &next,
+        &request,
+        fence_high_water,
+        previous_execution_id,
+    )
+    .await?;
     let job_id = next.job_id;
     system
         .commit_transition(
@@ -110,6 +127,7 @@ async fn redrive_transaction<S: JobStore>(
     next: &JobRecordV1,
     request: &RedriveRequest,
     fence_high_water: u64,
+    previous_execution_id: ExecutionId,
 ) -> JobResult<crate::store::StoreTransaction, S::Error> {
     let job_id = next.job_id;
     let job_key = keys::job_key(system.namespace(), &job_id)?;
@@ -120,6 +138,15 @@ async fn redrive_transaction<S: JobStore>(
     let dlq_key = keys::dead_letter_key(system.namespace(), &next.queue, &job_id)?;
     let mut mutations =
         redrive_mutations(system, next, &new_encoded, new_operation, fence_high_water)?;
+    if next.execution_id != previous_execution_id
+        && system.store().capabilities().effect_receipt_groups()
+    {
+        mutations.push(Mutation::ClearEffectReceipts(EffectReceiptGroup::new(
+            system.namespace(),
+            job_id,
+            previous_execution_id,
+        )?));
+    }
     let wake_check =
         wake_mutation(system, &next.queue, None, Some(&due_key), &mut mutations).await?;
     let mut checks = redrive_checks::<S::Error>(

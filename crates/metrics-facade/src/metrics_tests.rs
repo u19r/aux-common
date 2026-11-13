@@ -204,6 +204,15 @@ fn given_all_metric_variants_when_names_are_registered_then_names_are_static_and
         CounterMetric::BackfillJobExpiredLockFoundCount,
         CounterMetric::BackfillJobIdleCount,
         CounterMetric::BackfillJobsThrottledCount,
+        CounterMetric::BillingCommandTotal,
+        CounterMetric::BillingCommandConflictRetriesTotal,
+        CounterMetric::BillingStateTransitionTotal,
+        CounterMetric::BillingStateTransitionRefusedTotal,
+        CounterMetric::BillingWorkerStepTotal,
+        CounterMetric::BillingAttentionOpenedTotal,
+        CounterMetric::BillingAttentionResolvedTotal,
+        CounterMetric::BillingProviderCallTotal,
+        CounterMetric::BillingIntegrityMismatchTotal,
         CounterMetric::BillingRouteMetricCandidatesTotal,
         CounterMetric::BillingOperationUsageDuplicateRequestsTotal,
         CounterMetric::BillingProviderPendingReconciliationTotal,
@@ -381,6 +390,9 @@ fn given_all_metric_variants_when_names_are_registered_then_names_are_static_and
         HistogramMetric::BackfillLockAcquireLatencyMs,
         HistogramMetric::BgJobsRunDurationMsMetric,
         HistogramMetric::BgWorkerRunOnceMsMetric,
+        HistogramMetric::BillingCommandDurationSeconds,
+        HistogramMetric::BillingDueLagSeconds,
+        HistogramMetric::BillingProviderCallDurationSeconds,
         HistogramMetric::BillingOperationUsageIngestionLagMs,
         HistogramMetric::BillingProviderPendingDurationMs,
         HistogramMetric::FoundationdbGetReadVersionLatencyMs,
@@ -449,6 +461,15 @@ fn given_all_metric_variants_when_names_are_registered_then_names_are_static_and
         "backfill.job.expired.lock.found.count",
         "backfill.job.idle.count",
         "backfill.jobs.throttled.count",
+        "billing_command_total",
+        "billing_command_conflict_retries_total",
+        "billing_state_transition_total",
+        "billing_state_transition_refused_total",
+        "billing_worker_step_total",
+        "billing_attention_opened_total",
+        "billing_attention_resolved_total",
+        "billing_provider_call_total",
+        "billing_integrity_mismatch_total",
         "billing_route_metric_candidates_total",
         "billing_operation_usage_duplicate_requests_total",
         "billing_provider_pending_reconciliation_total",
@@ -626,6 +647,9 @@ fn given_all_metric_variants_when_names_are_registered_then_names_are_static_and
         "backfill.lock.acquire.latency.ms",
         "bg.jobs.run.duration.ms",
         "bg.worker.run.once.ms",
+        "billing_command_duration_seconds",
+        "billing_due_lag_seconds",
+        "billing_provider_call_duration_seconds",
         "billing_operation_usage_ingestion_lag_ms",
         "billing_provider_pending_duration_ms",
         "foundationdb.get.read.version.latency.ms",
@@ -675,13 +699,13 @@ fn given_all_metric_variants_when_names_are_registered_then_names_are_static_and
 
     // Then no customer-controlled value can create a new name or collide with a
     // sibling.
-    assert_eq!(counter_names.len(), 177);
+    assert_eq!(counter_names.len(), 186);
     assert_eq!(gauge_names.len(), 24);
-    assert_eq!(histogram_names.len(), 37);
+    assert_eq!(histogram_names.len(), 40);
     for (names, expected_unique_names) in [
-        (&counter_names, 177),
+        (&counter_names, 186),
         (&gauge_names, 24),
-        (&histogram_names, 37),
+        (&histogram_names, 40),
     ] {
         assert!(names.iter().all(|name| {
             !name.is_empty()

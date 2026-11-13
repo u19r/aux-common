@@ -800,3 +800,60 @@ fn given_full_abandoned_journal_when_seed_worker_starts_then_recovery_precedes_a
         crate::LifecycleObservation::Current { .. }
     ));
 }
+
+#[test]
+fn given_unknown_completion_with_clear_when_recovering_commits_then_clear_is_replayed() {
+    use crate::store::{EffectReceiptGroup, EffectReceiptKind};
+    let store = FakeStore::new();
+    let original = system(store.clone(), FairnessPolicy::low_volume(), 1);
+    let id = crate::JobId::from([1; 16]);
+    block_on(original.enqueue_raw(
+        crate::test_helper::low_volume_job(1, crate::Timestamp::ZERO),
+        crate::Timestamp::ZERO,
+    ))
+    .unwrap();
+    let claim = block_on(original.claim(id, crate::Timestamp::ZERO)).unwrap();
+    let group =
+        EffectReceiptGroup::new(original.namespace(), id, claim.record().execution_id).unwrap();
+    let members: Vec<StoreKey> = [
+        (EffectReceiptKind::Effect, 1),
+        (EffectReceiptKind::Effect, 2),
+        (EffectReceiptKind::TerminalProjection, 3),
+    ]
+    .into_iter()
+    .map(|(kind, digest)| group.member_key(kind, &[digest; 32]).unwrap())
+    .collect();
+    for member in &members {
+        store
+            .put_raw(member.clone(), Bytes::from_static(b"receipt"))
+            .unwrap();
+    }
+    let job_key = crate::keys::job_key(original.namespace(), &id).unwrap();
+    // The atomic first dispatch and both reserved-input applications lose
+    // their acknowledgement before the transaction applies.
+    for _ in 0..=2 {
+        store
+            .queue_commit_for_key(job_key.clone(), CommitOutcome::Unknown, false)
+            .unwrap();
+    }
+    assert!(matches!(
+        block_on(original.complete(
+            claim,
+            crate::test_helper::completion(),
+            crate::Timestamp::from_millis(1)
+        )),
+        Err(JobSystemError::UnknownCommit)
+    ));
+    assert!(store.contains(&job_key).unwrap());
+    for member in &members {
+        assert!(store.contains(member).unwrap());
+    }
+    drop(original);
+
+    let replacement = system(store.clone(), FairnessPolicy::low_volume(), 2);
+    assert_eq!(block_on(replacement.recover_commits()).unwrap(), 1);
+    assert!(!store.contains(&job_key).unwrap());
+    for member in &members {
+        assert!(!store.contains(member).unwrap());
+    }
+}

@@ -1,6 +1,11 @@
 use bytes::Bytes;
 
-use crate::{error::StoreDataError, model::JobState, policy::OutcomeCode, store::StoreKey};
+use crate::{
+    error::StoreDataError,
+    model::JobState,
+    policy::OutcomeCode,
+    store::{EffectReceiptGroup, EffectReceiptKind, StoreKey},
+};
 
 /// Authority to publish a terminal application projection, never to execute
 /// job effects. The destination must protect these reads in its native write.
@@ -11,6 +16,7 @@ pub struct JobTerminalAuthority {
     encoded_job: Bytes,
     state: JobState,
     outcome: Option<OutcomeCode>,
+    group: EffectReceiptGroup,
 }
 
 impl JobTerminalAuthority {
@@ -19,12 +25,14 @@ impl JobTerminalAuthority {
         encoded_job: Bytes,
         state: JobState,
         outcome: Option<OutcomeCode>,
+        group: EffectReceiptGroup,
     ) -> Self {
         Self {
             observation_keys,
             encoded_job,
             state,
             outcome,
+            group,
         }
     }
 
@@ -60,6 +68,17 @@ impl JobTerminalAuthority {
         identity.extend_from_slice(b"terminal-projection");
         identity.extend_from_slice(self.observation_keys[0].as_bytes());
         identity.extend_from_slice(&self.encoded_job);
+    }
+
+    /// The receipt key of this projection. `digest` binds the snapshot and
+    /// the caller's token (computed by the destination).
+    pub fn receipt_key(&self, digest: &[u8; 32]) -> Result<StoreKey, StoreDataError> {
+        self.group
+            .member_key(EffectReceiptKind::TerminalProjection, digest)
+    }
+
+    pub fn receipt_group(&self) -> &EffectReceiptGroup {
+        &self.group
     }
 }
 

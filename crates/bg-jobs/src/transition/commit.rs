@@ -5,8 +5,8 @@ use crate::{
     error::{JobResult, JobSystemError},
     ids::CommitOperationId,
     store::{
-        Check, CommitOutcome, JobStore, Mutation, StoreTransaction, StoreTransactionInput,
-        TransactionLimits,
+        Check, CommitOutcome, EffectReceiptGroup, JobStore, Mutation, StoreTransaction,
+        StoreTransactionInput, TransactionLimits,
     },
 };
 
@@ -49,6 +49,16 @@ impl<S: JobStore> JobSystem<S> {
                 .await?;
             self.prepare_fair_terminal_transition(&mut draft, &effect)
                 .await?;
+            if effect.kind().removes_job() && self.store().capabilities().effect_receipt_groups() {
+                let record = effect.record();
+                draft
+                    .mutations
+                    .push(Mutation::ClearEffectReceipts(EffectReceiptGroup::new(
+                        self.namespace(),
+                        record.job_id,
+                        record.execution_id,
+                    )?));
+            }
             self.build_transaction(draft.operation_id, draft.checks, draft.mutations)?
         } else {
             transaction

@@ -50,6 +50,26 @@ pub enum CounterMetric {
     BackfillJobExpiredLockFoundCount,
     BackfillJobIdleCount,
     BackfillJobsThrottledCount,
+    /// Labels: `command`, `outcome`. Values must be compile-time constants.
+    BillingCommandTotal,
+    /// Labels: `command`. Values must be compile-time constants.
+    BillingCommandConflictRetriesTotal,
+    /// Labels: `machine`, `from`, `to`. Values must be compile-time constants.
+    BillingStateTransitionTotal,
+    /// Labels: `machine`, `from`, `event`. Values must be compile-time
+    /// constants.
+    BillingStateTransitionRefusedTotal,
+    /// Labels: `queue`, `step`. Values must be compile-time constants.
+    BillingWorkerStepTotal,
+    /// Labels: `kind`. Values must be compile-time constants.
+    BillingAttentionOpenedTotal,
+    /// Labels: `kind`. Values must be compile-time constants.
+    BillingAttentionResolvedTotal,
+    /// Labels: `provider_kind`, `operation_kind`, `outcome`. Values must be
+    /// compile-time constants.
+    BillingProviderCallTotal,
+    /// Labels: `check`. Values must be compile-time constants.
+    BillingIntegrityMismatchTotal,
     BillingRouteMetricCandidatesTotal,
     BillingOperationUsageDuplicateRequestsTotal,
     BillingProviderPendingReconciliationTotal,
@@ -286,6 +306,15 @@ impl CounterMetric {
             Self::BackfillJobExpiredLockFoundCount => "backfill.job.expired.lock.found.count",
             Self::BackfillJobIdleCount => "backfill.job.idle.count",
             Self::BackfillJobsThrottledCount => "backfill.jobs.throttled.count",
+            Self::BillingCommandTotal => "billing_command_total",
+            Self::BillingCommandConflictRetriesTotal => "billing_command_conflict_retries_total",
+            Self::BillingStateTransitionTotal => "billing_state_transition_total",
+            Self::BillingStateTransitionRefusedTotal => "billing_state_transition_refused_total",
+            Self::BillingWorkerStepTotal => "billing_worker_step_total",
+            Self::BillingAttentionOpenedTotal => "billing_attention_opened_total",
+            Self::BillingAttentionResolvedTotal => "billing_attention_resolved_total",
+            Self::BillingProviderCallTotal => "billing_provider_call_total",
+            Self::BillingIntegrityMismatchTotal => "billing_integrity_mismatch_total",
             Self::BillingRouteMetricCandidatesTotal => "billing_route_metric_candidates_total",
             Self::BillingOperationUsageDuplicateRequestsTotal => {
                 "billing_operation_usage_duplicate_requests_total"
@@ -594,6 +623,13 @@ pub enum HistogramMetric {
     BgJobsDueDelayMs,
     BgJobsRunDurationMsMetric,
     BgWorkerRunOnceMsMetric,
+    /// Labels: `command`. Values must be compile-time constants.
+    BillingCommandDurationSeconds,
+    /// Labels: `queue`. Values must be compile-time constants.
+    BillingDueLagSeconds,
+    /// Labels: `provider_kind`, `operation_kind`, `outcome`. Values must be
+    /// compile-time constants.
+    BillingProviderCallDurationSeconds,
     BillingOperationUsageIngestionLagMs,
     BillingProviderPendingDurationMs,
     FoundationdbGetReadVersionLatencyMs,
@@ -650,6 +686,9 @@ impl HistogramMetric {
             Self::BgJobsDueDelayMs => "bg.jobs.due.delay.ms",
             Self::BgJobsRunDurationMsMetric => "bg.jobs.run.duration.ms",
             Self::BgWorkerRunOnceMsMetric => "bg.worker.run.once.ms",
+            Self::BillingCommandDurationSeconds => "billing_command_duration_seconds",
+            Self::BillingDueLagSeconds => "billing_due_lag_seconds",
+            Self::BillingProviderCallDurationSeconds => "billing_provider_call_duration_seconds",
             Self::BillingOperationUsageIngestionLagMs => "billing_operation_usage_ingestion_lag_ms",
             Self::BillingProviderPendingDurationMs => "billing_provider_pending_duration_ms",
             Self::FoundationdbGetReadVersionLatencyMs => "foundationdb.get.read.version.latency.ms",
