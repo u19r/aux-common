@@ -5,11 +5,12 @@ and strict enveloped XML signature verification for the SAML profile. The defaul
 of input, 64 nested elements, 8,192 total elements, 128 attributes per element,
 and 64 in-scope namespace bindings per element. Callers with a smaller protocol
 profile can use `XmlLimits::try_with_cardinality` to lower any of those bounds.
+The depth limit cannot exceed 256, because tree handling recurses once per level.
 Namespace URI values are limited to 1 KiB each, declarations to 16 KiB in total,
 and the cumulative in-scope namespace context materialised across the document to
 4 MiB by default. `XmlLimits::try_with_namespace_bytes` adjusts those budgets for
 an explicitly reviewed protocol profile.
-It rejects DTDs, processing instructions, comments, unsupported encodings and
+It rejects DTDs (any `<!DOCTYPE`, before parsing), processing instructions, comments, unsupported encodings and
 versions, duplicate attributes or namespace declarations, relative or
 whitespace-containing namespace URIs, multiple roots, and oversized/deep/
 high-cardinality documents before callers inspect a partial tree.

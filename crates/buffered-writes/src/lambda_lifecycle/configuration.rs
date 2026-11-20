@@ -5,7 +5,9 @@ use std::{
 
 use crate::{
     LifecycleError,
-    constants::{LAMBDA_IPC_DEFAULT_TIMEOUT, LAMBDA_IPC_MAX_TOKEN_BYTES},
+    constants::{
+        LAMBDA_IPC_DEFAULT_TIMEOUT, LAMBDA_IPC_MAX_TOKEN_BYTES, LAMBDA_IPC_MIN_TOKEN_BYTES,
+    },
 };
 
 /// Shared function/extension connection settings. Tokens are never formatted.
@@ -26,13 +28,13 @@ impl LambdaIpcConfig {
     pub fn try_new(address: SocketAddr, token: impl Into<String>) -> Result<Self, LifecycleError> {
         let token = token.into();
         if !address.ip().is_loopback()
-            || token.is_empty()
+            || token.len() < LAMBDA_IPC_MIN_TOKEN_BYTES
             || token.len() > LAMBDA_IPC_MAX_TOKEN_BYTES
             || !token.bytes().all(|byte| byte.is_ascii_graphic())
         {
             return Err(LifecycleError::InvalidConfiguration {
-                reason: "Lambda IPC requires a loopback address and a bounded printable ASCII \
-                         token",
+                reason: "Lambda IPC requires a loopback address and a printable ASCII token of 16 \
+                         to 256 bytes",
             });
         }
         Ok(Self {

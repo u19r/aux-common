@@ -10,7 +10,7 @@ publish = false
 doctest = false
 
 [dependencies]
-chrono = { workspace = true }
+jiff = { workspace = true }
 oauth-dpop = { workspace = true }
 regex = { workspace = true }
 schemars = { workspace = true }
@@ -22,6 +22,7 @@ url = { workspace = true }
 utoipa = { workspace = true }
 
 [dev-dependencies]
+alloc-counter = { workspace = true }
 proptest = { workspace = true }
 
 [lints]

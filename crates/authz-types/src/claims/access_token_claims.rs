@@ -36,6 +36,11 @@ pub struct OAuthAccessTokenClaims {
     )]
     pub scope: Vec<String>,
     pub tenant: String,
+    /// The organization the user signed into. Org-scoped authority in the
+    /// token was projected from this organization only; absent when the
+    /// session named no organization.
+    #[serde(rename = "org_id", default, skip_serializing_if = "Option::is_none")]
+    pub organization_id: Option<String>,
     pub token_type: AccessTokenType,
     pub principal_type: PrincipalType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -73,6 +78,8 @@ pub struct OAuthAccessTokenClaimsInput {
     pub client_id: String,
     pub scope: Vec<String>,
     pub tenant: String,
+    #[builder(default)]
+    pub organization_id: Option<String>,
     pub principal_type: PrincipalType,
     pub auth_time: Option<i64>,
     pub acr: Option<String>,
@@ -111,6 +118,8 @@ struct OAuthAccessTokenClaimsWire {
     #[serde(deserialize_with = "deserialize_scope")]
     scope: Vec<String>,
     tenant: String,
+    #[serde(rename = "org_id", default)]
+    organization_id: Option<String>,
     token_type: AccessTokenType,
     principal_type: PrincipalType,
     #[serde(default)]
@@ -147,6 +156,7 @@ impl OAuthAccessTokenClaims {
             client_id: input.client_id,
             scope: input.scope,
             tenant: input.tenant,
+            organization_id: input.organization_id,
             token_type: AccessTokenType::AccessToken,
             principal_type: input.principal_type,
             auth_time: input.auth_time,
@@ -186,6 +196,12 @@ impl OAuthAccessTokenClaims {
                 .is_some_and(|auth_time| auth_time > self.issued_at)
         {
             return Err(ClaimBoundsError::InvalidTemporalOrder);
+        }
+        if let Some(organization) = &self.organization_id {
+            if organization.is_empty() {
+                return Err(ClaimBoundsError::Empty { field: "org_id" });
+            }
+            validate_string("org_id", organization)?;
         }
         for value in self
             .amr
@@ -256,6 +272,7 @@ impl TryFrom<OAuthAccessTokenClaimsWire> for OAuthAccessTokenClaims {
             client_id: wire.client_id,
             scope: wire.scope,
             tenant: wire.tenant,
+            organization_id: wire.organization_id,
             token_type: wire.token_type,
             principal_type: wire.principal_type,
             auth_time: wire.auth_time,

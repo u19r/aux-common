@@ -1,5 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use sha2::{Digest, Sha256};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
@@ -79,7 +79,7 @@ impl UnverifiedMetadata {
     /// The returned value is structurally validated but remains attacker
     /// controlled. Use [`VerifiedMetadata::try_from`] when metadata
     /// authenticity is required.
-    pub fn parse_unverified(xml: &str, now: DateTime<Utc>) -> Result<Self, SamlError> {
+    pub fn parse_unverified(xml: &str, now: Timestamp) -> Result<Self, SamlError> {
         Self::parse_unverified_for_binding(xml, now, MetadataSsoBinding::HttpPost)
     }
 
@@ -88,7 +88,7 @@ impl UnverifiedMetadata {
     /// and metadata authenticity still require the caller's separate checks.
     pub fn parse_unverified_for_binding(
         xml: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         binding: MetadataSsoBinding,
     ) -> Result<Self, SamlError> {
         let root = xml_security::UnverifiedElement::try_from(xml)?;
@@ -134,7 +134,7 @@ impl UnverifiedMetadata {
 impl UnverifiedMetadata {
     fn from_unverified_element(
         root: &xml_security::UnverifiedElement,
-        now: DateTime<Utc>,
+        now: Timestamp,
         binding: MetadataSsoBinding,
     ) -> Result<Self, SamlError> {
         if contains_element(root, NS_DS, "Signature") {
@@ -190,7 +190,7 @@ pub struct MetadataVerification<'a, C> {
     xml: &'a str,
     trusted_signing_certificates: &'a [C],
     trust_policy: &'a CertificateTrustPolicy,
-    now: DateTime<Utc>,
+    now: Timestamp,
 }
 
 impl<'a, C> MetadataVerification<'a, C> {
@@ -199,7 +199,7 @@ impl<'a, C> MetadataVerification<'a, C> {
         xml: &'a str,
         trusted_signing_certificates: &'a [C],
         trust_policy: &'a CertificateTrustPolicy,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Self {
         Self {
             xml,
@@ -250,20 +250,60 @@ impl<C: AsRef<str>> TryFrom<MetadataVerification<'_, C>> for VerifiedMetadata {
 
 fn validate_valid_until(
     element: &xml_security::UnverifiedElement,
-    now: DateTime<Utc>,
+    now: Timestamp,
     element_name: &str,
 ) -> Result<(), SamlError> {
     let valid_until = element
         .attr("validUntil")
         .ok_or_else(|| SamlError::InvalidInput(format!("{element_name} validUntil is required")))?;
-    let valid_until = DateTime::parse_from_rfc3339(valid_until)
+    if !is_rfc3339_datetime(valid_until) {
+        return Err(SamlError::InvalidInput(format!(
+            "{element_name} validUntil is invalid"
+        )));
+    }
+    let valid_until = valid_until
+        .parse::<Timestamp>()
         .map_err(|_| SamlError::InvalidInput(format!("{element_name} validUntil is invalid")))?;
-    if valid_until.with_timezone(&Utc) <= now {
+    if valid_until <= now {
         return Err(SamlError::InvalidInput(format!(
             "{element_name} metadata is expired"
         )));
     }
     Ok(())
+}
+
+// Keep the RFC 3339 wire format: Jiff also accepts calendar annotations and
+// abbreviated times, which these protocol inputs have never accepted.
+fn is_rfc3339_datetime(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || !matches!(bytes.get(10), Some(b'T' | b't' | b' '))
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return false;
+    }
+    let mut suffix = &bytes[19..];
+    if suffix.first() == Some(&b'.') {
+        suffix = &suffix[1..];
+        let digits = suffix
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits == 0 {
+            return false;
+        }
+        suffix = &suffix[digits..];
+    }
+    matches!(suffix, [b'Z' | b'z'])
+        || (suffix.len() == 6
+            && matches!(suffix[0], b'+' | b'-')
+            && suffix[3] == b':'
+            && [suffix[1], suffix[2], suffix[4], suffix[5]]
+                .iter()
+                .all(u8::is_ascii_digit))
 }
 
 fn find_entity_descriptor(

@@ -1,0 +1,266 @@
+{
+  "schema": 1,
+  "bindings": [
+    {
+      "kind": "text",
+      "key": "tools.rust.version",
+      "template": "{{tools.rust.version}}",
+      "files": [
+        "aux-common/Cargo.toml",
+        "aux-common/crates/quickjs/Cargo.toml",
+        "aux-common/crates/quickjs/rust-toolchain.toml",
+        "aux-common/rust-toolchain.toml"
+      ],
+      "pattern": "(?:channel|rust-version)\\s*=\\s*\"(?<value>[^\"]+)\"",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "tools.rust.version",
+      "template": "{{tools.rust.version}}",
+      "files": [
+        "aux-common/scripts/build-quickjs-wasm.sh",
+        "aux-common/scripts/check-quickjs-wasm.sh"
+      ],
+      "pattern": "(?:cargo|rustc) \\+(?<value>\\d+\\.\\d+\\.\\d+)",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "tools.mold.version",
+      "template": "{{tools.mold.version}}",
+      "files": [
+        "aux-common/.cargo/config.toml",
+        "aux-common/crates/buffered-writes/deployments/persistent-host.Dockerfile",
+        "aux-common/scripts/install-mold.sh"
+      ],
+      "pattern": "aux-mold-(?<value>\\d+\\.\\d+\\.\\d+)",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "tools.mold.version",
+      "template": "{{tools.mold.version}}",
+      "files": [
+        "aux-common/scripts/install-mold.sh"
+      ],
+      "pattern": "mold-(?<value>\\d+\\.\\d+\\.\\d+)-",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "tools.mold.version",
+      "template": "{{tools.mold.version}}",
+      "files": [
+        "aux-common/.github/workflows/ci.yml",
+        "aux-common/scripts/install-mold.sh"
+      ],
+      "pattern": "mold (?<value>\\d+\\.\\d+\\.\\d+)",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "tools.mold.version",
+      "template": "{{tools.mold.version}}",
+      "files": [
+        "aux-common/scripts/install-mold.sh"
+      ],
+      "pattern": "mold/releases/download/v(?<value>\\d+\\.\\d+\\.\\d+)",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "tools.mold.version",
+      "template": "{{tools.mold.version}}",
+      "files": [
+        "aux-common/scripts/install-mold.sh"
+      ],
+      "pattern": "mold (?<value>\\d+\\\\\\.\\d+\\\\\\.\\d+)",
+      "encoding": "regex"
+    },
+    {
+      "kind": "text",
+      "key": "lock.tools.mold.x86_64.sha256",
+      "template": "{{lock.tools.mold.x86_64.sha256}}",
+      "files": [
+        "aux-common/scripts/install-mold.sh"
+      ],
+      "pattern": "archive_arch=x86_64\\s+checksum=(?<value>[a-f0-9]{64})",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "lock.tools.mold.aarch64.sha256",
+      "template": "{{lock.tools.mold.aarch64.sha256}}",
+      "files": [
+        "aux-common/scripts/install-mold.sh"
+      ],
+      "pattern": "archive_arch=aarch64\\s+checksum=(?<value>[a-f0-9]{64})",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "actions.actions_checkout.revision",
+      "template": "{{actions.actions_checkout.revision}}",
+      "files": [
+        "aux-common/.github/workflows/ci.yml"
+      ],
+      "pattern": "actions/checkout@(?<value>[a-zA-Z0-9_.-]+)",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "tools.rustfmt.version",
+      "template": "{{tools.rustfmt.version}}",
+      "files": [
+        "aux-common/justfile"
+      ],
+      "pattern": "cargo \\+(?<value>nightly(?:-\\d+-\\d+-\\d+)?)",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "tools.rustfmt.version",
+      "template": "{{tools.rustfmt.version}}",
+      "files": [
+        "aux-common/justfile"
+      ],
+      "pattern": "rustup toolchain install (?<value>nightly(?:-\\d+-\\d+-\\d+)?)",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "tools.rustfmt.version",
+      "template": "{{tools.rustfmt.version}}",
+      "files": [
+        "aux-common/justfile"
+      ],
+      "pattern": "--toolchain (?<value>nightly(?:-\\d+-\\d+-\\d+)?)",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "tools.rust.version",
+      "template": "{{tools.rust.version}}",
+      "files": [
+        "aux-common/.github/workflows/ci.yml"
+      ],
+      "pattern": "RUSTUP_TOOLCHAIN:\\s*\"(?<value>[^\"\\n]+)\"",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "tools.rust.version",
+      "template": "{{tools.rust.version}}",
+      "files": [
+        "aux-common/scripts/build-quickjs-wasm.sh",
+        "aux-common/scripts/check-quickjs-wasm.sh"
+      ],
+      "pattern": "cargo \\+(?<value>\\d+\\.\\d+\\.\\d+)",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "tools.wasi_sdk.version",
+      "template": "{{tools.wasi_sdk.version}}",
+      "files": [
+        "aux-common/.github/workflows/ci.yml"
+      ],
+      "pattern": "wasi-sdk-(?<value>\\d+)(?:\\.0)?",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "lock.tools.wasi_sdk.arm64.sha256",
+      "template": "{{lock.tools.wasi_sdk.arm64.sha256}}",
+      "files": [
+        "aux-common/.github/workflows/ci.yml"
+      ],
+      "pattern": "printf '%s  %s\\\\n' (?<value>[a-f0-9]{64})",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "images.rust_builder.reference",
+      "template": "{{images.rust_builder.reference}}",
+      "files": [
+        "aux-common/crates/buffered-writes/deployments/persistent-host.Dockerfile"
+      ],
+      "pattern": "RUST_IMAGE=(?<value>[^\\s]+)",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "images.debian_runtime.reference",
+      "template": "{{images.debian_runtime.reference}}",
+      "files": [
+        "aux-common/crates/buffered-writes/deployments/persistent-host.Dockerfile"
+      ],
+      "pattern": "RUNTIME_IMAGE=(?<value>[^\\s]+)",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "actions.actions_cache.revision",
+      "template": "{{actions.actions_cache.revision}}",
+      "files": [
+        "aux-common/.github/workflows/ci.yml"
+      ],
+      "pattern": "uses:\\s*actions/cache@(?<value>[\\w.-]+)",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "actions.actions_checkout.version",
+      "template": "{{actions.actions_checkout.version}}",
+      "files": [
+        "aux-common/.github/workflows/ci.yml"
+      ],
+      "pattern": "uses:\\s*actions/checkout@[\\w.-]+ # (?<value>v[\\d.]+)",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "actions.actions_cache.version",
+      "template": "{{actions.actions_cache.version}}",
+      "files": [
+        "aux-common/.github/workflows/ci.yml"
+      ],
+      "pattern": "uses:\\s*actions/cache@[\\w.-]+ # (?<value>v[\\d.]+)",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "tools.wasi_sdk.version",
+      "template": "{{tools.wasi_sdk.version}}",
+      "files": [
+        "aux-common/scripts/build-quickjs-wasm.sh",
+        "aux-common/scripts/quickjs-clang.sh"
+      ],
+      "pattern": "WASI SDK (?<value>\\d+)\\.0",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "tools.wasi_clang.version",
+      "template": "{{tools.wasi_clang.version}}",
+      "files": [
+        "aux-common/scripts/build-quickjs-wasm.sh",
+        "aux-common/scripts/quickjs-scripts-test.sh"
+      ],
+      "pattern": "(?<value>\\d+\\.\\d+\\.\\d+)-wasi-sdk",
+      "encoding": "plain"
+    },
+    {
+      "kind": "text",
+      "key": "tools.rust.version",
+      "template": "{{tools.rust.version}}",
+      "files": [
+        "aux-common/scripts/quickjs-scripts-test.sh"
+      ],
+      "pattern": "\\+(?<value>\\d+\\.\\d+\\.\\d+)",
+      "encoding": "plain"
+    }
+  ],
+  "copies": []
+}

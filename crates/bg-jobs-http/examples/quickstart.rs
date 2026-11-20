@@ -10,6 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let policy_id = HttpPolicyId::try_new("partner-webhook")?;
     let policy = HttpPolicy::builder(policy_id.clone())
         .endpoint(ApprovedEndpoint::exact("api.example.com")?)
+        .route(Method::POST, "/")
         .try_build()?;
     let request = HttpRequest::try_new(HttpRequestInput {
         method: Method::POST,

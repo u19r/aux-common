@@ -12,6 +12,7 @@ use crate::{
 fn policy() -> crate::HttpPolicy {
     HttpPolicy::builder(HttpPolicyId::try_new("test").expect("policy ID"))
         .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+        .route(Method::POST, "/")
         .try_build()
         .expect("policy")
 }
@@ -69,6 +70,7 @@ fn given_policy_limits_when_built_then_zero_or_oversized_values_fail_closed() {
     assert!(matches!(
         HttpPolicy::builder(id.clone())
             .endpoint(endpoint.clone())
+            .route(Method::POST, "/")
             .max_request_bytes(0)
             .try_build(),
         Err(HttpJobError::Validation(_))
@@ -76,6 +78,7 @@ fn given_policy_limits_when_built_then_zero_or_oversized_values_fail_closed() {
     assert_eq!(
         HttpPolicy::builder(id.clone())
             .endpoint(endpoint.clone())
+            .route(Method::POST, "/")
             .max_response_bytes(0)
             .try_build()
             .expect_err("zero response bound"),
@@ -86,6 +89,7 @@ fn given_policy_limits_when_built_then_zero_or_oversized_values_fail_closed() {
     assert_eq!(
         HttpPolicy::builder(id.clone())
             .endpoint(endpoint.clone())
+            .route(Method::POST, "/")
             .request_timeout(Duration::ZERO)
             .try_build()
             .expect_err("zero timeout"),
@@ -96,6 +100,7 @@ fn given_policy_limits_when_built_then_zero_or_oversized_values_fail_closed() {
     assert_eq!(
         HttpPolicy::builder(id)
             .endpoint(endpoint)
+            .route(Method::POST, "/")
             .retry_after_max(Duration::ZERO)
             .try_build()
             .expect_err("zero retry-after bound"),
@@ -109,6 +114,7 @@ fn given_policy_limits_when_built_then_zero_or_oversized_values_fail_closed() {
 fn given_connect_timeout_longer_than_request_timeout_when_policy_is_built_then_it_is_clamped() {
     let policy = HttpPolicy::builder(HttpPolicyId::try_new("timeout-bound").expect("policy ID"))
         .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+        .route(Method::POST, "/")
         .connect_timeout(Duration::from_secs(10))
         .request_timeout(Duration::from_secs(2))
         .try_build()
@@ -153,6 +159,7 @@ fn given_sensitive_headers_when_request_or_policy_is_built_then_material_is_reje
         assert_eq!(
             HttpPolicy::builder(id)
                 .endpoint(endpoint)
+                .route(Method::POST, "/")
                 .idempotency_header(http::HeaderName::from_bytes(name.as_bytes()).expect("name"))
                 .try_build()
                 .expect_err("forbidden identity header"),
@@ -192,6 +199,7 @@ fn given_approved_endpoint_when_debug_is_rendered_then_host_is_redacted() {
     let id = HttpPolicyId::try_new("debug-redaction").expect("policy ID");
     let policy = HttpPolicy::builder(id)
         .endpoint(endpoint.clone())
+        .route(Method::POST, "/")
         .try_build()
         .expect("policy");
 
@@ -209,4 +217,61 @@ fn given_request_body_when_above_global_bound_then_request_is_rejected() {
         HttpJobError::RequestBodyTooLarge
     );
     let _ = policy();
+}
+
+#[test]
+fn given_route_pinned_policy_when_method_or_path_leaves_route_then_request_is_not_approved() {
+    let policy = HttpPolicy::builder(HttpPolicyId::try_new("sqs-send").expect("policy ID"))
+        .endpoint(ApprovedEndpoint::exact("sqs.us-east-1.amazonaws.com").expect("endpoint"))
+        .route(Method::POST, "/123456789012/jobs")
+        .try_build()
+        .expect("policy");
+    let url = |path: &str| {
+        Url::parse(&format!("https://sqs.us-east-1.amazonaws.com{path}")).expect("URL")
+    };
+
+    assert!(policy.approves(&Method::POST, &url("/123456789012/jobs")));
+    assert!(policy.approves(&Method::POST, &url("/123456789012/jobs/child")));
+    for (method, path) in [
+        (Method::DELETE, "/123456789012/jobs"),
+        (Method::PUT, "/123456789012/jobs/child"),
+        (Method::POST, "/"),
+        (Method::POST, "/123456789012/jobs-other"),
+        (Method::POST, "/123456789012/jobs/../other"),
+        (Method::POST, "/123456789012/jobs/%2e%2e/other"),
+        (Method::POST, "/123456789012/jobs%2f..%2fother"),
+        (Method::POST, "/123456789012/jobs/a%5C..%5Cother"),
+    ] {
+        assert!(
+            !policy.approves(&method, &url(path)),
+            "{method} {path} must not be approved"
+        );
+    }
+}
+
+#[test]
+fn given_missing_or_ambiguous_route_when_policy_is_built_then_registration_fails() {
+    let id = HttpPolicyId::try_new("routes").expect("policy ID");
+    let endpoint = ApprovedEndpoint::exact("api.example.com").expect("endpoint");
+    assert_eq!(
+        HttpPolicy::builder(id.clone())
+            .endpoint(endpoint.clone())
+            .try_build()
+            .expect_err("a policy without a route"),
+        HttpJobError::EndpointNotApproved
+    );
+    for prefix in [
+        "", "jobs", "/a/../b", "/a/./b", "/a//b", "/a?x", "/a#x", "/a%2fb", "/a b",
+    ] {
+        assert!(
+            matches!(
+                HttpPolicy::builder(id.clone())
+                    .endpoint(endpoint.clone())
+                    .route(Method::POST, prefix)
+                    .try_build(),
+                Err(HttpJobError::Validation(_))
+            ),
+            "route prefix {prefix:?} must be rejected"
+        );
+    }
 }

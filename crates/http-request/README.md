@@ -7,8 +7,16 @@ The crate provides retries, timeouts, typed errors, metrics, response parsing he
 `HttpRequestError::dispatch_status` separates failures that prove no request bytes reached the
 destination from failures that may have happened after dispatch. DNS, connection, TLS setup, and
 their timeouts are `NotDispatched`; response loss, response timeout, body failure, and uncertain
-transport failures are `PossiblyDispatched`. Callers implementing an atomic remote protocol must
-map the latter to their ambiguous-outcome path rather than retrying with a new operation identity.
+transport failures are `PossiblyDispatched`. A failure after an earlier retry attempt or redirect
+hop may have been dispatched is wrapped as `AfterDispatch` and is `PossiblyDispatched`. Callers
+implementing an atomic remote protocol must map `PossiblyDispatched` to their ambiguous-outcome
+path rather than retrying with a new operation identity.
+
+`TenantHttpClient` applies one deadline per operation: its `timeout`, or a shorter request
+timeout, bounds every hop's DNS preflight, every attempt, retry waits, and redirect hops. A retry
+whose wait would reach the deadline is not attempted. `build()` accepts only canonical allowlist
+hosts (lowercase ASCII domains without empty labels or a trailing dot, or loopback literals when
+loopback destinations are enabled).
 
 Important files:
 

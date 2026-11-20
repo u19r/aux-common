@@ -88,7 +88,7 @@ impl<T: Send + Sync + 'static> Engine<T> {
             operation_id,
             scope,
             codec_version: self.cfg.codec.version().to_owned(),
-            admitted_at_utc_ms: self.cfg.clock.now_utc().timestamp_millis(),
+            admitted_at_utc_ms: crate::observer::utc_millis(self.cfg.clock.now_utc()),
             admitted_at_mono: self.cfg.clock.now_instant(),
             payload: bytes::Bytes::new(),
         })
@@ -298,7 +298,7 @@ impl<T: Send + Sync + 'static> Engine<T> {
         self.complete_buffer_operation(deadline, || {
             self.cfg.buffer.inspect(crate::BufferInspectRequest {
                 operation_id: Some(operation_id.clone()),
-                now_utc_ms: self.cfg.clock.now_utc().timestamp_millis(),
+                now_utc_ms: crate::observer::utc_millis(self.cfg.clock.now_utc()),
                 now_instant: self.cfg.clock.now_instant(),
                 deadline,
             })

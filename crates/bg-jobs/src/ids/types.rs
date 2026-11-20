@@ -154,9 +154,19 @@ impl OccurrenceId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[derive(Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
 struct OpaqueBytes<const MAX: usize> {
     bytes: Vec<u8>,
+}
+
+/// Opaque keys may carry tenant identifiers, so `Debug` reports length only.
+impl<const MAX: usize> fmt::Debug for OpaqueBytes<MAX> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpaqueBytes")
+            .field("len", &self.bytes.len())
+            .finish()
+    }
 }
 
 impl<const MAX: usize> OpaqueBytes<MAX> {

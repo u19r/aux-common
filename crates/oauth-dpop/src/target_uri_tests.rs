@@ -110,3 +110,54 @@ fn given_public_base_when_resolving_origin_and_absolute_requests_then_preserves_
     assert!(DpopTargetUri::try_from(maximum.as_str()).is_ok());
     assert!(DpopTargetUri::try_from(format!("{maximum}a").as_str()).is_err());
 }
+
+#[test]
+fn given_request_path_with_dot_segments_when_resolving_target_then_rejects_instead_of_normalizing()
+{
+    // Given a listener base and request paths whose raw or percent-encoded dot
+    // segments would normalize outside the base or onto a sibling resource.
+    let base = DpopTargetUri::parse_base("https://h/api").unwrap();
+
+    // When each path is joined or resolved as the server-side target.
+    // Then it is rejected rather than equated with a normalized alias.
+    for path in [
+        "/../other",
+        "/../other/x",
+        "/a/../x",
+        "/./x",
+        "/x/.",
+        "/x/..",
+    ] {
+        assert!(base.join_path(path).is_err(), "join {path}");
+    }
+    for request in [
+        "/a/%2E%2E/x",
+        "/a/%2e%2e/x",
+        "/a/.%2E/x",
+        "/%2E/x",
+        "/..",
+        "https://h/api/a/../x",
+        "https://h/api/a/%2E%2E/x",
+        "https://h/api/./x",
+    ] {
+        assert!(
+            base.resolve_request_uri(&request.parse().unwrap()).is_err(),
+            "resolve {request}"
+        );
+    }
+
+    // The client `htu` claim is still normalized, and dot-free paths that
+    // merely contain dots inside a segment resolve beneath the base.
+    assert_eq!(
+        DpopTargetUri::try_from("https://h/api/a/%2E%2E/x")
+            .unwrap()
+            .as_str(),
+        "https://h/api/x"
+    );
+    assert_eq!(
+        base.resolve_request_uri(&"/a/..x/.y".parse().unwrap())
+            .unwrap()
+            .as_str(),
+        "https://h/api/a/..x/.y"
+    );
+}

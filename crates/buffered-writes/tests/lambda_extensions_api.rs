@@ -90,7 +90,7 @@ async fn next(listener: &TcpListener) -> TcpStream {
     stream
 }
 fn deadline_ms(after: Duration) -> u64 {
-    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap()
+    u64::try_from(jiff::Timestamp::now().as_millisecond()).unwrap()
         + u64::try_from(after.as_millis()).unwrap()
 }
 async fn invoke(stream: &mut TcpStream, id: &str, budget: Duration) {
@@ -110,14 +110,14 @@ async fn shutdown(stream: &mut TcpStream, reason: &str) {
 async fn bind(writer: BufferedWrites<u32>) -> LambdaExtensionServer<u32> {
     LambdaExtensionServer::bind(
         writer,
-        LambdaIpcConfig::try_new("127.0.0.1:0".parse().unwrap(), "test-token").unwrap(),
+        LambdaIpcConfig::try_new("127.0.0.1:0".parse().unwrap(), "test-token-0123456789").unwrap(),
     )
     .await
     .unwrap()
 }
 fn runtime(server: &LambdaExtensionServer<u32>) -> LambdaExtensionClient<u32> {
     LambdaExtensionClient::new(
-        LambdaIpcConfig::try_new(server.local_addr().unwrap(), "test-token").unwrap(),
+        LambdaIpcConfig::try_new(server.local_addr().unwrap(), "test-token-0123456789").unwrap(),
     )
 }
 

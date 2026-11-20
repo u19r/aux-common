@@ -1,6 +1,6 @@
 #![no_main]
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use libfuzzer_sys::fuzz_target;
 use saml2::UnverifiedMetadata;
 
@@ -15,7 +15,7 @@ use saml2::UnverifiedMetadata;
 // slip through a clock difference. Any violation confuses one metadata
 // generation, entity, or validity window for another.
 fn parse_at(document: &str, timestamp: i64) -> Option<(String, String, usize)> {
-    let now = DateTime::<Utc>::from_timestamp(timestamp, 0)?;
+    let now = Timestamp::from_second(timestamp).ok()?;
     let metadata = UnverifiedMetadata::parse_unverified(document, now).ok()?;
     Some((
         metadata.entity_id().to_string(),

@@ -10,6 +10,10 @@ use buffered_writes::{Deadline, QueueConfig, QueueError, ReplayQueue, SqsQueue};
 use bytes::Bytes;
 use http_request::{HttpClient, HttpResponse, Transport, TransportFuture, reqwest::Request};
 
+fn envelope_key() -> buffered_writes::EnvelopeKey {
+    buffered_writes::EnvelopeKey::try_new([7; 32]).unwrap()
+}
+
 #[derive(Clone, Debug)]
 struct ProtocolTransport(Arc<Mutex<Vec<Request>>>, &'static str, http::StatusCode);
 impl Default for ProtocolTransport {
@@ -48,9 +52,12 @@ fn queue(transport: &ProtocolTransport, endpoint: Option<String>) -> SqsQueue {
         .with_transport(transport.clone())
         .build()
         .unwrap();
-    let mut config = QueueConfig::sqs("https://sqs.eu-west-2.amazonaws.com/123456789012/source")
-        .with_region("eu-west-2")
-        .with_quarantine_url("https://sqs.eu-west-2.amazonaws.com/123456789012/quarantine");
+    let mut config = QueueConfig::sqs(
+        "https://sqs.eu-west-2.amazonaws.com/123456789012/source",
+        envelope_key(),
+    )
+    .with_region("eu-west-2")
+    .with_quarantine_url("https://sqs.eu-west-2.amazonaws.com/123456789012/quarantine");
     if let Some(endpoint) = endpoint {
         config = config.with_endpoint(endpoint);
     }
@@ -209,7 +216,10 @@ async fn given_hung_transport_when_receiving_then_total_deadline_bounds_operatio
         .build()
         .unwrap();
     let queue = SqsQueue::try_new_with_client(
-        QueueConfig::sqs("https://sqs.eu-west-2.amazonaws.com/123456789012/source"),
+        QueueConfig::sqs(
+            "https://sqs.eu-west-2.amazonaws.com/123456789012/source",
+            envelope_key(),
+        ),
         CredentialSource::Static(AwsStaticCredentials {
             access_key_id: "test".into(),
             secret_access_key: "test".into(),
@@ -230,16 +240,31 @@ async fn given_hung_transport_when_receiving_then_total_deadline_bounds_operatio
 #[test]
 fn given_invalid_transport_configuration_when_building_then_reject_before_dispatch() {
     for config in [
-        QueueConfig::sqs("https://sqs.eu-west-2.amazonaws.com/123456789012/source")
-            .with_fifo_group_id("group"),
-        QueueConfig::sqs("https://sqs.eu-west-2.amazonaws.com/123456789012/source.fifo")
-            .with_fifo_group_id(""),
-        QueueConfig::sqs("https://sqs.eu-west-2.amazonaws.com/123456789012/source.fifo")
-            .with_fifo_group_id("a".repeat(129)),
-        QueueConfig::sqs("https://sqs.eu-west-2.amazonaws.com/123456789012/source")
-            .with_quarantine_url("https://sqs.eu-west-2.amazonaws.com/123456789012/source"),
-        QueueConfig::sqs("https://sqs.eu-west-2.amazonaws.com/123456789012/source")
-            .with_endpoint("https://secret@queue.invalid"),
+        QueueConfig::sqs(
+            "https://sqs.eu-west-2.amazonaws.com/123456789012/source",
+            envelope_key(),
+        )
+        .with_fifo_group_id("group"),
+        QueueConfig::sqs(
+            "https://sqs.eu-west-2.amazonaws.com/123456789012/source.fifo",
+            envelope_key(),
+        )
+        .with_fifo_group_id(""),
+        QueueConfig::sqs(
+            "https://sqs.eu-west-2.amazonaws.com/123456789012/source.fifo",
+            envelope_key(),
+        )
+        .with_fifo_group_id("a".repeat(129)),
+        QueueConfig::sqs(
+            "https://sqs.eu-west-2.amazonaws.com/123456789012/source",
+            envelope_key(),
+        )
+        .with_quarantine_url("https://sqs.eu-west-2.amazonaws.com/123456789012/source"),
+        QueueConfig::sqs(
+            "https://sqs.eu-west-2.amazonaws.com/123456789012/source",
+            envelope_key(),
+        )
+        .with_endpoint("https://secret@queue.invalid"),
     ] {
         assert!(SqsQueue::try_new(config).is_err());
     }
@@ -249,9 +274,12 @@ fn given_invalid_transport_configuration_when_building_then_reject_before_dispat
 async fn given_smaller_queue_limit_when_quarantining_then_reject_without_dispatch() {
     let transport = ProtocolTransport::default();
     let queue = SqsQueue::try_new_with_client(
-        QueueConfig::sqs("https://sqs.eu-west-2.amazonaws.com/123456789012/source")
-            .with_quarantine_url("https://sqs.eu-west-2.amazonaws.com/123456789012/quarantine")
-            .with_max_envelope_bytes(8),
+        QueueConfig::sqs(
+            "https://sqs.eu-west-2.amazonaws.com/123456789012/source",
+            envelope_key(),
+        )
+        .with_quarantine_url("https://sqs.eu-west-2.amazonaws.com/123456789012/quarantine")
+        .with_max_envelope_bytes(8),
         CredentialSource::Static(AwsStaticCredentials {
             access_key_id: "test".into(),
             secret_access_key: "test".into(),
@@ -278,8 +306,11 @@ async fn given_smaller_queue_limit_when_quarantining_then_reject_without_dispatc
     for limit in [0, 1_048_577] {
         assert!(
             SqsQueue::try_new(
-                QueueConfig::sqs("https://sqs.eu-west-2.amazonaws.com/123456789012/source")
-                    .with_max_envelope_bytes(limit)
+                QueueConfig::sqs(
+                    "https://sqs.eu-west-2.amazonaws.com/123456789012/source",
+                    envelope_key()
+                )
+                .with_max_envelope_bytes(limit)
             )
             .is_err()
         );
@@ -301,7 +332,10 @@ fn given_transparent_post_retries_when_building_then_reject_second_attempt_owner
         .unwrap();
     assert!(
         SqsQueue::try_new_with_client(
-            QueueConfig::sqs("https://sqs.eu-west-2.amazonaws.com/123456789012/source"),
+            QueueConfig::sqs(
+                "https://sqs.eu-west-2.amazonaws.com/123456789012/source",
+                envelope_key()
+            ),
             CredentialSource::DefaultChain,
             client
         )
@@ -333,10 +367,11 @@ async fn capture_batch() -> buffered_writes::SealedBatch {
 async fn given_fifo_transport_when_retrying_then_batch_identity_and_bounded_group_are_stable() {
     let transport = ProtocolTransport::default();
     let queue = SqsQueue::try_new_with_client(
-        QueueConfig::sqs("https://sqs.eu-west-2.amazonaws.com/123456789012/source.fifo")
-            .with_quarantine_url(
-                "https://sqs.eu-west-2.amazonaws.com/123456789012/quarantine.fifo",
-            ),
+        QueueConfig::sqs(
+            "https://sqs.eu-west-2.amazonaws.com/123456789012/source.fifo",
+            envelope_key(),
+        )
+        .with_quarantine_url("https://sqs.eu-west-2.amazonaws.com/123456789012/quarantine.fifo"),
         CredentialSource::Static(AwsStaticCredentials {
             access_key_id: "test".into(),
             secret_access_key: "test".into(),
@@ -351,10 +386,11 @@ async fn given_fifo_transport_when_retrying_then_batch_identity_and_bounded_grou
     let batch = capture_batch().await;
     let expected_id = batch.batch_id().to_string();
     let deadline = Deadline::after(Duration::from_secs(2));
-    buffered_writes::WriteQueue::publish(&queue, batch.clone(), deadline)
+    let envelope = envelope_key().seal(batch).unwrap();
+    buffered_writes::WriteQueue::publish(&queue, envelope.clone(), deadline)
         .await
         .unwrap();
-    buffered_writes::WriteQueue::publish(&queue, batch, deadline)
+    buffered_writes::WriteQueue::publish(&queue, envelope, deadline)
         .await
         .unwrap();
     queue
@@ -409,8 +445,11 @@ async fn given_invalid_receive_response_when_receiving_then_reject_without_deliv
 async fn given_cross_region_quarantine_when_publishing_then_sign_each_queue_for_its_region() {
     let transport = ProtocolTransport::default();
     let queue = SqsQueue::try_new_with_client(
-        QueueConfig::sqs("https://sqs.eu-west-2.amazonaws.com/123456789012/source")
-            .with_quarantine_url("https://sqs.eu-central-1.amazonaws.com/123456789012/quarantine"),
+        QueueConfig::sqs(
+            "https://sqs.eu-west-2.amazonaws.com/123456789012/source",
+            envelope_key(),
+        )
+        .with_quarantine_url("https://sqs.eu-central-1.amazonaws.com/123456789012/quarantine"),
         CredentialSource::Static(AwsStaticCredentials {
             access_key_id: "test".into(),
             secret_access_key: "test".into(),
@@ -501,8 +540,11 @@ async fn given_unknown_publication_when_deadline_expires_then_do_not_delete_sour
         .build()
         .unwrap();
     let queue = SqsQueue::try_new_with_client(
-        QueueConfig::sqs("https://sqs.eu-west-2.amazonaws.com/123456789012/source")
-            .with_quarantine_url("https://sqs.eu-west-2.amazonaws.com/123456789012/quarantine"),
+        QueueConfig::sqs(
+            "https://sqs.eu-west-2.amazonaws.com/123456789012/source",
+            envelope_key(),
+        )
+        .with_quarantine_url("https://sqs.eu-west-2.amazonaws.com/123456789012/quarantine"),
         CredentialSource::Static(AwsStaticCredentials {
             access_key_id: "test".into(),
             secret_access_key: "test".into(),
@@ -613,7 +655,10 @@ async fn given_accepted_sqs_dispatch_when_flush_is_aborted_then_retained_batch_r
     };
     let transport = HoldAcceptedResponse::default();
     let queue = SqsQueue::try_new_with_client(
-        QueueConfig::sqs("https://sqs.eu-west-2.amazonaws.com/123456789012/source"),
+        QueueConfig::sqs(
+            "https://sqs.eu-west-2.amazonaws.com/123456789012/source",
+            envelope_key(),
+        ),
         CredentialSource::Static(AwsStaticCredentials {
             access_key_id: "test".into(),
             secret_access_key: "test".into(),
@@ -635,7 +680,7 @@ async fn given_accepted_sqs_dispatch_when_flush_is_aborted_then_retained_batch_r
     let writer = BufferedWrites::builder("cancel-sqs/v1", sink)
         .with_clock(clock.clone())
         .with_buffer_provider(buffer.clone())
-        .fallback(QueueConfig::custom(queue))
+        .fallback(QueueConfig::custom(queue, envelope_key()))
         .build()
         .unwrap();
     writer.add_write_item(1).await.unwrap();
@@ -650,7 +695,7 @@ async fn given_accepted_sqs_dispatch_when_flush_is_aborted_then_retained_batch_r
     let snapshot = buffer
         .inspect(buffered_writes::BufferInspectRequest {
             operation_id: None,
-            now_utc_ms: clock.now_utc().timestamp_millis(),
+            now_utc_ms: clock.now_utc().as_millisecond(),
             now_instant: clock.now_instant(),
             deadline: Deadline::after(Duration::from_secs(2)),
         })
@@ -667,10 +712,9 @@ async fn given_accepted_sqs_dispatch_when_flush_is_aborted_then_retained_batch_r
         .map(|request| serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap())
         .collect();
     assert_eq!(bodies[0]["MessageBody"], bodies[1]["MessageBody"]);
-    let original = buffered_writes::SealedBatch::from_envelope_bytes(
-        bodies[0]["MessageBody"].as_str().unwrap().as_bytes(),
-    )
-    .unwrap();
+    let original = envelope_key()
+        .open(bodies[0]["MessageBody"].as_str().unwrap().as_bytes())
+        .unwrap();
     assert_eq!(original.batch_id(), snapshot.unresolved_batch_ids[0]);
 }
 
@@ -694,4 +738,39 @@ async fn given_queue_url_when_using_json_protocol_then_post_to_service_root_and_
         body["QueueUrl"],
         "https://sqs.eu-west-2.amazonaws.com/123456789012/source"
     );
+}
+
+#[test]
+fn given_sqs_queue_without_quarantine_when_replay_is_built_then_configuration_is_rejected() {
+    let client = HttpClient::builder()
+        .with_transport(ProtocolTransport::default())
+        .build()
+        .unwrap();
+    let queue = SqsQueue::try_new_with_client(
+        QueueConfig::sqs(
+            "https://sqs.eu-west-2.amazonaws.com/123456789012/source",
+            envelope_key(),
+        )
+        .with_region("eu-west-2"),
+        CredentialSource::Static(AwsStaticCredentials {
+            access_key_id: "test-access".into(),
+            secret_access_key: "test-secret".into(),
+            session_token: None,
+        }),
+        client,
+    )
+    .unwrap();
+    let sink = buffered_writes::AtomicSink::try_new(
+        buffered_writes::SinkLimits::default(),
+        |_: buffered_writes::WriteAttempt<u32>| async { Ok::<(), buffered_writes::SinkError>(()) },
+    )
+    .unwrap();
+
+    let result =
+        buffered_writes::ReplayWorker::builder("sqs/v1", queue, envelope_key(), sink).build();
+
+    assert!(matches!(
+        result,
+        Err(buffered_writes::ConfigurationError::InvalidQueueConfiguration { .. })
+    ));
 }

@@ -79,8 +79,10 @@ impl<T: Send + Sync + 'static> ReplayWorker<T> {
         if envelope.envelope_bytes.len() > self.queue.limits().max_envelope_bytes() {
             return Err(poison);
         }
-        let batch =
-            SealedBatch::from_envelope_bytes(&envelope.envelope_bytes).map_err(|_| poison)?;
+        let batch = self
+            .key
+            .open(&envelope.envelope_bytes)
+            .map_err(|_| poison)?;
         batch
             .validate_compatibility(
                 &self.namespace,
@@ -104,7 +106,7 @@ impl<T: Send + Sync + 'static> ReplayWorker<T> {
         let Some(max_age) = self.policy.max_replay_age else {
             return Ok(());
         };
-        let now = self.clock.now_utc().timestamp_millis();
+        let now = crate::observer::utc_millis(self.clock.now_utc());
         if now < batch.first_item_time_ms() {
             return Err(QuarantineReason::UncertainReplayAge);
         }

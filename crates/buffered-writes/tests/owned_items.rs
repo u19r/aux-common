@@ -12,6 +12,10 @@ use buffered_writes::{
 };
 use serde::{Deserialize, Serialize};
 
+fn envelope_key() -> buffered_writes::EnvelopeKey {
+    buffered_writes::EnvelopeKey::try_new([7; 32]).unwrap()
+}
+
 #[derive(Serialize, Deserialize)]
 struct OwnedItem {
     value: Box<u64>,
@@ -37,7 +41,13 @@ async fn given_non_clone_item_when_factory_handles_and_replay_are_used_then_shar
                 .lock()
                 .unwrap()
                 .insert(pending.operation_id().clone(), *pending.value);
-            *captured.lock().unwrap() = Some(attempt.sealed_batch().to_envelope_bytes().unwrap());
+            *captured.lock().unwrap() = Some(
+                envelope_key()
+                    .seal(attempt.sealed_batch().clone())
+                    .unwrap()
+                    .bytes()
+                    .clone(),
+            );
             async { Ok::<(), SinkError>(()) }
         },
     )
@@ -63,7 +73,7 @@ async fn given_non_clone_item_when_factory_handles_and_replay_are_used_then_shar
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let queue = InMemoryQueue::default();
     queue.inject_raw_envelope(envelope.lock().unwrap().clone().unwrap());
-    let replay = ReplayWorker::builder("owned/v1", queue.clone(), sink)
+    let replay = ReplayWorker::builder("owned/v1", queue.clone(), envelope_key(), sink)
         .build()
         .unwrap();
     assert_eq!(
@@ -131,8 +141,11 @@ async fn given_non_clone_item_when_extension_client_is_shared_then_ipc_submissio
         .unwrap();
     let server = buffered_writes::LambdaExtensionServer::bind(
         writer.clone(),
-        buffered_writes::LambdaIpcConfig::try_new("127.0.0.1:0".parse().unwrap(), "test-token")
-            .unwrap(),
+        buffered_writes::LambdaIpcConfig::try_new(
+            "127.0.0.1:0".parse().unwrap(),
+            "test-token-0123456789",
+        )
+        .unwrap(),
     )
     .await
     .unwrap();
@@ -144,8 +157,11 @@ async fn given_non_clone_item_when_extension_client_is_shared_then_ipc_submissio
         async move { server.serve().await }
     });
     let mut runtime = buffered_writes::LambdaExtensionClient::new(
-        buffered_writes::LambdaIpcConfig::try_new(server.local_addr().unwrap(), "test-token")
-            .unwrap(),
+        buffered_writes::LambdaIpcConfig::try_new(
+            server.local_addr().unwrap(),
+            "test-token-0123456789",
+        )
+        .unwrap(),
     );
     let client = runtime
         .begin_invocation("invocation-1", "attempt-invocation-1")

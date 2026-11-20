@@ -65,6 +65,9 @@ pub enum CounterMetric {
     BillingAttentionOpenedTotal,
     /// Labels: `kind`. Values must be compile-time constants.
     BillingAttentionResolvedTotal,
+    /// Labels: `kind`. One increment per tenant controller cycle in which the
+    /// oldest open item of the kind is older than its limit.
+    BillingAttentionOverdueTotal,
     /// Labels: `provider_kind`, `operation_kind`, `outcome`. Values must be
     /// compile-time constants.
     BillingProviderCallTotal,
@@ -313,6 +316,7 @@ impl CounterMetric {
             Self::BillingWorkerStepTotal => "billing_worker_step_total",
             Self::BillingAttentionOpenedTotal => "billing_attention_opened_total",
             Self::BillingAttentionResolvedTotal => "billing_attention_resolved_total",
+            Self::BillingAttentionOverdueTotal => "billing_attention_overdue_total",
             Self::BillingProviderCallTotal => "billing_provider_call_total",
             Self::BillingIntegrityMismatchTotal => "billing_integrity_mismatch_total",
             Self::BillingRouteMetricCandidatesTotal => "billing_route_metric_candidates_total",

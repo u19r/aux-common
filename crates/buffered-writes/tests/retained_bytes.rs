@@ -16,7 +16,7 @@ async fn inspect(buffer: &MemoryBuffer) -> buffered_writes::BufferSnapshot {
     buffer
         .inspect(BufferInspectRequest {
             operation_id: None,
-            now_utc_ms: chrono::Utc::now().timestamp_millis(),
+            now_utc_ms: jiff::Timestamp::now().as_millisecond(),
             now_instant: Instant::now(),
             deadline: Deadline::after(Duration::from_secs(1)),
         })
@@ -161,7 +161,7 @@ async fn given_oversized_seal_when_provider_checks_capacity_then_preserve_claim_
         .build()
         .unwrap();
     writer.add_write_item(7).await.unwrap();
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = jiff::Timestamp::now().as_millisecond();
     let ClaimedWork::OpenCandidate(candidate) = buffer
         .claim(BufferClaimRequest {
             max_watermark: None,

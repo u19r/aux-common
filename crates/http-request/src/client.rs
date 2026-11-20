@@ -12,7 +12,7 @@ use tracing::{debug, warn};
 
 use crate::{
     constants::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT},
-    error::{HttpRequestError, HttpRequestErrorKind, Result},
+    error::{HttpRequestDispatchStatus, HttpRequestError, HttpRequestErrorKind, Result},
     observer::{HttpRequestAttempt, HttpRequestObserver, active_http_request_observer},
     response::HttpResponse,
     retry::RetryConfig,
@@ -360,7 +360,19 @@ impl HttpClient {
     }
 
     pub async fn execute(&self, request: Request) -> Result<HttpResponse> {
-        let mut attempts = RequestAttempts::new(request, &self.retry, self.observer.as_ref());
+        self.execute_attempts(request, None).await
+    }
+
+    /// Send `request` under this client's retry policy. With a `deadline`,
+    /// each attempt's timeout is the time left before it, and a retry whose
+    /// wait would reach it is not attempted.
+    pub(crate) async fn execute_attempts(
+        &self,
+        request: Request,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<HttpResponse> {
+        let mut attempts =
+            RequestAttempts::new(request, &self.retry, self.observer.as_ref(), deadline);
         loop {
             let request = attempts.next_request()?;
             let start = Instant::now();
@@ -383,6 +395,9 @@ struct RequestAttempts<'a> {
     diagnostics: RequestAttemptDiagnostics,
     max_retries: u32,
     attempt: u32,
+    deadline: Option<tokio::time::Instant>,
+    /// Whether an earlier attempt may have reached the destination.
+    dispatched: bool,
 }
 
 impl<'a> RequestAttempts<'a> {
@@ -390,6 +405,7 @@ impl<'a> RequestAttempts<'a> {
         request: Request,
         retry: &'a RetryConfig,
         observer: Option<&'a Arc<dyn HttpRequestObserver>>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Self {
         let first_request = request.try_clone();
         let can_retry = first_request.is_some() && retry.should_retry_method(request.method());
@@ -401,13 +417,15 @@ impl<'a> RequestAttempts<'a> {
             diagnostics: request_attempt_diagnostics(request.url()),
             max_retries,
             attempt: 0,
+            deadline,
+            dispatched: false,
             first_request,
             base_request: Some(request),
         }
     }
 
     fn next_request(&mut self) -> Result<Request> {
-        let request = if self.attempt == 0 {
+        let mut request = if self.attempt == 0 {
             self.first_request
                 .take()
                 .or_else(|| self.base_request.take())
@@ -418,6 +436,10 @@ impl<'a> RequestAttempts<'a> {
                 .and_then(reqwest::Request::try_clone)
                 .ok_or(HttpRequestError::RequestNotCloneable)?
         };
+        if let Some(deadline) = self.deadline {
+            *request.timeout_mut() =
+                Some(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        }
         debug!(
             attempt = self.attempt,
             method = self.method_label,
@@ -435,42 +457,55 @@ impl<'a> RequestAttempts<'a> {
         start: Instant,
     ) -> Option<Result<HttpResponse>> {
         let status = result.as_ref().ok().map(HttpResponse::status);
-        let retrying = self.attempt < self.max_retries
-            && (status.is_some_and(should_retry_status)
-                || result.as_ref().is_err_and(should_retry_error));
+        let retry_delay = self.find_retry_delay(&result);
         let observation = HttpRequestAttempt::new(
             self.method_label,
             status,
             self.attempt,
-            retrying,
+            retry_delay.is_some(),
             start.elapsed(),
         );
         match self.observer {
             Some(observer) => observer.observe_attempt(observation),
             None => active_http_request_observer().observe_attempt(observation),
         }
-        if !retrying {
-            return Some(result);
-        }
-
-        self.attempt += 1;
-        let attempt = self.attempt;
-        let (status, error_kind, delay) = match result {
-            Ok(response) => {
-                let status = response.status();
-                let delay =
-                    retry_delay_for_response(self.retry, &response, attempt.saturating_sub(1));
-                (Some(status), None, delay)
-            }
-            Err(error) => (
-                None,
-                Some(error.kind()),
-                self.retry.backoff_delay(attempt.saturating_sub(1)),
-            ),
+        let Some(delay) = retry_delay else {
+            return Some(if self.dispatched {
+                result.map_err(HttpRequestError::after_dispatch)
+            } else {
+                result
+            });
         };
-        self.wait_for_retry(attempt, status, error_kind, delay)
+
+        self.dispatched |= !result.as_ref().is_err_and(|error| {
+            error.dispatch_status() == HttpRequestDispatchStatus::NotDispatched
+        });
+        let error_kind = result.as_ref().err().map(HttpRequestError::kind);
+        // Release the retried response's connection before waiting.
+        drop(result);
+        self.attempt += 1;
+        self.wait_for_retry(self.attempt, status, error_kind, delay)
             .await;
         None
+    }
+
+    fn find_retry_delay(&self, result: &Result<HttpResponse>) -> Option<Duration> {
+        if self.attempt >= self.max_retries {
+            return None;
+        }
+        let delay = match result {
+            Ok(response) if should_retry_status(response.status()) => {
+                retry_delay_for_response(self.retry, response, self.attempt)
+            }
+            Err(error) if should_retry_error(error) => self.retry.backoff_delay(self.attempt),
+            _ => return None,
+        };
+        // The operation deadline also bounds retries: skip a retry whose wait
+        // would leave no time to send it.
+        let fits_deadline = self.deadline.is_none_or(|deadline| {
+            delay < deadline.saturating_duration_since(tokio::time::Instant::now())
+        });
+        fits_deadline.then_some(delay)
     }
 
     async fn wait_for_retry(

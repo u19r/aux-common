@@ -11,11 +11,11 @@ doctest = false
 
 [dependencies]
 aws-credentials = { workspace = true }
-chrono = { workspace = true }
 data-encoding = { workspace = true }
 hmac = { workspace = true }
 http = { workspace = true }
 http-request = { path = "../http-request" }
+jiff = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }

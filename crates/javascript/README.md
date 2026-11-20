@@ -127,7 +127,7 @@ It depends on this crate without `runtime`; native hosts never compile or link Q
 The default `runtime` feature enables the runtime and the build-time compiler.
 Without `runtime`, the guest producer activates neither Wasmtime nor the native precompiler.
 
-Build prerequisites: Rust 1.99.1 with `wasm32-wasip1` and Clippy, and an explicit WASI SDK 24.0 path.
+Build prerequisites: Rust 1.100.0 with `wasm32-wasip1` and Clippy, and an explicit WASI SDK 24.0 path.
 Set `CARGO_TARGET_DIR` to an isolated build directory and `WASI_SDK` to the SDK directory.
 
 Artifact regeneration commands require the full development checkout, which includes the

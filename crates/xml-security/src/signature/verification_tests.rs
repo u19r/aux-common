@@ -1864,3 +1864,39 @@ fn given_signed_assertion_nested_in_forged_assertion_when_verifying_then_expose_
         Some("alice")
     );
 }
+
+#[test]
+fn given_attacker_values_in_rejected_signature_shapes_when_verifying_then_errors_do_not_echo_them()
+{
+    // Given documents whose rejected parts carry attacker-chosen IDs, element
+    // names, namespace URIs, and inclusive prefixes. Callers forward these
+    // messages to HTTP responses and logs, so they must stay fixed categories.
+    let marker = "attacker-marker";
+    let ds = DS_NS;
+    let cases = [
+        format!(
+            r#"<r ID="x{marker}&#xA;forged log line"><c ID="x{marker}&#xA;forged log line"/></r>"#
+        ),
+        format!(r#"<r ID="r"><Signature xmlns="urn:{marker}"/></r>"#),
+        format!(r#"<r ID="r"><ds:Signature xmlns:ds="{ds}"><ds:{marker}/></ds:Signature></r>"#),
+        format!(
+            r#"<r ID="r"><ds:Signature xmlns:ds="{ds}"><SignedInfo xmlns="urn:{marker}"/></ds:Signature></r>"#
+        ),
+        format!(
+            r#"<r ID="r"><ds:Signature xmlns:ds="{ds}"><ds:SignedInfo><ds:{marker}/></ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue></ds:Signature></r>"#
+        ),
+        format!(r#"<r a="1" a="2{marker}"/>"#),
+    ];
+
+    for xml in cases {
+        // When verification rejects the document.
+        let error = super::VerifiedXmlDocument::verify_enveloped(&xml, &[vec![1_u8]])
+            .expect_err("malformed signature shape must be rejected");
+
+        // Then neither Display nor Debug renders the attacker-chosen bytes.
+        assert!(
+            !error.to_string().contains(marker) && !format!("{error:?}").contains(marker),
+            "error echoed attacker input: {error:?}"
+        );
+    }
+}

@@ -895,7 +895,7 @@ async fn given_future_retained_timestamp_when_remote_retries_then_metadata_match
         .unwrap();
     let mut state: serde_json::Value = serde_json::from_slice(&state_bytes).unwrap();
     let mut metadata: serde_json::Value = serde_json::from_slice(&metadata_bytes).unwrap();
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = jiff::Timestamp::now().as_millisecond();
     let future = now + 3_600_000;
     // Simulate rollback after a later retry schedule while the original batch
     // remains older than current provider time. Keep its immutable digest
@@ -981,7 +981,7 @@ async fn given_client_clock_ahead_of_provider_when_retry_backoff_expires_then_no
     })
     .unwrap();
     let clock = buffered_writes::TestClock::with_utc_millis(
-        chrono::Utc::now().timestamp_millis() + 3_600_000,
+        jiff::Timestamp::now().as_millisecond() + 3_600_000,
     );
     clock.set_auto_advance_on_sleep(false);
     let writer = BufferedWrites::builder("clock-skew/v1", sink)
@@ -1069,7 +1069,7 @@ async fn given_same_namespace_when_old_metadata_is_mixed_with_new_state_then_rej
         provider
             .inspect(buffered_writes::BufferInspectRequest {
                 operation_id: None,
-                now_utc_ms: chrono::Utc::now().timestamp_millis(),
+                now_utc_ms: jiff::Timestamp::now().as_millisecond(),
                 now_instant: Instant::now(),
                 deadline: Deadline::after(Duration::from_secs(1))
             })
@@ -1145,7 +1145,7 @@ async fn given_tls_peer_when_ca_hostname_or_password_is_wrong_then_reject_withou
             provider
                 .inspect(buffered_writes::BufferInspectRequest {
                     operation_id: None,
-                    now_utc_ms: chrono::Utc::now().timestamp_millis(),
+                    now_utc_ms: jiff::Timestamp::now().as_millisecond(),
                     now_instant: Instant::now(),
                     deadline: Deadline::after(Duration::from_millis(300))
                 })
@@ -1211,7 +1211,7 @@ async fn given_expiring_or_lost_retention_when_live_provider_inspects_then_rejec
         .unwrap();
     let inspect = || buffered_writes::BufferInspectRequest {
         operation_id: None,
-        now_utc_ms: chrono::Utc::now().timestamp_millis(),
+        now_utc_ms: jiff::Timestamp::now().as_millisecond(),
         now_instant: Instant::now(),
         deadline: Deadline::after(Duration::from_secs(2)),
     };
@@ -1473,7 +1473,7 @@ async fn given_active_lease_when_network_delay_crosses_expiry_before_cas_then_re
         max_items: 25,
         max_bytes: 64 * 1024,
         lease_duration: Duration::from_millis(100),
-        now_utc_ms: chrono::Utc::now().timestamp_millis(),
+        now_utc_ms: jiff::Timestamp::now().as_millisecond(),
         now_instant: Instant::now(),
         deadline: Deadline::after(Duration::from_secs(2)),
     };
@@ -1529,7 +1529,7 @@ async fn given_replicated_claim_when_primary_fails_and_replica_is_promoted_then_
         max_items: 25,
         max_bytes: 64 * 1024,
         lease_duration: Duration::from_secs(10),
-        now_utc_ms: chrono::Utc::now().timestamp_millis(),
+        now_utc_ms: jiff::Timestamp::now().as_millisecond(),
         now_instant: Instant::now(),
         deadline: Deadline::after(Duration::from_secs(10)),
     };
@@ -1630,7 +1630,7 @@ fn cancellation_append(id: &str, value: u32) -> buffered_writes::BufferAppendReq
             operation_id: OperationId::try_from(id).unwrap(),
             scope: buffered_writes::TenantScope::try_from("cancel-scope").unwrap(),
             codec_version: "serde-json/v1".to_owned(),
-            admitted_at_utc_ms: chrono::Utc::now().timestamp_millis(),
+            admitted_at_utc_ms: jiff::Timestamp::now().as_millisecond(),
             admitted_at_mono: Instant::now(),
             payload: bytes::Bytes::from(serde_json::to_vec(&value).unwrap()),
         },
@@ -1647,7 +1647,7 @@ fn cancellation_claim() -> BufferClaimRequest {
         max_items: 25,
         max_bytes: 64 * 1024,
         lease_duration: Duration::from_millis(500),
-        now_utc_ms: chrono::Utc::now().timestamp_millis(),
+        now_utc_ms: jiff::Timestamp::now().as_millisecond(),
         now_instant: Instant::now(),
         deadline: Deadline::after(Duration::from_secs(5)),
     }
@@ -1687,7 +1687,7 @@ fn cancellation_seal(
         action: BufferSealAction::InstallBatch(batch),
         capacity: BufferCapacity::default(),
         lease_duration: Duration::from_millis(500),
-        now_utc_ms: chrono::Utc::now().timestamp_millis(),
+        now_utc_ms: jiff::Timestamp::now().as_millisecond(),
         deadline: Deadline::after(Duration::from_secs(5)),
     }
 }
@@ -1740,7 +1740,7 @@ async fn given_each_provider_operation_when_caller_cancels_after_server_commit_t
         }
         let inspect = || BufferInspectRequest {
             operation_id: Some(original.record.operation_id.clone()),
-            now_utc_ms: chrono::Utc::now().timestamp_millis(),
+            now_utc_ms: jiff::Timestamp::now().as_millisecond(),
             now_instant: Instant::now(),
             deadline: Deadline::after(Duration::from_secs(5)),
         };
@@ -1767,7 +1767,7 @@ async fn given_each_provider_operation_when_caller_cancels_after_server_commit_t
                             batch_id: work.batch.batch_id(),
                             fencing_token: work.fencing_token,
                             lease_duration: Duration::from_secs(2),
-                            now_utc_ms: chrono::Utc::now().timestamp_millis(),
+                            now_utc_ms: jiff::Timestamp::now().as_millisecond(),
                             deadline: Deadline::after(Duration::from_secs(5)),
                         })
                         .await;
@@ -1781,7 +1781,7 @@ async fn given_each_provider_operation_when_caller_cancels_after_server_commit_t
                             batch_id: work.batch.batch_id(),
                             fencing_token: work.fencing_token,
                             disposition: SettleDisposition::Delivered,
-                            now_utc_ms: chrono::Utc::now().timestamp_millis(),
+                            now_utc_ms: jiff::Timestamp::now().as_millisecond(),
                             deadline: Deadline::after(Duration::from_secs(5)),
                         })
                         .await;
@@ -1845,7 +1845,7 @@ async fn given_each_provider_operation_when_caller_cancels_after_server_commit_t
                     disposition: SettleDisposition::ReleaseForRetry {
                         retry_delay: Duration::ZERO,
                     },
-                    now_utc_ms: chrono::Utc::now().timestamp_millis(),
+                    now_utc_ms: jiff::Timestamp::now().as_millisecond(),
                     deadline: Deadline::after(Duration::from_secs(5)),
                 })
                 .await

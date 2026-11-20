@@ -136,7 +136,7 @@ async fn given_future_retained_timestamp_when_disk_retries_then_inspection_match
 /// old. Retry eligibility must agree between metadata inspection and actual
 /// claiming.
 pub(crate) async fn verify_retry_clock(buffer: impl WriteBuffer) {
-    let regressed = chrono::Utc::now().timestamp_millis();
+    let regressed = jiff::Timestamp::now().as_millisecond();
     let now = regressed + 3_600_000;
     let first_item = now - 7_200_000;
     let deadline = Deadline::after(Duration::from_secs(5));

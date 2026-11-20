@@ -118,7 +118,7 @@ impl Drop for MetadataService {
     }
 }
 fn notice() -> String {
-    serde_json::json!({"action":"terminate", "time":(chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339()}).to_string()
+    serde_json::json!({"action":"terminate", "time":(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(60)).to_string()}).to_string()
 }
 
 #[tokio::test]

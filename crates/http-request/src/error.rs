@@ -34,6 +34,10 @@ pub enum HttpRequestError {
     InvalidUrl,
     #[error("response body could not be decoded")]
     Decode,
+    /// A failure that followed an attempt or redirect hop of the same
+    /// operation that may already have reached the destination.
+    #[error("{source} after an earlier dispatch")]
+    AfterDispatch { source: Box<HttpRequestError> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,11 +104,13 @@ impl HttpRequestError {
             HttpRequestError::SsrfBlocked { .. } => HttpRequestErrorKind::Ssrf,
             HttpRequestError::InvalidUrl => HttpRequestErrorKind::InvalidUrl,
             HttpRequestError::Decode => HttpRequestErrorKind::Decode,
+            HttpRequestError::AfterDispatch { source } => source.kind(),
         }
     }
 
     /// Classifies whether a caller may safely treat the operation as not
-    /// applied.
+    /// applied. Any failure after an earlier attempt or redirect hop was
+    /// dispatched is `PossiblyDispatched`.
     #[must_use]
     pub const fn dispatch_status(&self) -> HttpRequestDispatchStatus {
         match self {
@@ -127,7 +133,21 @@ impl HttpRequestError {
             | Self::CacheTtlOverflow { .. }
             | Self::HttpStatus { .. }
             | Self::RedirectBlocked { .. }
-            | Self::Decode => HttpRequestDispatchStatus::PossiblyDispatched,
+            | Self::Decode
+            | Self::AfterDispatch { .. } => HttpRequestDispatchStatus::PossiblyDispatched,
+        }
+    }
+
+    /// Records that an earlier attempt or redirect hop of the same operation
+    /// may have reached the destination, so this failure no longer proves the
+    /// operation was not applied.
+    #[must_use]
+    pub(crate) fn after_dispatch(self) -> Self {
+        match self.dispatch_status() {
+            HttpRequestDispatchStatus::NotDispatched => Self::AfterDispatch {
+                source: Box::new(self),
+            },
+            HttpRequestDispatchStatus::PossiblyDispatched => self,
         }
     }
 }

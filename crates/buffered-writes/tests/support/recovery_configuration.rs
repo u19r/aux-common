@@ -24,7 +24,7 @@ async fn inspect(buffer: &impl WriteBuffer) -> buffered_writes::BufferSnapshot {
     buffer
         .inspect(BufferInspectRequest {
             operation_id: None,
-            now_utc_ms: chrono::Utc::now().timestamp_millis(),
+            now_utc_ms: jiff::Timestamp::now().as_millisecond(),
             now_instant: Instant::now(),
             deadline: Deadline::after(Duration::from_secs(1)),
         })

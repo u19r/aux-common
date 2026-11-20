@@ -116,6 +116,7 @@ fn request(resource_type: &str) -> EvaluationRequest {
 fn internal_context() -> CedarInternalContext {
     CedarInternalContext {
         token_present: false,
+        token_is_subject_credential: false,
         token_valid: true,
         token_resource_filter_enabled: false,
         token_resource_filter: Vec::new(),
@@ -131,6 +132,7 @@ fn internal_context() -> CedarInternalContext {
         session_auth_age_seconds: 0,
         session_mfa_age_present: false,
         session_mfa_age_seconds: 0,
+        capacity_accounting: false,
     }
 }
 

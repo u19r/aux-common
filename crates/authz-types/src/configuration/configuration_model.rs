@@ -1,28 +1,40 @@
 use std::{
     collections::{HashMap, HashSet},
     ops::Deref,
+    rc::Rc,
 };
 
 use serde::{Deserialize, Serialize};
 use url::Url;
 use utoipa::ToSchema;
 
-use super::constants::{
-    ACTION_MAX, AUTHN_ALGORITHMS_MAX, AUTHN_AUDIENCES_MAX, AUTHN_URL_MAX, ID_MAX, NAME_MAX,
-    RESOURCE_TYPE_MAX,
+use super::{
+    action_pattern::{ActionPattern, is_action_name_char},
+    constants::{
+        ACTION_MAX, AUTHN_ALGORITHMS_MAX, AUTHN_AUDIENCES_MAX, AUTHN_URL_MAX, ID_MAX, NAME_MAX,
+        RESOURCE_TYPE_MAX,
+    },
 };
 use crate::{
     ActionPatternExpandError, AuthnProviderConfig, ExpandedActionRef,
-    MAX_ACTIONS_PER_RESOURCE_TYPE, MAX_AUTHN_PROVIDERS, MAX_PERMISSION_ACTION_REFS,
-    MAX_PERMISSIONS, MAX_RESOURCE_TYPES, MAX_ROLE_ACTION_REFS, MAX_ROLE_ENTRY_SCOPES,
-    MAX_ROLE_PERMISSION_REFS, MAX_ROLES, MAX_SCOPE_MAPPING_INCLUDES, MAX_SCOPE_MAPPING_PERMISSIONS,
-    MAX_SCOPE_MAPPINGS, MAX_STEP_UP_RULES, Permission, PermissionActionRef, ResourceType, Role,
+    MAX_ACTIONS_PER_RESOURCE_TYPE, MAX_AUTHN_PROVIDERS, MAX_EXPANDED_ACTION_REFS,
+    MAX_PERMISSION_ACTION_REFS, MAX_PERMISSIONS, MAX_POLICY_LINKS, MAX_RESOURCE_TYPES,
+    MAX_ROLE_ACTION_REFS, MAX_ROLE_ENTRY_SCOPES, MAX_ROLE_PERMISSION_REFS, MAX_ROLES,
+    MAX_SCOPE_MAPPING_INCLUDES, MAX_SCOPE_MAPPING_PERMISSIONS, MAX_SCOPE_MAPPINGS,
+    MAX_STEP_UP_RULES, Permission, PermissionActionRef, ResourceType, ResourceTypeId, Role,
     RoleActionRef, Scope, ScopeMappingEntry, StepUpConfig, StepUpRule, ValidationError,
     expand_action_patterns,
 };
 
-pub(crate) type ActionPatternCache =
-    HashMap<(String, String), Result<Vec<ExpandedActionRef>, ActionPatternExpandError>>;
+/// Match counts per normalized `(resource_type, action)` pattern. Validation
+/// counts matches instead of materializing them so wildcard expansion can be
+/// bounded before it allocates.
+type ActionPatternCountCache = HashMap<(String, String), Result<usize, ActionPatternExpandError>>;
+
+/// Expanded references per normalized pattern, shared across every entry that
+/// repeats the pattern. Built only after the expansion bounds pass.
+pub(super) type ActionPatternExpansionCache =
+    HashMap<(String, String), Result<Rc<[ExpandedActionRef]>, ActionPatternExpandError>>;
 
 /// Complete authorization configuration model.
 /// This is what customers send to configure their authorization.
@@ -111,7 +123,13 @@ impl ConfigurationModel {
 
     fn validate_with_options(&self, allow_wildcards: bool) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
-        let mut action_pattern_cache = ActionPatternCache::new();
+        let mut references = ActionReferenceValidator {
+            resource_types: self.resource_types.as_slice(),
+            allow_wildcards,
+            match_counts: ActionPatternCountCache::new(),
+        };
+        let mut expansion = ExpansionBudget::default();
+        let mut permission_action_counts = HashMap::with_capacity(self.permissions.len());
 
         // Check resource type limits
         if self.resource_types.len() > MAX_RESOURCE_TYPES {
@@ -154,13 +172,17 @@ impl ConfigurationModel {
                 )));
             }
 
-            if rt.id.is_empty() || rt.id.len() > RESOURCE_TYPE_MAX {
-                errors.push(ValidationError::OutOfRange {
-                    field: "resource_types[].id",
-                    message: format!("must be 1..={RESOURCE_TYPE_MAX} characters"),
-                });
+            // The resource type ID charset keeps Cedar action IDs
+            // (`resource_type:action`), token selections, and bundle
+            // manifest keys unambiguous.
+            if let Err(mut error) = ResourceTypeId::new(rt.id.as_str()) {
+                if let ValidationError::InvalidFormat { field, .. }
+                | ValidationError::OutOfRange { field, .. } = &mut error
+                {
+                    *field = "resource_types[].id";
+                }
+                errors.push(error);
             }
-            validate_catalog_identifier(&mut errors, "resource_types[].id", rt.id.as_str());
             if rt.name.is_empty() || rt.name.len() > NAME_MAX {
                 errors.push(ValidationError::OutOfRange {
                     field: "resource_types[].name",
@@ -182,11 +204,12 @@ impl ConfigurationModel {
                         message: format!("must be 1..={ACTION_MAX} characters"),
                     });
                 }
-                validate_catalog_identifier(
-                    &mut errors,
-                    "resource_types[].actions[].name",
-                    action.name.as_str(),
-                );
+                if !action.name.chars().all(is_action_name_char) {
+                    errors.push(ValidationError::InvalidFormat {
+                        field: "resource_types[].actions[].name",
+                        message: "must use ASCII letters, digits, '_', '-', or '.'".into(),
+                    });
+                }
             }
         }
 
@@ -233,42 +256,36 @@ impl ConfigurationModel {
                     message: "must include at least one action reference".into(),
                 });
             }
-            if perm.actions.len() > MAX_PERMISSION_ACTION_REFS {
-                errors.push(ValidationError::LimitExceeded {
-                    resource: "permission_actions",
-                    limit: MAX_PERMISSION_ACTION_REFS,
-                    actual: perm.actions.len(),
-                });
-            }
-            if perm.not_actions.len() > MAX_PERMISSION_ACTION_REFS {
-                errors.push(ValidationError::LimitExceeded {
-                    resource: "permission_not_actions",
-                    limit: MAX_PERMISSION_ACTION_REFS,
-                    actual: perm.not_actions.len(),
-                });
-            }
-            for action in &perm.actions {
-                validate_action_reference(
-                    &mut errors,
-                    "permissions[].actions[]",
-                    action.resource_type.as_str(),
-                    action.action_name.as_str(),
-                    self.resource_types.as_slice(),
-                    allow_wildcards,
-                    &mut action_pattern_cache,
-                );
-            }
-            for action in &perm.not_actions {
-                validate_action_reference(
-                    &mut errors,
-                    "permissions[].not_actions[]",
-                    action.resource_type.as_str(),
-                    action.action_name.as_str(),
-                    self.resource_types.as_slice(),
-                    allow_wildcards,
-                    &mut action_pattern_cache,
-                );
-            }
+            let action_count = references.validate_all(
+                &mut errors,
+                "permissions[].actions[]",
+                perm.actions
+                    .iter()
+                    .map(|action| (action.resource_type.as_str(), action.action_name.as_str())),
+            );
+            expansion.add_entry(
+                &mut errors,
+                "permission_actions",
+                MAX_PERMISSION_ACTION_REFS,
+                action_count,
+            );
+            let not_action_count = references.validate_all(
+                &mut errors,
+                "permissions[].not_actions[]",
+                perm.not_actions
+                    .iter()
+                    .map(|action| (action.resource_type.as_str(), action.action_name.as_str())),
+            );
+            expansion.add_entry(
+                &mut errors,
+                "permission_not_actions",
+                MAX_PERMISSION_ACTION_REFS,
+                not_action_count,
+            );
+            permission_action_counts.insert(
+                perm.id.as_str(),
+                action_count.saturating_add(not_action_count),
+            );
         }
 
         // Check roles reference valid permissions
@@ -334,20 +351,6 @@ impl ConfigurationModel {
                     actual: role.permissions.len(),
                 });
             }
-            if role.actions.len() > MAX_ROLE_ACTION_REFS {
-                errors.push(ValidationError::LimitExceeded {
-                    resource: "role_actions",
-                    limit: MAX_ROLE_ACTION_REFS,
-                    actual: role.actions.len(),
-                });
-            }
-            if role.not_actions.len() > MAX_ROLE_ACTION_REFS {
-                errors.push(ValidationError::LimitExceeded {
-                    resource: "role_not_actions",
-                    limit: MAX_ROLE_ACTION_REFS,
-                    actual: role.not_actions.len(),
-                });
-            }
             for permission in &role.permissions {
                 if !perm_ids.contains(permission.permission_id.as_str()) {
                     errors.push(ValidationError::ReferenceNotFound {
@@ -355,6 +358,13 @@ impl ConfigurationModel {
                         id: permission.permission_id.as_str().to_string(),
                     });
                 }
+                expansion.add_policy_links(
+                    permission_action_counts
+                        .get(permission.permission_id.as_str())
+                        .copied()
+                        .unwrap_or_default(),
+                    permission.scopes.len(),
+                );
                 if permission.scopes.len() > MAX_ROLE_ENTRY_SCOPES {
                     errors.push(ValidationError::LimitExceeded {
                         resource: "role_permission_scopes",
@@ -363,16 +373,16 @@ impl ConfigurationModel {
                     });
                 }
             }
+            let mut role_action_count = 0_usize;
             for action in &role.actions {
-                validate_action_reference(
+                let count = references.validate(
                     &mut errors,
                     "roles[].actions[]",
                     action.resource_type.as_str(),
                     action.action_name.as_str(),
-                    self.resource_types.as_slice(),
-                    allow_wildcards,
-                    &mut action_pattern_cache,
                 );
+                role_action_count = role_action_count.saturating_add(count);
+                expansion.add_policy_links(count, action.scopes.len());
                 if action.scopes.len() > MAX_ROLE_ENTRY_SCOPES {
                     errors.push(ValidationError::LimitExceeded {
                         resource: "role_action_scopes",
@@ -386,16 +396,22 @@ impl ConfigurationModel {
                     errors.push(error);
                 }
             }
+            expansion.add_entry(
+                &mut errors,
+                "role_actions",
+                MAX_ROLE_ACTION_REFS,
+                role_action_count,
+            );
+            let mut role_not_action_count = 0_usize;
             for action in &role.not_actions {
-                validate_action_reference(
+                let count = references.validate(
                     &mut errors,
                     "roles[].not_actions[]",
                     action.resource_type.as_str(),
                     action.action_name.as_str(),
-                    self.resource_types.as_slice(),
-                    allow_wildcards,
-                    &mut action_pattern_cache,
                 );
+                role_not_action_count = role_not_action_count.saturating_add(count);
+                expansion.add_policy_links(count, action.scopes.len());
                 if action.scopes.len() > MAX_ROLE_ENTRY_SCOPES {
                     errors.push(ValidationError::LimitExceeded {
                         resource: "role_not_action_scopes",
@@ -410,9 +426,16 @@ impl ConfigurationModel {
                     });
                 }
             }
+            expansion.add_entry(
+                &mut errors,
+                "role_not_actions",
+                MAX_ROLE_ACTION_REFS,
+                role_not_action_count,
+            );
         }
+        expansion.check_totals(&mut errors);
 
-        validate_resource_scope_configuration(self, &mut errors, &mut action_pattern_cache);
+        validate_resource_scope_configuration(self, &mut errors);
 
         if self.authn_providers.len() > MAX_AUTHN_PROVIDERS {
             errors.push(ValidationError::LimitExceeded {
@@ -697,43 +720,46 @@ impl ConfigurationModel {
         }
     }
 
+    /// Expand wildcard references. Callers run `validate_with_options(true)`
+    /// first, which bounds the expanded size from match counts, so the
+    /// allocations here are bounded by `MAX_EXPANDED_ACTION_REFS`.
     fn expand_for_validated(&self) -> Result<Self, Vec<ValidationError>> {
         let mut expanded = self.clone();
         let mut errors = Vec::new();
-        let resource_types = expanded.resource_types.clone();
-        let mut action_pattern_cache = ActionPatternCache::new();
+        let mut expansions = ActionPatternExpansionCache::new();
+        let resource_types = self.resource_types.as_slice();
 
         for permission in &mut expanded.permissions {
             permission.actions = expand_permission_action_refs(
-                resource_types.as_slice(),
+                resource_types,
                 permission.actions.as_slice(),
                 "permissions[].actions[]",
                 &mut errors,
-                &mut action_pattern_cache,
+                &mut expansions,
             );
             permission.not_actions = expand_permission_action_refs(
-                resource_types.as_slice(),
+                resource_types,
                 permission.not_actions.as_slice(),
                 "permissions[].not_actions[]",
                 &mut errors,
-                &mut action_pattern_cache,
+                &mut expansions,
             );
         }
 
         for role in &mut expanded.roles {
             role.actions = expand_role_action_refs(
-                resource_types.as_slice(),
+                resource_types,
                 role.actions.as_slice(),
                 "roles[].actions[]",
                 &mut errors,
-                &mut action_pattern_cache,
+                &mut expansions,
             );
             role.not_actions = expand_role_action_refs(
-                resource_types.as_slice(),
+                resource_types,
                 role.not_actions.as_slice(),
                 "roles[].not_actions[]",
                 &mut errors,
-                &mut action_pattern_cache,
+                &mut expansions,
             );
         }
 
@@ -745,11 +771,170 @@ impl ConfigurationModel {
     }
 }
 
+/// Validates action references against the catalog and counts what each would
+/// expand to, without materializing any expansion.
+struct ActionReferenceValidator<'catalog> {
+    resource_types: &'catalog [ResourceType],
+    allow_wildcards: bool,
+    match_counts: ActionPatternCountCache,
+}
+
+impl ActionReferenceValidator<'_> {
+    /// Validate references and return their total expanded count.
+    fn validate_all<'reference>(
+        &mut self,
+        errors: &mut Vec<ValidationError>,
+        field: &'static str,
+        references: impl Iterator<Item = (&'reference str, &'reference str)>,
+    ) -> usize {
+        references.fold(0_usize, |total, (resource_type, action_name)| {
+            total.saturating_add(self.validate(errors, field, resource_type, action_name))
+        })
+    }
+
+    /// Validate one reference and return its expanded count. An invalid
+    /// reference counts as one, so a count never undercounts the raw list.
+    fn validate(
+        &mut self,
+        errors: &mut Vec<ValidationError>,
+        field: &'static str,
+        resource_type: &str,
+        action_name: &str,
+    ) -> usize {
+        let has_wildcard = resource_type.contains('*') || action_name.contains('*');
+        if has_wildcard && !self.allow_wildcards {
+            errors.push(ValidationError::InvalidFormat {
+                field,
+                message: "wildcards are not allowed in validated action references".into(),
+            });
+            return 1;
+        }
+
+        match self.count(resource_type, action_name) {
+            Ok(count) => count,
+            Err(error) => {
+                self.append_reference_error(errors, field, error, resource_type, action_name);
+                1
+            }
+        }
+    }
+
+    fn append_reference_error(
+        &self,
+        errors: &mut Vec<ValidationError>,
+        field: &'static str,
+        error: ActionPatternExpandError,
+        resource_type: &str,
+        action_name: &str,
+    ) {
+        match error {
+            ActionPatternExpandError::NoMatches {
+                resource_type_pattern,
+                used_wildcard: false,
+                ..
+            } => {
+                let resource_found = self
+                    .resource_types
+                    .iter()
+                    .any(|entry| normalize_name_key(entry.id.as_str()) == resource_type_pattern);
+                errors.push(if resource_found {
+                    ValidationError::ReferenceNotFound {
+                        entity_type: "resource_type_action",
+                        id: format!("{resource_type}:{action_name}"),
+                    }
+                } else {
+                    ValidationError::ReferenceNotFound {
+                        entity_type: "resource_type",
+                        id: resource_type.to_string(),
+                    }
+                });
+            }
+            error => append_expansion_error(errors, field, error),
+        }
+    }
+
+    fn count(
+        &mut self,
+        resource_type: &str,
+        action_name: &str,
+    ) -> Result<usize, ActionPatternExpandError> {
+        let key = pattern_key(resource_type, action_name);
+        if let Some(result) = self.match_counts.get(&key) {
+            return result.clone();
+        }
+        let result =
+            ActionPattern::parse(resource_type, action_name, RESOURCE_TYPE_MAX, ACTION_MAX)
+                .and_then(|pattern| {
+                    pattern.count_matches(self.resource_types, resource_type, action_name)
+                });
+        self.match_counts.insert(key, result.clone());
+        result
+    }
+}
+
+/// Expansion size accumulated from match counts. Checked before any
+/// expansion is allocated so a small wildcard configuration cannot make
+/// validation or policy generation materialize an unbounded model.
+#[derive(Default)]
+struct ExpansionBudget {
+    action_refs: usize,
+    policy_links: usize,
+}
+
+impl ExpansionBudget {
+    fn add_entry(
+        &mut self,
+        errors: &mut Vec<ValidationError>,
+        resource: &'static str,
+        limit: usize,
+        expanded_count: usize,
+    ) {
+        if expanded_count > limit {
+            errors.push(ValidationError::LimitExceeded {
+                resource,
+                limit,
+                actual: expanded_count,
+            });
+        }
+        self.action_refs = self.action_refs.saturating_add(expanded_count);
+    }
+
+    fn add_policy_links(&mut self, expanded_count: usize, scope_count: usize) {
+        self.policy_links = self
+            .policy_links
+            .saturating_add(expanded_count.saturating_mul(scope_count));
+    }
+
+    fn check_totals(&self, errors: &mut Vec<ValidationError>) {
+        if self.action_refs > MAX_EXPANDED_ACTION_REFS {
+            errors.push(ValidationError::LimitExceeded {
+                resource: "expanded_action_refs",
+                limit: MAX_EXPANDED_ACTION_REFS,
+                actual: self.action_refs,
+            });
+        }
+        if self.policy_links > MAX_POLICY_LINKS {
+            errors.push(ValidationError::LimitExceeded {
+                resource: "policy_links",
+                limit: MAX_POLICY_LINKS,
+                actual: self.policy_links,
+            });
+        }
+    }
+}
+
+fn pattern_key(resource_type: &str, action_name: &str) -> (String, String) {
+    (
+        resource_type.trim().to_ascii_lowercase(),
+        action_name.trim().to_ascii_lowercase(),
+    )
+}
+
 fn validate_resource_scope_types(
     errors: &mut Vec<ValidationError>,
     field: &'static str,
     scopes: &[Scope],
-    allowed_resource_types: &HashSet<String>,
+    allowed_resource_types: &HashSet<&str>,
 ) {
     for scope in scopes {
         let Some(resource_type) = scope.resource_type() else {
@@ -771,41 +956,47 @@ fn validate_resource_scope_types(
     }
 }
 
+/// Resource scopes must name the only resource type an entry grants. The
+/// granted resource types are computed only for entries that carry a
+/// resource scope, so ordinary wildcard entries cost nothing here.
 fn validate_resource_scope_configuration(
     model: &ConfigurationModel,
     errors: &mut Vec<ValidationError>,
-    action_pattern_cache: &mut ActionPatternCache,
 ) {
-    let permission_resource_types: HashMap<_, _> = model
-        .permissions
-        .iter()
-        .map(|permission| {
-            let resource_types = permission
-                .actions
-                .iter()
-                .chain(permission.not_actions.iter())
-                .flat_map(|action| {
-                    expand_action_patterns_cached(
-                        action_pattern_cache,
-                        model.resource_types.as_slice(),
-                        action.resource_type.as_str(),
-                        action.action_name.as_str(),
-                        RESOURCE_TYPE_MAX,
-                        ACTION_MAX,
-                    )
-                    .unwrap_or_default()
-                })
-                .map(|action| action.resource_type)
-                .collect::<HashSet<_>>();
-            (permission.id.as_str(), resource_types)
-        })
-        .collect::<HashMap<_, _>>();
+    let catalog = model.resource_types.as_slice();
+    let has_resource_scope =
+        |scopes: &[Scope]| scopes.iter().any(|scope| scope.resource_type().is_some());
+    let mut permission_resource_types: HashMap<&str, HashSet<&str>> = HashMap::new();
 
     for role in &model.roles {
         for permission in &role.permissions {
-            if let Some(resource_types) =
-                permission_resource_types.get(permission.permission_id.as_str())
-            {
+            if !has_resource_scope(&permission.scopes) {
+                continue;
+            }
+            let permission_id = permission.permission_id.as_str();
+            if !permission_resource_types.contains_key(permission_id) {
+                let Some(definition) = model
+                    .permissions
+                    .iter()
+                    .find(|definition| definition.id == permission_id)
+                else {
+                    continue;
+                };
+                let resource_types = definition
+                    .actions
+                    .iter()
+                    .chain(definition.not_actions.iter())
+                    .flat_map(|action| {
+                        granted_resource_types(
+                            catalog,
+                            action.resource_type.as_str(),
+                            action.action_name.as_str(),
+                        )
+                    })
+                    .collect();
+                permission_resource_types.insert(permission_id, resource_types);
+            }
+            if let Some(resource_types) = permission_resource_types.get(permission_id) {
                 validate_resource_scope_types(
                     errors,
                     "roles[].permissions[].scopes",
@@ -814,55 +1005,42 @@ fn validate_resource_scope_configuration(
                 );
             }
         }
-        for action in &role.actions {
-            let resource_types = resource_types_for_action(
-                action_pattern_cache,
-                model.resource_types.as_slice(),
-                action.resource_type.as_str(),
-                action.action_name.as_str(),
-            );
-            validate_resource_scope_types(
-                errors,
-                "roles[].actions[].scopes",
-                &action.scopes,
-                &resource_types,
-            );
-        }
-        for action in &role.not_actions {
-            let resource_types = resource_types_for_action(
-                action_pattern_cache,
-                model.resource_types.as_slice(),
-                action.resource_type.as_str(),
-                action.action_name.as_str(),
-            );
-            validate_resource_scope_types(
-                errors,
-                "roles[].not_actions[].scopes",
-                &action.scopes,
-                &resource_types,
-            );
+        for (field, actions) in [
+            ("roles[].actions[].scopes", &role.actions),
+            ("roles[].not_actions[].scopes", &role.not_actions),
+        ] {
+            for action in actions
+                .iter()
+                .filter(|action| has_resource_scope(&action.scopes))
+            {
+                let resource_types = granted_resource_types(
+                    catalog,
+                    action.resource_type.as_str(),
+                    action.action_name.as_str(),
+                )
+                .collect();
+                validate_resource_scope_types(errors, field, &action.scopes, &resource_types);
+            }
         }
     }
 }
 
-fn resource_types_for_action(
-    action_pattern_cache: &mut ActionPatternCache,
-    resource_types: &[ResourceType],
+/// Resource types matched by one reference; an invalid reference matches none
+/// and is reported by reference validation.
+fn granted_resource_types<'catalog>(
+    catalog: &'catalog [ResourceType],
     resource_type: &str,
     action_name: &str,
-) -> HashSet<String> {
-    expand_action_patterns_cached(
-        action_pattern_cache,
-        resource_types,
-        resource_type,
-        action_name,
-        RESOURCE_TYPE_MAX,
-        ACTION_MAX,
-    )
-    .unwrap_or_default()
-    .into_iter()
-    .map(|action| action.resource_type)
-    .collect()
+) -> impl Iterator<Item = &'catalog str> {
+    ActionPattern::parse(resource_type, action_name, RESOURCE_TYPE_MAX, ACTION_MAX)
+        .ok()
+        .into_iter()
+        .flat_map(move |pattern| {
+            pattern
+                .matches(catalog)
+                .map(|(resource_type, _)| resource_type)
+                .collect::<Vec<_>>()
+        })
 }
 
 fn has_nonempty_https_target(value: &str) -> bool {
@@ -910,109 +1088,26 @@ fn normalize_name_key(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
 
-fn validate_catalog_identifier(
-    errors: &mut Vec<ValidationError>,
-    field: &'static str,
-    value: &str,
-) {
-    if value.contains('*') {
-        errors.push(ValidationError::InvalidFormat {
-            field,
-            message: "catalog identifiers must not contain wildcards".into(),
-        });
-    }
-}
-
-fn validate_action_reference(
-    errors: &mut Vec<ValidationError>,
-    field: &'static str,
-    resource_type: &str,
-    action_name: &str,
-    resource_types: &[ResourceType],
-    allow_wildcards: bool,
-    action_pattern_cache: &mut ActionPatternCache,
-) {
-    let has_wildcard = resource_type.contains('*') || action_name.contains('*');
-    if has_wildcard && !allow_wildcards {
-        errors.push(ValidationError::InvalidFormat {
-            field,
-            message: "wildcards are not allowed in validated action references".into(),
-        });
-        return;
-    }
-
-    match expand_action_patterns_cached(
-        action_pattern_cache,
-        resource_types,
-        resource_type,
-        action_name,
-        RESOURCE_TYPE_MAX,
-        ACTION_MAX,
-    ) {
-        Ok(_) => {}
-        Err(ActionPatternExpandError::InvalidPattern(error)) => {
-            errors.push(ValidationError::InvalidFormat {
-                field,
-                message: error.to_string(),
-            });
-        }
-        Err(ActionPatternExpandError::NoMatches {
-            resource_type_pattern,
-            action_name_pattern,
-            used_wildcard,
-        }) => {
-            if !used_wildcard {
-                let resource_found = resource_types
-                    .iter()
-                    .any(|entry| normalize_name_key(entry.id.as_str()) == resource_type_pattern);
-                if !resource_found {
-                    errors.push(ValidationError::ReferenceNotFound {
-                        entity_type: "resource_type",
-                        id: resource_type.to_string(),
-                    });
-                    return;
-                }
-                errors.push(ValidationError::ReferenceNotFound {
-                    entity_type: "resource_type_action",
-                    id: format!("{resource_type}:{action_name}"),
-                });
-                return;
-            }
-
-            errors.push(ValidationError::InvalidFormat {
-                field,
-                message: format!(
-                    "wildcard pattern matched zero resource_type_action entries: \
-                     {resource_type_pattern}:{action_name_pattern}"
-                ),
-            });
-        }
-    }
-}
-
-pub(crate) fn expand_action_patterns_cached(
-    cache: &mut ActionPatternCache,
+/// Expand one pattern once per configuration and share the result across the
+/// entries that repeat it.
+pub(super) fn expand_action_patterns_shared(
+    cache: &mut ActionPatternExpansionCache,
     resource_types: &[ResourceType],
     resource_type_pattern: &str,
     action_name_pattern: &str,
-    resource_type_max_len: usize,
-    action_name_max_len: usize,
-) -> Result<Vec<ExpandedActionRef>, ActionPatternExpandError> {
-    let key = (
-        resource_type_pattern.trim().to_ascii_lowercase(),
-        action_name_pattern.trim().to_ascii_lowercase(),
-    );
+) -> Result<Rc<[ExpandedActionRef]>, ActionPatternExpandError> {
+    let key = pattern_key(resource_type_pattern, action_name_pattern);
     if let Some(result) = cache.get(&key) {
         return result.clone();
     }
-
     let result = expand_action_patterns(
         resource_types,
         resource_type_pattern,
         action_name_pattern,
-        resource_type_max_len,
-        action_name_max_len,
-    );
+        RESOURCE_TYPE_MAX,
+        ACTION_MAX,
+    )
+    .map(Rc::from);
     cache.insert(key, result.clone());
     result
 }
@@ -1022,26 +1117,24 @@ fn expand_permission_action_refs(
     requested: &[PermissionActionRef],
     field: &'static str,
     errors: &mut Vec<ValidationError>,
-    action_pattern_cache: &mut ActionPatternCache,
+    expansions: &mut ActionPatternExpansionCache,
 ) -> Vec<PermissionActionRef> {
     let mut deduped = HashSet::new();
     let mut expanded = Vec::new();
     for action_ref in requested {
-        match expand_action_patterns_cached(
-            action_pattern_cache,
+        match expand_action_patterns_shared(
+            expansions,
             resource_types,
             action_ref.resource_type.as_str(),
             action_ref.action_name.as_str(),
-            RESOURCE_TYPE_MAX,
-            ACTION_MAX,
         ) {
             Ok(matches) => {
-                for matched in matches {
-                    let key = (matched.resource_type.clone(), matched.action_name.clone());
-                    if deduped.insert(key) {
+                for matched in matches.iter() {
+                    if deduped.insert((matched.resource_type.clone(), matched.action_name.clone()))
+                    {
                         expanded.push(PermissionActionRef {
-                            resource_type: matched.resource_type,
-                            action_name: matched.action_name,
+                            resource_type: matched.resource_type.clone(),
+                            action_name: matched.action_name.clone(),
                         });
                     }
                 }
@@ -1049,15 +1142,11 @@ fn expand_permission_action_refs(
             Err(error) => append_expansion_error(errors, field, error),
         }
     }
-    expanded.sort_by(|left, right| {
+    expanded.sort_by_cached_key(|action| {
         (
-            normalize_name_key(left.resource_type.as_str()),
-            normalize_name_key(left.action_name.as_str()),
+            normalize_name_key(action.resource_type.as_str()),
+            normalize_name_key(action.action_name.as_str()),
         )
-            .cmp(&(
-                normalize_name_key(right.resource_type.as_str()),
-                normalize_name_key(right.action_name.as_str()),
-            ))
     });
     expanded
 }
@@ -1067,69 +1156,58 @@ fn expand_role_action_refs(
     requested: &[RoleActionRef],
     field: &'static str,
     errors: &mut Vec<ValidationError>,
-    action_pattern_cache: &mut ActionPatternCache,
+    expansions: &mut ActionPatternExpansionCache,
 ) -> Vec<RoleActionRef> {
     let mut deduped = HashSet::new();
     let mut expanded = Vec::new();
     for action_ref in requested {
-        match expand_action_patterns_cached(
-            action_pattern_cache,
+        let matches = match expand_action_patterns_shared(
+            expansions,
             resource_types,
             action_ref.resource_type.as_str(),
             action_ref.action_name.as_str(),
-            RESOURCE_TYPE_MAX,
-            ACTION_MAX,
         ) {
-            Ok(matches) => {
-                for matched in matches {
-                    let scope_key = action_ref
-                        .scopes
-                        .iter()
-                        .map(|scope| scope.storage_key())
-                        .collect::<Vec<_>>()
-                        .join("|");
-                    let key = (
-                        matched.resource_type.clone(),
-                        matched.action_name.clone(),
-                        scope_key,
-                        action_ref.limit.clone(),
-                    );
-                    if deduped.insert(key) {
-                        expanded.push(RoleActionRef {
-                            resource_type: matched.resource_type,
-                            action_name: matched.action_name,
-                            scopes: action_ref.scopes.clone(),
-                            limit: action_ref.limit.clone(),
-                        });
-                    }
-                }
+            Ok(matches) => matches,
+            Err(error) => {
+                append_expansion_error(errors, field, error);
+                continue;
             }
-            Err(error) => append_expansion_error(errors, field, error),
+        };
+        let scope_key = role_scope_key(&action_ref.scopes);
+        for matched in matches.iter() {
+            let key = (
+                matched.resource_type.clone(),
+                matched.action_name.clone(),
+                scope_key.clone(),
+                action_ref.limit.clone(),
+            );
+            if deduped.insert(key) {
+                expanded.push(RoleActionRef {
+                    resource_type: matched.resource_type.clone(),
+                    action_name: matched.action_name.clone(),
+                    scopes: action_ref.scopes.clone(),
+                    limit: action_ref.limit.clone(),
+                });
+            }
         }
     }
-    expanded.sort_by(|left, right| {
+    expanded.sort_by_cached_key(|action| {
         (
-            normalize_name_key(left.resource_type.as_str()),
-            normalize_name_key(left.action_name.as_str()),
-            left.scopes
-                .iter()
-                .map(|scope| scope.storage_key())
-                .collect::<Vec<_>>()
-                .join("|"),
+            normalize_name_key(action.resource_type.as_str()),
+            normalize_name_key(action.action_name.as_str()),
+            role_scope_key(&action.scopes),
+            action.limit.clone(),
         )
-            .cmp(&(
-                normalize_name_key(right.resource_type.as_str()),
-                normalize_name_key(right.action_name.as_str()),
-                right
-                    .scopes
-                    .iter()
-                    .map(|scope| scope.storage_key())
-                    .collect::<Vec<_>>()
-                    .join("|"),
-            ))
-            .then_with(|| left.limit.cmp(&right.limit))
     });
     expanded
+}
+
+fn role_scope_key(scopes: &[Scope]) -> String {
+    scopes
+        .iter()
+        .map(Scope::storage_key)
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 fn append_expansion_error(

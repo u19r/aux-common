@@ -159,8 +159,9 @@ impl AttemptHistory {
     }
 }
 
-/// The complete v1 authoritative job value.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The complete v1 authoritative job value. `Debug` reports the checkpoint's
+/// length, never its bytes.
+#[derive(Clone, PartialEq, Eq)]
 pub struct JobRecordV1 {
     pub job_id: JobId,
     pub namespace: Namespace,
@@ -183,6 +184,38 @@ pub struct JobRecordV1 {
     pub retention_deadline: Timestamp,
     pub deduplication: Option<Deduplication>,
     pub revision: u64,
+}
+
+impl fmt::Debug for JobRecordV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JobRecordV1")
+            .field("job_id", &self.job_id)
+            .field("namespace", &self.namespace)
+            .field("queue", &self.queue)
+            .field("kind", &self.kind)
+            .field("schema_version", &self.schema_version)
+            .field("generation", &self.generation)
+            .field("execution_id", &self.execution_id)
+            .field("payload", &self.payload)
+            .field("fairness", &self.fairness)
+            .field("ordering_key", &self.ordering_key)
+            .field("priority", &self.priority)
+            .field("created_at", &self.created_at)
+            .field("scheduled_at", &self.scheduled_at)
+            .field("expires_at", &self.expires_at)
+            .field("policy", &self.policy)
+            .field("attempts", &self.attempts)
+            .field("state", &self.state)
+            .field(
+                "checkpoint_bytes",
+                &self.checkpoint.as_ref().map(Bytes::len),
+            )
+            .field("retention_deadline", &self.retention_deadline)
+            .field("deduplication", &self.deduplication)
+            .field("revision", &self.revision)
+            .finish()
+    }
 }
 
 impl JobRecordV1 {
@@ -240,8 +273,8 @@ impl JobRecordV1 {
 }
 
 /// Lowest-level enqueue input. Its immutable fields are used for idempotent
-/// replay checks.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// replay checks. `Debug` reports the payload's length, never its bytes.
+#[derive(Clone, PartialEq, Eq)]
 pub struct NewJob {
     /// Raw/test-support-only immutable enqueue identity.
     pub job_id: JobId,
@@ -265,6 +298,25 @@ pub struct NewJob {
     pub retry_override: Option<RetrySelection>,
     /// Raw/test-support-only deduplication policy.
     pub deduplication: Option<Deduplication>,
+}
+
+impl fmt::Debug for NewJob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NewJob")
+            .field("job_id", &self.job_id)
+            .field("kind", &self.kind)
+            .field("schema_version", &self.schema_version)
+            .field("payload_bytes", &self.payload.len())
+            .field("fairness", &self.fairness)
+            .field("ordering_key", &self.ordering_key)
+            .field("priority", &self.priority)
+            .field("scheduled_at", &self.scheduled_at)
+            .field("expires_at", &self.expires_at)
+            .field("retry_override", &self.retry_override)
+            .field("deduplication", &self.deduplication)
+            .finish()
+    }
 }
 
 impl NewJob {
@@ -316,7 +368,7 @@ pub struct EnqueueResult {
 ///     Ok(JobOutcome::Complete(OutcomeCode::try_new("finished").unwrap()))
 /// }
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[must_use = "return the handler's outcome; discarding it can lose a retry or continuation"]
 pub enum JobOutcome {
     Complete(OutcomeCode),
@@ -336,6 +388,38 @@ pub enum JobOutcome {
         code: OutcomeCode,
     },
     Cancelled,
+}
+
+/// Reports a continuation checkpoint's length, never its bytes.
+impl fmt::Debug for JobOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Complete(code) => formatter.debug_tuple("Complete").field(code).finish(),
+            Self::Continue {
+                not_before,
+                checkpoint,
+            } => formatter
+                .debug_struct("Continue")
+                .field("not_before", not_before)
+                .field("checkpoint_bytes", &checkpoint.len())
+                .finish(),
+            Self::Retry {
+                class,
+                not_before,
+                code,
+            } => formatter
+                .debug_struct("Retry")
+                .field("class", class)
+                .field("not_before", not_before)
+                .field("code", code)
+                .finish(),
+            Self::DeadLetter { code } => formatter
+                .debug_struct("DeadLetter")
+                .field("code", code)
+                .finish(),
+            Self::Cancelled => formatter.write_str("Cancelled"),
+        }
+    }
 }
 
 /// Cooperative cancellation state shared by a claimed attempt and its context.

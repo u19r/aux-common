@@ -3,7 +3,7 @@
 name = "quickjs"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/u19r/aux-common"
 description = "Private Wasm producer for the javascript crate"
@@ -34,4 +34,4 @@ strip = true
 workspace = true
 
 [workspace.package]
-rust-version = "1.99.1"
+rust-version = "1.100.0"

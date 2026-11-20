@@ -178,7 +178,7 @@ impl<T: Send + Sync + 'static> DeliveryTurn<'_, T> {
         self.report.last_error = Some(kind);
         let age = leased
             .batch
-            .age_at_utc_ms(self.engine.cfg.clock.now_utc().timestamp_millis());
+            .age_at_utc_ms(crate::observer::utc_millis(self.engine.cfg.clock.now_utc()));
         self.engine.record_sink_failure(age);
         self.engine.cfg.observer.observe(WriteEvent::FlushFailed {
             kind,

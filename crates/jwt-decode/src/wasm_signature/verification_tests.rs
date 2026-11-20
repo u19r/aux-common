@@ -53,9 +53,9 @@ fn given_elliptic_curve_tokens_when_wasm_backend_verifies_then_supported_algorit
 #[test]
 fn given_hmac_tokens_when_wasm_backend_verifies_then_supported_algorithms_pass() {
     for algorithm in [Algorithm::HS256, Algorithm::HS384, Algorithm::HS512] {
-        let encoding_key = EncodingKey::from_secret(HMAC_KEY);
+        let encoding_key = EncodingKey::from_secret(HMAC_KEY).expect("valid HMAC test key");
         let token = token(algorithm, &encoding_key);
-        let decoding_key = DecodingKey::from_secret(HMAC_KEY);
+        let decoding_key = DecodingKey::from_secret(HMAC_KEY).expect("valid HMAC test key");
         assert_token_verifies(&token, &decoding_key, algorithm);
     }
 }
@@ -82,6 +82,50 @@ fn given_tampered_signature_when_wasm_backend_verifies_then_signature_is_rejecte
     .expect_err("tampered signature must fail");
 
     assert_eq!(error.kind(), &JwtDecodeErrorKind::SignatureInvalid);
+}
+
+#[test]
+fn given_es256_signature_and_its_n_minus_s_mirror_when_wasm_backend_verifies_then_both_verify() {
+    // Given a valid ES256 token and the distinct signature that replaces s
+    // with n - s.
+    let encoding_key = EncodingKey::from_ec_pem(P256_PRIVATE_KEY).expect("valid P-256 test key");
+    let token = token(Algorithm::ES256, &encoding_key);
+    let (message, encoded_signature) = token.rsplit_once('.').expect("compact token");
+    let signature = p256::ecdsa::Signature::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(encoded_signature)
+            .expect("base64 signature"),
+    )
+    .expect("fixed-width ES256 signature");
+    let mirrored = p256::ecdsa::Signature::from_scalars(signature.r(), -signature.s())
+        .expect("mirrored signature");
+    let mirrored_signature = URL_SAFE_NO_PAD.encode(mirrored.to_bytes());
+    assert_ne!(encoded_signature, mirrored_signature);
+    let jwk = Jwk::from_encoding_key(&encoding_key, Algorithm::ES256).expect("public JWK");
+    let decoding_key = DecodingKey::from_jwk(&jwk).expect("public decoding key");
+
+    // When both encodings reach the WASM and native backends.
+    // Then both backends accept both encodings, so neither can be used as a
+    // replay or deduplication key.
+    for candidate in [encoded_signature, mirrored_signature.as_str()] {
+        verify(
+            candidate,
+            message.as_bytes(),
+            &decoding_key,
+            SignatureAlgorithm::ES256,
+        )
+        .expect("WASM backend accepts both encodings");
+        assert!(
+            jsonwebtoken::crypto::verify(
+                candidate,
+                message.as_bytes(),
+                &decoding_key,
+                Algorithm::ES256
+            )
+            .expect("native backend verifies"),
+            "native backend accepts both encodings"
+        );
+    }
 }
 
 fn assert_asymmetric_verifies(algorithm: Algorithm, encoding_key: EncodingKey) {
@@ -114,7 +158,7 @@ fn given_native_and_wasm_backends_when_verifying_then_verdicts_agree() {
     let p256 = EncodingKey::from_ec_pem(P256_PRIVATE_KEY).expect("valid P-256 test key");
     let p384 = EncodingKey::from_ec_pem(P384_PRIVATE_KEY).expect("valid P-384 test key");
     let ed25519 = EncodingKey::from_ed_pem(ED25519_PRIVATE_KEY).expect("valid Ed25519 test key");
-    let hmac = EncodingKey::from_secret(HMAC_KEY);
+    let hmac = EncodingKey::from_secret(HMAC_KEY).expect("valid HMAC test key");
     let cases = [
         (Algorithm::RS256, rsa.clone()),
         (Algorithm::RS384, rsa.clone()),
@@ -138,12 +182,13 @@ fn given_native_and_wasm_backends_when_verifying_then_verdicts_agree() {
             || algorithm == Algorithm::HS384
             || algorithm == Algorithm::HS512
         {
-            DecodingKey::from_secret(HMAC_KEY)
+            DecodingKey::from_secret(HMAC_KEY).expect("valid HMAC test key")
         } else {
             let jwk = Jwk::from_encoding_key(&encoding_key, algorithm).expect("public JWK");
             DecodingKey::from_jwk(&jwk).expect("public decoding key")
         };
-        let wrong_key = DecodingKey::from_secret(b"wrong-key-with-enough-entropy-000000");
+        let wrong_key = DecodingKey::from_secret(b"wrong-key-with-enough-entropy-000000")
+            .expect("valid HMAC test key");
         let mut tampered = URL_SAFE_NO_PAD.decode(signature).expect("base64 signature");
         tampered[0] ^= 1;
         let variants = [

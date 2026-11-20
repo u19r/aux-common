@@ -14,12 +14,13 @@ loopback hosts (`localhost`, `127.0.0.1`, or `::1`). CBOR is preflighted before
 decoding with byte, depth, and value-count budgets to keep attacker-controlled
 credential and attestation data bounded.
 
-Counters are classified as `Initial`, `Increased`, `Unchanged`, `Regression`,
-or `ZeroCounter`. A zero counter with no history (`previous == 0 &&
-current == 0`) reports `ZeroCounter`, not `Initial`: the authenticator may
-not implement a counter, so first use and unlimited replays are
-indistinguishable and the result must not back replay-detection-sensitive
-decisions.
+Counters are classified as `Initial`, `Increased`, `NotIncreased`, or
+`ZeroCounter`. `NotIncreased` covers an equal or lower counter after a non-zero
+counter, which WebAuthn treats as a possible-clone signal. A zero counter with
+no history (`previous == 0 && current == 0`) reports `ZeroCounter`, not
+`Initial`: the authenticator may not implement a counter, so first use and
+unlimited replays are indistinguishable and the result must not back
+replay-detection-sensitive decisions.
 
 The default profile rejects raw r||s signatures, duplicate or trailing CBOR,
 wrong key type/curve/algorithm, malformed credential boundaries, unsupported

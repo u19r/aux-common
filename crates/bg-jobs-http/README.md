@@ -19,6 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let policy_id = HttpPolicyId::try_new("partner-webhook")?;
     let policy = HttpPolicy::builder(policy_id.clone())
         .endpoint(ApprovedEndpoint::exact("api.example.com")?)
+        .route(Method::POST, "/")
         .try_build()?;
     let request = HttpRequest::try_new(HttpRequestInput {
         method: Method::POST,
@@ -46,7 +47,8 @@ policy-bound executor.
 ## Security and limits
 
 Only HTTPS URLs with a hostname are accepted. Policies allowlist exact hosts or explicit
-subdomains and ports; loopback/IP destinations, credentials in the URL, fragments, and sensitive
+subdomains and ports, and pin each approved method to a path prefix with `route`, so payload data
+cannot choose a different operation on an approved host; loopback/IP destinations, credentials in the URL, fragments, and sensitive
 headers are rejected. Authorization and other secret material must be added by a registration-owned
 `RequestAuthorizer`, not by durable job payload data. Authorizers run through one bounded future
 boundary; there is no synchronous authorization escape hatch.

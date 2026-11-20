@@ -1,16 +1,28 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use serde::Deserialize;
 
-use super::{PreparedPayload, SealedBatch, SealedBatchInput};
-use crate::{configuration::validate_version, error::EncodeError};
+use super::{PreparedPayload, SealedBatch, SealedBatchInput, record::PersistedRecord};
+use crate::{
+    configuration::{BatchId, Namespace, OperationId, TenantScope, validate_version},
+    error::EncodeError,
+};
 
 /// Untrusted wire data. All deserialization enters the validated batch
-/// boundary.
+/// boundary. Fields are listed explicitly: `#[serde(flatten)]` would buffer the
+/// whole envelope as generic content (about 16x on byte arrays) before
+/// validation.
 #[derive(Deserialize)]
 pub(super) struct BatchEnvelope {
-    #[serde(flatten)]
-    input: SealedBatchInput,
+    batch_id: BatchId,
+    namespace: Namespace,
+    scope: TenantScope,
+    codec_version: String,
+    strategy_version: String,
+    first_item_time_ms: i64,
+    records: Arc<[PersistedRecord]>,
+    prepared: PreparedPayload,
+    operation_ids: Arc<[OperationId]>,
     digest: [u8; 32],
 }
 
@@ -18,7 +30,17 @@ impl TryFrom<BatchEnvelope> for SealedBatch {
     type Error = EncodeError;
 
     fn try_from(envelope: BatchEnvelope) -> Result<Self, Self::Error> {
-        let batch = Self::try_new(envelope.input)?;
+        let batch = Self::try_new(SealedBatchInput {
+            batch_id: envelope.batch_id,
+            namespace: envelope.namespace,
+            scope: envelope.scope,
+            codec_version: envelope.codec_version,
+            strategy_version: envelope.strategy_version,
+            first_item_time_ms: envelope.first_item_time_ms,
+            records: envelope.records,
+            prepared: envelope.prepared,
+            operation_ids: envelope.operation_ids,
+        })?;
         if batch.digest() != &envelope.digest {
             return Err(EncodeError::invalid_input(
                 "sealed batch digest verification failed",

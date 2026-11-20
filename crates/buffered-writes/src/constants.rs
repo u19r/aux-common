@@ -91,6 +91,8 @@ pub(crate) const LAMBDA_IPC_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 pub(crate) const DEFAULT_SPOT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(crate) const BATCH_DIGEST_DOMAIN: &[u8] = b"aux-buffered-writes/batch/v2";
+pub(crate) const BATCH_ENVELOPE_MAC_DOMAIN: &[u8] = b"aux-buffered-writes/queue-envelope/v1";
+pub(crate) const MIN_ENVELOPE_KEY_BYTES: usize = 32;
 pub(crate) const ADMISSION_DIGEST_DOMAIN: &[u8] = b"aux-buffered-writes/admission/v1";
 
 #[cfg(feature = "valkey")]
@@ -132,7 +134,7 @@ redis.call('MSET', KEYS[1], ARGV[8], KEYS[2], ARGV[9])
 return 1
 "#;
 
-pub(crate) const REPLAY_QUARANTINE_VERSION: u16 = 1;
+pub(crate) const REPLAY_QUARANTINE_VERSION: u16 = 2;
 
 #[cfg(feature = "sqs")]
 pub(crate) const SQS_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
@@ -170,6 +172,14 @@ pub(crate) const IMDS_MAX_NOTICE_BYTES: usize = 16384;
 pub(crate) const LAMBDA_IPC_DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(feature = "lambda")]
 pub(crate) const LAMBDA_IPC_MAX_TOKEN_BYTES: usize = 256;
+/// A capability token shorter than 128 bits is guessable by any local process.
+#[cfg(feature = "lambda")]
+pub(crate) const LAMBDA_IPC_MIN_TOKEN_BYTES: usize = 16;
+/// The serial listener stops waiting for a request frame after this budget, so
+/// an idle or slow local peer cannot hold it for the full exchange timeout.
+/// The function writes its frame immediately after connecting on loopback.
+#[cfg(feature = "lambda")]
+pub(crate) const LAMBDA_IPC_REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(feature = "lambda")]
 pub(crate) const LAMBDA_MAX_INVOCATION_ID_BYTES: usize = 128;
 #[cfg(feature = "lambda")]

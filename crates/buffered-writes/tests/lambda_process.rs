@@ -229,7 +229,7 @@ async fn reply(stream: &mut TcpStream, status: u16, headers: &str, body: &str) {
     stream.shutdown().await.unwrap();
 }
 fn deadline_ms(budget: Duration) -> u64 {
-    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap()
+    u64::try_from(jiff::Timestamp::now().as_millisecond()).unwrap()
         + u64::try_from(budget.as_millis()).unwrap()
 }
 

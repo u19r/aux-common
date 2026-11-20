@@ -15,6 +15,7 @@ pub enum SigV4AuthorizerError {
     CredentialUnavailable,
     SigningFailed,
     InvalidUri,
+    CallerAwsHeader,
 }
 
 impl fmt::Display for SigV4AuthorizerError {
@@ -24,6 +25,7 @@ impl fmt::Display for SigV4AuthorizerError {
             Self::CredentialUnavailable => "AWS credentials unavailable",
             Self::SigningFailed => "SigV4 signing failed",
             Self::InvalidUri => "request URI could not be prepared for SigV4",
+            Self::CallerAwsHeader => "request carries a caller-supplied AWS header",
         };
         formatter.write_str(message)
     }
@@ -75,6 +77,15 @@ impl SigV4Authorizer {
         if request.url().scheme() != "https" {
             return Err(SigV4AuthorizerError::InvalidUri);
         }
+        // Signed `x-amz-*` headers select AWS operations and options (target,
+        // copy source, ACL), so only the registration may choose them.
+        if request
+            .headers()
+            .keys()
+            .any(|name| name.as_str().starts_with("x-amz-"))
+        {
+            return Err(SigV4AuthorizerError::CallerAwsHeader);
+        }
         let uri = request
             .url()
             .as_str()
@@ -96,7 +107,9 @@ impl RequestAuthorizer for SigV4Authorizer {
     fn authorize<'a>(&'a self, request: AuthorizationRequest<'a>) -> AuthorizationFuture<'a> {
         Box::pin(async move {
             self.sign(request).await.map_err(|error| match error {
-                SigV4AuthorizerError::InvalidUri => AuthorizationErrorKind::InvalidRequest,
+                SigV4AuthorizerError::InvalidUri | SigV4AuthorizerError::CallerAwsHeader => {
+                    AuthorizationErrorKind::InvalidRequest
+                }
                 SigV4AuthorizerError::CredentialUnavailable => {
                     AuthorizationErrorKind::CredentialUnavailable
                 }

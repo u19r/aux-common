@@ -592,15 +592,6 @@ fn given_even_exponent_rsa_key_when_preparing_verifier_then_reject() {
     assert!(PreparedVerifier::try_new(JwsAlgorithm::Rs256, &spki).is_err());
 }
 
-/// ECDSA P-256 signature malleability: the high-S (`n - s`) form of a
-/// signature must produce identical verification outcomes to the low-S
-/// form, because the verification boundary normalizes `s` to the lower
-/// half of the group order before dispatching to the backend verifier.
-///
-/// Without normalization, the two byte-encodings of one logical signature
-/// can produce distinct observable outcomes: replay dedupe, forensic
-/// identification, and signature-hash rate limiting all see two different
-/// inputs for what is cryptographically the same signature.
 fn malleability_signing_key() -> SigningKey {
     SigningKey::from_slice(&[9u8; 32]).expect("test key")
 }
@@ -628,28 +619,10 @@ fn malleability_spki(key: &SigningKey) -> Vec<u8> {
     spki
 }
 
-fn flipped_s(signature: &Signature) -> Signature {
-    use crate::constants::P256_ORDER;
-    let mut bytes = signature.to_bytes();
-    let s = &mut bytes[32..64];
-    let mut borrow = 0u16;
-    for index in (0..32).rev() {
-        let value = u16::from(P256_ORDER[index]).checked_sub(u16::from(s[index]) + borrow);
-        match value {
-            Some(difference) => {
-                s[index] = u8::try_from(difference).expect("in-range byte");
-                borrow = 0;
-            }
-            None => {
-                s[index] = u8::try_from(
-                    u16::from(P256_ORDER[index]) + 0x100 - u16::from(s[index]) - borrow,
-                )
-                .expect("wrapped byte");
-                borrow = 1;
-            }
-        }
-    }
-    Signature::from_slice(&bytes).expect("flipped signature")
+/// The `(r, n - s)` mirror of an ECDSA signature: a distinct encoding that
+/// verifies for the same message and key.
+fn mirrored_s(signature: &Signature) -> Signature {
+    Signature::from_scalars(signature.r(), -signature.s()).expect("mirrored signature")
 }
 
 fn malleability_seed_token(key: &SigningKey) -> String {
@@ -661,100 +634,47 @@ fn malleability_seed_token(key: &SigningKey) -> String {
 }
 
 #[test]
-fn given_high_s_and_low_s_forms_when_verified_then_outcomes_are_identical() {
+fn given_es256_token_and_its_n_minus_s_mirror_when_verified_then_both_verify() {
+    // Given a valid ES256 compact JWS and the distinct token whose signature
+    // replaces s with n - s.
     let key = malleability_signing_key();
     let token = malleability_seed_token(&key);
-
-    let prepared =
-        PreparedVerifier::try_new(JwsAlgorithm::Es256, &malleability_spki(&key)).expect("prepared");
-
-    let (x, y) = {
-        let point = key.verifying_key().to_sec1_point(false);
-        (
-            URL_SAFE_NO_PAD.encode(point.x().unwrap()),
-            URL_SAFE_NO_PAD.encode(point.y().unwrap()),
-        )
-    };
-    let jwk = serde_json::json!({"kty":"EC","crv":"P-256","x":x,"y":y});
-    let embedded = EmbeddedEs256Key::try_from(&jwk).expect("embedded key");
-
     let parts: Vec<&str> = token.split('.').collect();
     let signature_bytes = URL_SAFE_NO_PAD.decode(parts[2]).expect("signature decodes");
-    let malleated = flipped_s(&Signature::from_slice(&signature_bytes).expect("signature"));
-    let malleated_token = format!(
+    let mirrored = mirrored_s(&Signature::from_slice(&signature_bytes).expect("signature"));
+    let mirrored_bytes = mirrored.to_bytes();
+    let mirrored_token = format!(
         "{}.{}.{}",
         parts[0],
         parts[1],
-        URL_SAFE_NO_PAD.encode(malleated.to_bytes())
+        URL_SAFE_NO_PAD.encode(mirrored_bytes.as_slice())
     );
+    assert_ne!(token, mirrored_token, "the mirror is a distinct token");
 
-    let low_prepared = CompactJws::decode(&token)
-        .expect("decode low-S")
-        .verify(&prepared);
-    let high_prepared = CompactJws::decode(&malleated_token)
-        .expect("decode high-S")
-        .verify(&prepared);
-    assert_eq!(
-        low_prepared.is_ok(),
-        high_prepared.is_ok(),
-        "PreparedVerifier outcomes differ between low-S and high-S forms"
-    );
-    assert!(low_prepared.is_ok(), "low-S form must verify");
+    // When both forms reach the prepared verifier and the embedded DPoP key.
+    let prepared =
+        PreparedVerifier::try_new(JwsAlgorithm::Es256, &malleability_spki(&key)).expect("prepared");
+    let point = key.verifying_key().to_sec1_point(false);
+    let jwk = serde_json::json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+        "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+    });
+    let embedded = EmbeddedEs256Key::try_from(&jwk).expect("embedded key");
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
 
-    let low_signing_input = format!("{}.{}", parts[0], parts[1]);
-    let low_sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).expect("signature bytes");
-    let low_embedded = embedded.verify(low_signing_input.as_bytes(), &low_sig_bytes);
-
-    let high_parts: Vec<&str> = malleated_token.split('.').collect();
-    let high_signing_input = format!("{}.{}", high_parts[0], high_parts[1]);
-    let high_sig_bytes = URL_SAFE_NO_PAD
-        .decode(high_parts[2])
-        .expect("signature bytes");
-    let high_embedded = embedded.verify(high_signing_input.as_bytes(), &high_sig_bytes);
-    assert_eq!(
-        low_embedded.is_ok(),
-        high_embedded.is_ok(),
-        "EmbeddedEs256Key outcomes differ between low-S and high-S forms"
-    );
-    assert!(low_embedded.is_ok(), "low-S form must verify on embedded");
-}
-
-#[test]
-fn given_high_s_signature_when_normalized_then_produces_low_s_canonical_form() {
-    use p256::ecdsa::signature::Signer as _;
-
-    use crate::constants::{P256_HALF_ORDER, normalize_low_s};
-    let key = malleability_signing_key();
-    let signature: Signature = key.sign(b"normalization probe");
-    let raw = signature.to_bytes();
-    let malleated = flipped_s(&signature);
-
-    let low_normalized = normalize_low_s(raw.as_slice()).expect("64 bytes");
-    let high_normalized = normalize_low_s(malleated.to_bytes().as_slice()).expect("64 bytes");
-
-    assert_eq!(
-        low_normalized, high_normalized,
-        "normalization must produce the same canonical bytes for both forms"
-    );
-    assert!(
-        low_normalized[32..64] <= P256_HALF_ORDER[..],
-        "normalized s must be in the lower half of the order"
-    );
-}
-
-#[test]
-fn given_low_s_signature_when_normalized_then_identity() {
-    use p256::ecdsa::signature::Signer as _;
-
-    use crate::constants::normalize_low_s;
-    let key = malleability_signing_key();
-    let signature: Signature = key.sign(b"identity probe");
-    let raw = signature.to_bytes();
-    // Skip keys whose signature happens to be high-S; the invariant under
-    // test is identity for already-low-S inputs.
-    if raw[32..64] > crate::constants::P256_HALF_ORDER[..] {
-        return;
+    // Then both verify: ECDSA treats s and n - s alike, so callers must key
+    // replay and deduplication on signed claims, never on token bytes.
+    for candidate in [&token, &mirrored_token] {
+        CompactJws::decode(candidate)
+            .expect("decode")
+            .verify(&prepared)
+            .expect("both encodings verify with the prepared verifier");
     }
-    let normalized = normalize_low_s(raw.as_slice()).expect("64 bytes");
-    assert_eq!(normalized[..], raw[..], "low-S input must be unchanged");
+    for signature in [signature_bytes.as_slice(), mirrored_bytes.as_slice()] {
+        embedded
+            .verify(signing_input.as_bytes(), signature)
+            .expect("both encodings verify with the embedded key");
+    }
 }

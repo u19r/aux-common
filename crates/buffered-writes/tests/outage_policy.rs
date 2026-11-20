@@ -9,6 +9,10 @@ use buffered_writes::{
     QueueConfig, SinkError, SinkHealth, SinkLimits, TestClock, WriteAttempt, WriteOutcome,
 };
 
+fn envelope_key() -> buffered_writes::EnvelopeKey {
+    buffered_writes::EnvelopeKey::try_new([7; 32]).unwrap()
+}
+
 #[derive(Clone, Copy)]
 enum PartialFailure {
     Retryable,
@@ -64,7 +68,7 @@ async fn given_incomplete_partial_failure_when_outage_age_is_reached_then_open_b
         let queue = InMemoryQueue::default();
         let writer = BufferedWrites::builder("partial-outage/v1", sink.clone())
             .with_clock(clock.clone())
-            .fallback(QueueConfig::custom(queue.clone()))
+            .fallback(QueueConfig::custom(queue.clone(), envelope_key()))
             .delivery_policy(DeliveryPolicy {
                 failure_threshold: 1,
                 max_attempts_per_turn: 1,
@@ -89,11 +93,15 @@ async fn given_incomplete_partial_failure_when_outage_age_is_reached_then_open_b
         );
         assert_eq!(identities.lock().unwrap().len(), 1);
         assert_eq!(committed.lock().unwrap().len(), 1);
-        let replay =
-            buffered_writes::ReplayWorker::builder("partial-outage/v1", queue.clone(), sink)
-                .with_clock(clock.clone())
-                .build()
-                .unwrap();
+        let replay = buffered_writes::ReplayWorker::builder(
+            "partial-outage/v1",
+            queue.clone(),
+            envelope_key(),
+            sink,
+        )
+        .with_clock(clock.clone())
+        .build()
+        .unwrap();
         let deadline = buffered_writes::Deadline::from_anchor(
             buffered_writes::Clock::now_instant(&clock),
             Duration::from_secs(1),
@@ -316,7 +324,7 @@ async fn given_default_failure_threshold_when_old_batch_is_queued_then_remain_sy
     let queue = InMemoryQueue::default();
     let writer = BufferedWrites::builder("aged-outage/v1", sink)
         .with_clock(clock.clone())
-        .fallback(QueueConfig::custom(queue.clone()))
+        .fallback(QueueConfig::custom(queue.clone(), envelope_key()))
         .build()
         .unwrap();
     writer.add_write_item(1).await.unwrap();
@@ -362,7 +370,7 @@ impl buffered_writes::WriteQueue for FaultQueue {
     }
     fn publish(
         &self,
-        batch: buffered_writes::SealedBatch,
+        envelope: buffered_writes::QueueEnvelope,
         deadline: buffered_writes::Deadline,
     ) -> futures_util::future::BoxFuture<
         'static,
@@ -372,7 +380,7 @@ impl buffered_writes::WriteQueue for FaultQueue {
         self.identities
             .lock()
             .unwrap()
-            .push((batch.batch_id(), *batch.digest()));
+            .push((envelope.batch().batch_id(), *envelope.batch().digest()));
         match self.fault {
             QueueFault::Unavailable => Box::pin(async {
                 Err(buffered_writes::QueueError::Unavailable {
@@ -380,7 +388,7 @@ impl buffered_writes::WriteQueue for FaultQueue {
                 })
             }),
             QueueFault::LoseFirstAcknowledgement => {
-                let publish = buffered_writes::WriteQueue::publish(&self.inner, batch, deadline);
+                let publish = buffered_writes::WriteQueue::publish(&self.inner, envelope, deadline);
                 Box::pin(async move {
                     let receipt = publish.await?;
                     if call == 0 {
@@ -408,7 +416,7 @@ async fn given_open_breaker_and_unavailable_queue_when_flush_is_retried_then_rep
     let writer = BufferedWrites::builder("both-outages/v1", sink)
         .with_observer(observer.clone())
         .with_clock(clock.clone())
-        .fallback(QueueConfig::custom(queue.clone()))
+        .fallback(QueueConfig::custom(queue.clone(), envelope_key()))
         .delivery_policy(DeliveryPolicy {
             failure_threshold: 1,
             ..DeliveryPolicy::default()
@@ -465,7 +473,7 @@ async fn given_lost_queue_ack_when_republished_then_preserve_batch_and_deduplica
     let queue = FaultQueue::new(QueueFault::LoseFirstAcknowledgement);
     let writer = BufferedWrites::builder("lost-queue-ack/v1", sink)
         .with_clock(clock.clone())
-        .fallback(QueueConfig::custom(queue.clone()))
+        .fallback(QueueConfig::custom(queue.clone(), envelope_key()))
         .build()
         .unwrap();
     writer.add_write_item(1).await.unwrap();
@@ -504,11 +512,15 @@ async fn given_lost_queue_ack_when_republished_then_preserve_batch_and_deduplica
         },
     )
     .unwrap();
-    let replay =
-        buffered_writes::ReplayWorker::builder("lost-queue-ack/v1", queue.inner.clone(), sink)
-            .with_clock(clock.clone())
-            .build()
-            .unwrap();
+    let replay = buffered_writes::ReplayWorker::builder(
+        "lost-queue-ack/v1",
+        queue.inner.clone(),
+        envelope_key(),
+        sink,
+    )
+    .with_clock(clock.clone())
+    .build()
+    .unwrap();
     let deadline = buffered_writes::Deadline::from_anchor(
         buffered_writes::Clock::now_instant(&clock),
         Duration::from_secs(1),
@@ -683,7 +695,7 @@ async fn given_old_item_when_utc_regresses_before_failure_then_fallback_does_not
     let queue = InMemoryQueue::default();
     let writer = BufferedWrites::builder("rollback-outage/v1", sink)
         .with_clock(clock.clone())
-        .fallback(QueueConfig::custom(queue.clone()))
+        .fallback(QueueConfig::custom(queue.clone(), envelope_key()))
         .build()
         .unwrap();
     writer.add_write_item(1).await.unwrap();
@@ -717,7 +729,7 @@ async fn given_failed_sealed_batch_when_utc_regresses_then_normal_response_retri
             max_attempts_per_turn: 1,
             ..DeliveryPolicy::default()
         })
-        .fallback(QueueConfig::custom(queue.clone()))
+        .fallback(QueueConfig::custom(queue.clone(), envelope_key()))
         .build()
         .unwrap();
     writer.add_write_item(1).await.unwrap();

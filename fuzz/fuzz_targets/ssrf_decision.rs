@@ -1,7 +1,9 @@
 #![no_main]
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use bg_jobs_http::ApprovedEndpoint;
-use http_request::{AllowedDomain, TenantHttpClient};
+use http_request::{AllowedDomain, TenantHttpClient, is_blocked_ip};
 use libfuzzer_sys::fuzz_target;
 use url::Url;
 
@@ -14,9 +16,87 @@ use url::Url;
 // userinfo and case and trailing dots must never change a verdict, and an
 // explicit port must never match a differently-ported endpoint. Builder
 // construction itself must never panic and must reject empty allowlists.
-// DNS resolution timing (rebinding between validation and connect) is
-// covered by the in-crate flipping-resolver simulation; the per-resolution
-// IP table is pinned by the reserved-address corpus tests.
+// The tenant IP classification oracle (`is_blocked_ip`) requires that every
+// address inside a reserved IPv6 range is blocked whatever its interface
+// identifier (including ISATAP `0:5efe:<v4>`), that a blocked IPv4 address
+// stays blocked in every IPv6 wrapping the classifier decodes, and that the
+// loopback opt-in only removes blocks. DNS resolution timing (rebinding
+// between validation and connect) is covered by the in-crate
+// flipping-resolver simulation.
+
+// Reserved IPv6 ranges, restated independently of the crate's table so the
+// oracle states the policy rather than mirroring its implementation.
+const RESERVED_IPV6_RANGES: [(Ipv6Addr, u32); 11] = [
+    (Ipv6Addr::UNSPECIFIED, 128),
+    (Ipv6Addr::LOCALHOST, 128),
+    (Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0), 48),
+    (Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0), 64),
+    (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 32),
+    (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 32),
+    (Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16),
+    (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
+    (Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0), 10),
+    (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+    (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
+];
+
+fn check_ip_classification(data: &[u8]) {
+    // Read the trailing input bytes as one IPv6 address; its low 32 bits
+    // double as an embedded IPv4 address.
+    let mut bytes = [0_u8; 16];
+    for (slot, byte) in bytes.iter_mut().rev().zip(data.iter().rev()) {
+        *slot = *byte;
+    }
+    let fuzzed = u128::from_be_bytes(bytes);
+    let embedded = Ipv4Addr::from(fuzzed as u32);
+    let embedded_bits = u128::from(u32::from(embedded));
+    let isatap_identifier = (0x5efe_u128 << 32) | embedded_bits;
+
+    // Any identifier inside a reserved range is blocked, with or without the
+    // loopback opt-in (which may only exempt `::1`).
+    for (network, prefix_len) in RESERVED_IPV6_RANGES {
+        let host_mask = u128::MAX.checked_shr(prefix_len).unwrap_or(0);
+        let network = u128::from(network) & !host_mask;
+        for identifier in [fuzzed, isatap_identifier] {
+            let ip = Ipv6Addr::from(network | (identifier & host_mask));
+            assert!(
+                is_blocked_ip(IpAddr::V6(ip), false),
+                "reserved {ip} was allowed"
+            );
+            assert!(
+                ip.is_loopback() || is_blocked_ip(IpAddr::V6(ip), true),
+                "reserved {ip} was allowed with the loopback opt-in"
+            );
+        }
+    }
+
+    // Decoding an embedded IPv4 address only adds blocking reasons.
+    let wrappings = [
+        embedded.to_ipv6_mapped(),
+        embedded.to_ipv6_compatible(),
+        Ipv6Addr::from((0x0064_ff9b_u128 << 96) | embedded_bits),
+        Ipv6Addr::from((fuzzed & !u128::from(u64::MAX)) | isatap_identifier),
+    ];
+    for allow_loopback_ips in [false, true] {
+        if !is_blocked_ip(IpAddr::V4(embedded), allow_loopback_ips) {
+            continue;
+        }
+        for wrapped in wrappings {
+            assert!(
+                (allow_loopback_ips && wrapped.is_loopback())
+                    || is_blocked_ip(IpAddr::V6(wrapped), allow_loopback_ips),
+                "blocked {embedded} escaped as {wrapped}"
+            );
+        }
+    }
+
+    // The loopback opt-in never blocks what the strict policy allows.
+    let ip = IpAddr::V6(Ipv6Addr::from(fuzzed));
+    assert!(
+        !is_blocked_ip(ip, true) || is_blocked_ip(ip, false),
+        "loopback opt-in blocked {ip}"
+    );
+}
 fn split_input(data: &[u8]) -> (String, String) {
     let text = String::from_utf8_lossy(data);
     let middle = text.len() / 2;
@@ -75,6 +155,7 @@ fuzz_target!(|data: &[u8]| {
     if data.len() < 4 {
         return;
     }
+    check_ip_classification(data);
     let (host_text, url_text) = split_input(data);
     let host_text = host_text.trim();
     if host_text.is_empty() || host_text.len() > 253 {

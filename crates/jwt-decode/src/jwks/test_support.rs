@@ -147,7 +147,8 @@ pub(crate) fn hmac_token(claims: Claims) -> String {
     let mut header = Header::new(Algorithm::HS256);
     header.kid = Some("hmac-key".to_owned());
     header.typ = Some("at+jwt".to_owned());
-    jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(HMAC_SECRET)).unwrap()
+    let key = EncodingKey::from_secret(HMAC_SECRET).expect("valid HMAC test key");
+    jsonwebtoken::encode(&header, &claims, &key).unwrap()
 }
 
 pub(crate) fn signed_token(header: Header, claims: Claims) -> String {

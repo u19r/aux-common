@@ -39,7 +39,7 @@ impl TestFunction {
                 std::env::var("BUFFERED_WRITES_LAMBDA_RECEIPT_DIR")
                     .expect("explicit receipt directory"),
             ),
-            started_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap(),
+            started_ms: u64::try_from(jiff::Timestamp::now().as_millisecond()).unwrap(),
             cleaned: false,
         };
         resources.receipt_dir = resources.receipt_dir.join(&resources.name);

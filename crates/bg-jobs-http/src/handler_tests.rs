@@ -172,6 +172,7 @@ fn response(status: StatusCode, body: &[u8]) -> Result<HttpResponse, HttpRequest
 fn policy() -> HttpPolicy {
     HttpPolicy::builder(HttpPolicyId::try_new("identity").expect("policy ID"))
         .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+        .route(Method::POST, "/")
         .try_build()
         .expect("policy")
 }
@@ -194,6 +195,7 @@ fn job_with_headers(headers: HeaderMap, body: &[u8]) -> HttpJob {
 fn policy_with_authorizer(id: &str, authorizer: impl RequestAuthorizer) -> HttpPolicy {
     HttpPolicy::builder(HttpPolicyId::try_new(id).expect("policy ID"))
         .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+        .route(Method::POST, "/")
         .authorizer(authorizer)
         .try_build()
         .expect("policy")
@@ -289,6 +291,7 @@ async fn given_multiple_policies_when_executed_then_each_bound_client_uses_its_p
     let first_timeout = Duration::from_millis(100);
     let first_policy = HttpPolicy::builder(first_id.clone())
         .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+        .route(Method::POST, "/")
         .request_timeout(first_timeout)
         .connect_timeout(Duration::from_secs(2))
         .try_build()
@@ -297,6 +300,7 @@ async fn given_multiple_policies_when_executed_then_each_bound_client_uses_its_p
     let second_timeout = Duration::from_millis(400);
     let second_policy = HttpPolicy::builder(second_id.clone())
         .endpoint(ApprovedEndpoint::exact_on_port("api.example.com", 8443).expect("endpoint"))
+        .route(Method::POST, "/")
         .request_timeout(second_timeout)
         .connect_timeout(Duration::from_secs(2))
         .try_build()
@@ -395,6 +399,7 @@ async fn given_unapproved_endpoint_when_executed_then_no_transport_or_authorizat
 async fn given_policy_request_and_response_bounds_when_exceeded_then_no_body_is_sent_or_retained() {
     let request_policy = HttpPolicy::builder(HttpPolicyId::try_new("request-bound").expect("ID"))
         .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+        .route(Method::POST, "/")
         .max_request_bytes(4)
         .try_build()
         .expect("policy");
@@ -422,6 +427,7 @@ async fn given_policy_request_and_response_bounds_when_exceeded_then_no_body_is_
 
     let response_policy = HttpPolicy::builder(HttpPolicyId::try_new("response-bound").expect("ID"))
         .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+        .route(Method::POST, "/")
         .max_response_bytes(4)
         .try_build()
         .expect("policy");
@@ -480,6 +486,7 @@ async fn given_expired_deadline_when_authorization_is_execution_time_then_it_is_
     let calls = Arc::new(AtomicUsize::new(0));
     let policy = HttpPolicy::builder(HttpPolicyId::try_new("deadline-auth").expect("policy ID"))
         .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+        .route(Method::POST, "/")
         .authorizer(CountingAuthorizer {
             calls: Arc::clone(&calls),
         })
@@ -527,6 +534,7 @@ async fn given_authorization_consuming_deadline_does_not_start_transport() {
     let policy =
         HttpPolicy::builder(HttpPolicyId::try_new("deadline-consumed").expect("policy ID"))
             .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+            .route(Method::POST, "/")
             .authorizer(YieldingAuthorizer)
             .try_build()
             .expect("policy");
@@ -598,6 +606,7 @@ async fn given_authorization_that_yields_before_the_deadline_when_executed_then_
 async fn given_custom_transport_when_executed_then_remaining_total_deadline_is_on_request() {
     let policy = HttpPolicy::builder(HttpPolicyId::try_new("request-deadline").expect("policy ID"))
         .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+        .route(Method::POST, "/")
         .request_timeout(Duration::from_millis(200))
         .connect_timeout(Duration::from_secs(2))
         .try_build()
@@ -995,6 +1004,7 @@ impl RequestAuthorizer for WedgedAuthorizer {
 fn wedged_policy() -> HttpPolicy {
     HttpPolicy::builder(HttpPolicyId::try_new("wedged").expect("policy ID"))
         .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+        .route(Method::POST, "/")
         .request_timeout(Duration::from_millis(150))
         .connect_timeout(Duration::from_millis(50))
         .try_build()
@@ -1051,6 +1061,7 @@ async fn given_wedged_transport_when_execute_runs_then_attempt_is_deadline_bound
 async fn given_wedged_authorizer_when_execute_runs_then_attempt_is_deadline_bounded() {
     let policy = HttpPolicy::builder(HttpPolicyId::try_new("wedged").expect("policy ID"))
         .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+        .route(Method::POST, "/")
         .request_timeout(Duration::from_millis(150))
         .authorizer(WedgedAuthorizer)
         .try_build()

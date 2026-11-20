@@ -297,11 +297,8 @@ impl UnverifiedElement {
         match signatures.as_slice() {
             [] => Ok(None),
             [signature] if signature.namespace() == Some(NS_DS) => Ok(Some(signature)),
-            [signature] => Err(XmlSecurityError::NamespaceMismatch {
-                message: format!(
-                    "Signature element uses unexpected namespace {:?}",
-                    signature.namespace()
-                ),
+            [_] => Err(XmlSecurityError::NamespaceMismatch {
+                message: "Signature element uses unexpected namespace".to_string(),
             }),
             _ => Err(XmlSecurityError::Signature {
                 message: "an element contains multiple direct Signature elements".to_string(),
@@ -357,10 +354,11 @@ impl UnverifiedElement {
             if name == "ID" && (value.is_empty() || !seen.insert(value.clone())) {
                 return Err(XmlSecurityError::Signature {
                     message: if value.is_empty() {
-                        "ID attributes must not be empty".to_string()
+                        "ID attributes must not be empty"
                     } else {
-                        format!("ID value appears more than once: {value}")
-                    },
+                        "ID value appears more than once"
+                    }
+                    .to_string(),
                 });
             }
         }
@@ -389,7 +387,7 @@ impl UnverifiedElement {
                 || !matches!(child.name(), "SignedInfo" | "SignatureValue" | "KeyInfo")
             {
                 return Err(XmlSecurityError::Signature {
-                    message: format!("unsupported Signature child: {}", child.name()),
+                    message: "unsupported Signature child".to_string(),
                 });
             }
             match child.name() {
@@ -452,7 +450,7 @@ impl UnverifiedElement {
                 )
             {
                 return Err(XmlSecurityError::Signature {
-                    message: format!("unsupported SignedInfo child: {}", child.name()),
+                    message: "unsupported SignedInfo child".to_string(),
                 });
             }
         }
@@ -537,7 +535,7 @@ impl UnverifiedElement {
                 || !matches!(child.name(), "Transforms" | "DigestMethod" | "DigestValue")
             {
                 return Err(XmlSecurityError::Signature {
-                    message: format!("unsupported Reference child: {}", child.name()),
+                    message: "unsupported Reference child".to_string(),
                 });
             }
         }
@@ -554,8 +552,8 @@ impl UnverifiedElement {
             .collect::<Vec<_>>();
         match children.as_slice() {
             [child] if child.namespace() == Some(NS_DS) => Ok(child),
-            [child] => Err(XmlSecurityError::NamespaceMismatch {
-                message: format!("{name} uses unexpected namespace {:?}", child.namespace()),
+            [_] => Err(XmlSecurityError::NamespaceMismatch {
+                message: format!("{name} uses unexpected namespace"),
             }),
             [] => Err(XmlSecurityError::Signature {
                 message: format!("{name} is missing"),
@@ -620,7 +618,7 @@ impl UnverifiedElement {
         for prefix in prefix_list.split_whitespace() {
             if prefixes.iter().any(|existing| existing == prefix) {
                 return Err(XmlSecurityError::NamespaceMismatch {
-                    message: format!("duplicate inclusive namespace prefix: {prefix}"),
+                    message: "duplicate inclusive namespace prefix".to_string(),
                 });
             }
             prefixes.push(prefix.to_string());

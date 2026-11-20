@@ -5,7 +5,7 @@ use super::{
     protocol::{SendMessageRequest, SendMessageResponse, hash_message_identity},
 };
 use crate::{
-    Deadline, QueueError, QueueLimits, QueueReceipt, SealedBatch, WriteQueue,
+    Deadline, QueueEnvelope, QueueError, QueueLimits, QueueReceipt, WriteQueue,
     constants::SQS_TARGET_SEND_MESSAGE,
 };
 
@@ -16,19 +16,16 @@ impl WriteQueue for SqsQueue {
 
     fn publish(
         &self,
-        batch: SealedBatch,
+        envelope: QueueEnvelope,
         deadline: Deadline,
     ) -> BoxFuture<'static, Result<QueueReceipt, QueueError>> {
         let queue = self.clone();
         Box::pin(async move {
-            let bytes = batch
-                .to_envelope_bytes()
-                .map_err(|_| QueueError::Permanent {
-                    reason: "failed to serialize sealed batch envelope",
+            let batch = envelope.batch();
+            let body =
+                std::str::from_utf8(envelope.bytes()).map_err(|_| QueueError::Permanent {
+                    reason: "envelope must be valid UTF-8 JSON",
                 })?;
-            let body = std::str::from_utf8(&bytes).map_err(|_| QueueError::Permanent {
-                reason: "envelope must be valid UTF-8 JSON",
-            })?;
             let delivery = queue.is_fifo.then(|| {
                 (
                     batch.batch_id().to_string(),

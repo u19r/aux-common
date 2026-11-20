@@ -80,6 +80,26 @@ fn regex_mapping_compiles_once_and_renders_typed_nested_template() {
 }
 
 #[test]
+fn given_step_up_claim_names_when_used_as_mapping_target_or_custom_claim_then_rejected() {
+    // Given every claim that `SessionContext::from_claims` reads for step-up.
+    for name in ["mfa_time", "auth_time", "acr", "amr"] {
+        // When a claim mapping targets it, then compilation rejects it.
+        let protected = ClaimMappingRegistry::compile(vec![exact_spec("$.sub", name)])
+            .expect_err("step-up claim is protected");
+        assert_eq!(protected, ClaimMappingError::ProtectedTarget(name.into()));
+
+        // When it is supplied as a custom claim, then bounds reject it.
+        assert_eq!(
+            crate::CustomClaims::try_new(serde_json::Map::from_iter([(
+                name.to_string(),
+                json!(1_000),
+            )])),
+            Err(crate::ClaimBoundsError::ProtectedClaim(name.to_string()))
+        );
+    }
+}
+
+#[test]
 fn mappings_reject_protected_and_duplicate_targets() {
     for target in ["sub", "access_profile_session_reference"] {
         let protected = ClaimMappingRegistry::compile(vec![exact_spec("$.sub", target)])

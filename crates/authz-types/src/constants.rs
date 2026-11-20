@@ -38,6 +38,12 @@ pub const MAX_SCOPE_MAPPING_PERMISSIONS: usize = 500;
 pub const MAX_SCOPE_MAPPING_INCLUDES: usize = 200;
 /// Maximum configured step-up rules.
 pub const MAX_STEP_UP_RULES: usize = 200;
+/// Maximum action references across all permissions and roles after wildcard
+/// expansion. Checked from match counts before any expansion is allocated.
+pub const MAX_EXPANDED_ACTION_REFS: usize = 100_000;
+/// Maximum generated role policies (role, granted action, entry scope). Each
+/// becomes one Cedar template link, so this bounds policy generation.
+pub const MAX_POLICY_LINKS: usize = 100_000;
 
 /// Reserved context keys added by Authz enrichment.
 pub const CONTEXT_SUBJECT_PARENTS_KEY: &str = "subject_parents";

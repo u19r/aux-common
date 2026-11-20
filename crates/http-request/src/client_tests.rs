@@ -14,8 +14,8 @@ use tokio::{
 };
 
 use crate::{
-    HttpClientBuilder, HttpRequestError, HttpRequestErrorKind, HttpResponse, RetryConfig,
-    Transport, TransportFuture, client::retry_delay_for_response,
+    HttpClientBuilder, HttpRequestDispatchStatus, HttpRequestError, HttpRequestErrorKind,
+    HttpResponse, RetryConfig, Transport, TransportFuture, client::retry_delay_for_response,
 };
 
 struct SequenceTransport {
@@ -81,6 +81,36 @@ impl Transport for CountingTransport {
             .pop_front()
             .expect("counting transport response");
         Box::pin(async move { response })
+    }
+}
+
+/// Answers every attempt with `503 Retry-After: 5` after `delay`, recording
+/// each attempt's timeout. Like any custom transport, it does not enforce
+/// that timeout itself.
+#[derive(Debug)]
+struct SlowUnavailableTransport {
+    delay: Duration,
+    timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
+}
+
+impl Transport for SlowUnavailableTransport {
+    fn send(&self, request: Request) -> TransportFuture {
+        self.timeouts
+            .lock()
+            .expect("slow transport timeouts lock")
+            .push(request.timeout().copied());
+        let delay = self.delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::RETRY_AFTER, HeaderValue::from_static("5"));
+            Ok(HttpResponse::from_mock(
+                StatusCode::SERVICE_UNAVAILABLE,
+                headers,
+                Vec::new(),
+                Url::parse("https://example.test/resource").expect("503 response url"),
+            ))
+        })
     }
 }
 
@@ -1034,4 +1064,92 @@ fn custom_transport_defaults_to_untrusted_policy_capabilities() {
     assert!(!transport.redirects_disabled());
     assert!(!transport.destination_policy_enforced());
     assert!(!transport.deadline_enforced());
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_operation_deadline_when_retry_wait_reaches_it_then_returns_last_response_without_retrying()
+ {
+    // Given an endpoint that answers 503 with `Retry-After: 5` after 9.9 s,
+    // the default retry policy, and a 20 s operation deadline.
+    let timeouts = Arc::new(Mutex::new(Vec::new()));
+    let client = HttpClientBuilder::new()
+        .with_transport(SlowUnavailableTransport {
+            delay: Duration::from_millis(9_900),
+            timeouts: Arc::clone(&timeouts),
+        })
+        .build()
+        .expect("build http client");
+    let request = client
+        .get("https://example.test/resource")
+        .build()
+        .expect("request");
+    let started_at = tokio::time::Instant::now();
+
+    // When the request runs under that deadline.
+    let response = client
+        .execute_attempts(request, Some(started_at + Duration::from_secs(20)))
+        .await
+        .expect("final response");
+
+    // Then each attempt's timeout is the budget left, the retry that fits
+    // runs, and the one whose wait would reach the deadline does not.
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        *timeouts.lock().expect("timeouts lock"),
+        vec![
+            Some(Duration::from_secs(20)),
+            Some(Duration::from_millis(5_100))
+        ]
+    );
+    assert_eq!(
+        tokio::time::Instant::now() - started_at,
+        Duration::from_millis(24_800)
+    );
+}
+
+#[tokio::test]
+async fn given_put_retried_after_503_when_next_attempt_cannot_connect_then_reports_possibly_dispatched()
+ {
+    // Given a PUT whose first attempt is delivered and answered with 503,
+    // and whose retry is refused at connect.
+    let transport = SequenceTransport::from_responses(vec![
+        Ok(HttpResponse::from_mock(
+            StatusCode::SERVICE_UNAVAILABLE,
+            HeaderMap::new(),
+            Vec::new(),
+            Url::parse("https://example.test/resource").expect("503 response url"),
+        )),
+        Err(HttpRequestError::Transport {
+            kind: HttpRequestErrorKind::Connect,
+        }),
+    ]);
+    let client = HttpClientBuilder::new()
+        .retry(RetryConfig {
+            max_retries: 1,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            retry_non_idempotent: false,
+        })
+        .with_transport(transport)
+        .build()
+        .expect("build http client");
+
+    // When the PUT is sent.
+    let error = match client
+        .put("https://example.test/resource")
+        .body("value")
+        .send()
+        .await
+    {
+        Ok(_) => panic!("refused retry should fail"),
+        Err(error) => error,
+    };
+
+    // Then the connect failure keeps its kind but no longer claims the write
+    // was not applied, because the first attempt reached the destination.
+    assert_eq!(error.kind(), HttpRequestErrorKind::Connect);
+    assert_eq!(
+        error.dispatch_status(),
+        HttpRequestDispatchStatus::PossiblyDispatched
+    );
 }

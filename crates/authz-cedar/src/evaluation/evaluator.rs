@@ -210,6 +210,9 @@ pub struct CedarResourceScope {
 #[derive(Debug, Clone)]
 pub struct CedarInternalContext {
     pub token_present: bool,
+    /// The token is the subject's own credential (a user API key), not a
+    /// delegated service token presented by a policy enforcement point.
+    pub token_is_subject_credential: bool,
     pub token_valid: bool,
     pub token_resource_filter_enabled: bool,
     pub token_resource_filter: Vec<CedarEntityRef>,
@@ -225,6 +228,9 @@ pub struct CedarInternalContext {
     pub session_auth_age_seconds: i64,
     pub session_mfa_age_present: bool,
     pub session_mfa_age_seconds: i64,
+    /// The evaluation meters capacity for an action that is authorized, with
+    /// step-up, where it runs. Step-up guards do not apply to it.
+    pub capacity_accounting: bool,
 }
 
 pub struct PreparedCedarEvaluation {
@@ -1285,8 +1291,16 @@ fn restricted_expr_from_internal_context(
 
     RestrictedExpression::new_record([
         (
+            "capacity_accounting".to_string(),
+            RestrictedExpression::new_bool(context.capacity_accounting),
+        ),
+        (
             "token_present".to_string(),
             RestrictedExpression::new_bool(context.token_present),
+        ),
+        (
+            "token_is_subject_credential".to_string(),
+            RestrictedExpression::new_bool(context.token_is_subject_credential),
         ),
         (
             "token_valid".to_string(),

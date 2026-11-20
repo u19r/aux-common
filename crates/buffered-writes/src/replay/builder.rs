@@ -4,8 +4,8 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use super::worker::ReplayWorker;
 use crate::{
-    Clock, ConfigurationError, DeliveryPolicy, NoopWriteObserver, ProductionClock, RecordCodec,
-    ReplayGuarantee, ReplayQueue, SerdeJsonCodec, WriteObserver, WriteSink,
+    Clock, ConfigurationError, DeliveryPolicy, EnvelopeKey, NoopWriteObserver, ProductionClock,
+    RecordCodec, ReplayGuarantee, ReplayQueue, SerdeJsonCodec, WriteObserver, WriteSink,
     constants::DEFAULT_GROUPING_STRATEGY_VERSION,
 };
 
@@ -14,6 +14,7 @@ pub struct ReplayBuilder<T> {
     namespace: String,
     strategy_version: String,
     queue: Arc<dyn ReplayQueue>,
+    key: EnvelopeKey,
     sink: Arc<dyn WriteSink<T>>,
     codec: Arc<dyn RecordCodec<T>>,
     policy: DeliveryPolicy,
@@ -22,11 +23,17 @@ pub struct ReplayBuilder<T> {
 }
 
 impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> ReplayBuilder<T> {
-    pub(super) fn new(namespace: String, queue: impl ReplayQueue, sink: impl WriteSink<T>) -> Self {
+    pub(super) fn new(
+        namespace: String,
+        queue: impl ReplayQueue,
+        key: EnvelopeKey,
+        sink: impl WriteSink<T>,
+    ) -> Self {
         Self {
             namespace,
             strategy_version: DEFAULT_GROUPING_STRATEGY_VERSION.to_owned(),
             queue: Arc::new(queue),
+            key,
             sink: Arc::new(sink),
             codec: Arc::new(SerdeJsonCodec::<T>::default()),
             policy: DeliveryPolicy::default(),
@@ -69,12 +76,18 @@ impl<T: Send + Sync + 'static> ReplayBuilder<T> {
         if self.sink.replay_guarantee() == ReplayGuarantee::Unsupported {
             return Err(ConfigurationError::UnsupportedReplayGuarantee);
         }
+        if !self.queue.has_quarantine_target() {
+            return Err(ConfigurationError::InvalidQueueConfiguration {
+                reason: "replay requires a quarantine target for poison envelopes",
+            });
+        }
         crate::configuration::validate_version(&self.strategy_version)?;
         crate::configuration::validate_version(self.codec.version())?;
         Ok(ReplayWorker {
             namespace,
             strategy_version: self.strategy_version,
             queue: self.queue,
+            key: self.key,
             sink: self.sink,
             codec: self.codec,
             policy: self.policy,

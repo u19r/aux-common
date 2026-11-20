@@ -2,7 +2,8 @@
 //!
 //! Callers own application initialization, request routing, and worker duties.
 //! This crate reads the reserved listen and runtime addresses and acknowledges
-//! readiness. It does not read credentials or create background work.
+//! readiness directly, ignoring proxy environment variables. It does not read
+//! credentials or create background work.
 
 mod constants;
 mod environment;

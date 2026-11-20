@@ -7,7 +7,7 @@ use bg_jobs_http::{
     HttpRequest, HttpRequestInput, PolicyBoundTransport,
 };
 use bytes::Bytes;
-use http::{HeaderMap, Method, StatusCode};
+use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_request::{HttpResponse, Transport, TransportFuture, Url};
 
 use crate::{CredentialSource, SigV4Authorizer, SigV4AuthorizerError};
@@ -75,6 +75,7 @@ async fn given_approved_https_request_when_authorized_then_sigv4_headers_are_add
     let policy_id = HttpPolicyId::try_new("sigv4-signing").expect("policy ID");
     let policy = HttpPolicy::builder(policy_id.clone())
         .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+        .route(Method::POST, "/")
         .authorizer(authorizer())
         .try_build()
         .expect("policy");
@@ -129,6 +130,7 @@ async fn given_invalid_header_when_executor_authorizes_then_signing_failure_is_c
     let policy_id = HttpPolicyId::try_new("sigv4-invalid-header").expect("policy ID");
     let policy = HttpPolicy::builder(policy_id.clone())
         .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+        .route(Method::POST, "/")
         .authorizer(authorizer())
         .try_build()
         .expect("policy");
@@ -163,6 +165,7 @@ async fn given_unapproved_endpoint_when_executor_uses_sigv4_then_it_is_rejected_
     let policy_id = HttpPolicyId::try_new("sigv4-approved").expect("policy ID");
     let policy = HttpPolicy::builder(policy_id.clone())
         .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+        .route(Method::POST, "/")
         .authorizer(authorizer())
         .try_build()
         .expect("policy");
@@ -204,4 +207,90 @@ fn given_invalid_sigv4_configuration_when_built_then_no_signer_is_created() {
             .expect_err("control character"),
         SigV4AuthorizerError::InvalidConfiguration
     );
+}
+
+fn sqs_policy(policy_id: &HttpPolicyId) -> HttpPolicy {
+    HttpPolicy::builder(policy_id.clone())
+        .endpoint(ApprovedEndpoint::exact("sqs.us-east-1.amazonaws.com").expect("endpoint"))
+        .route(Method::POST, "/123456789012/jobs")
+        .authorizer(authorizer())
+        .try_build()
+        .expect("policy")
+}
+
+#[tokio::test]
+async fn given_payload_x_amz_target_when_sigv4_authorizes_then_rejected_before_signing() {
+    let policy_id = HttpPolicyId::try_new("sqs-send").expect("policy ID");
+    let (transport, request_log) = RecordingTransport::new();
+    let executor = HttpExecutor::builder()
+        .policy(sqs_policy(&policy_id))
+        .with_transport(transport)
+        .try_build()
+        .expect("executor");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-amz-target",
+        HeaderValue::from_static("AmazonSQS.PurgeQueue"),
+    );
+    let request = HttpRequest::try_new(HttpRequestInput {
+        method: Method::POST,
+        url: Url::parse("https://sqs.us-east-1.amazonaws.com/123456789012/jobs").expect("URL"),
+        headers,
+        body: Bytes::from_static(
+            br#"{"QueueUrl":"https://sqs.us-east-1.amazonaws.com/123456789012/other"}"#,
+        ),
+    })
+    .expect("request");
+
+    let error = executor
+        .execute(
+            &HttpJob::new(policy_id, request),
+            HttpAttempt::new(ExecutionId::from([5; 16]), AttemptId::from([6; 16]), None),
+        )
+        .await
+        .expect_err("caller-selected AWS operation");
+
+    assert_eq!(
+        error,
+        HttpJobError::Authorization(bg_jobs_http::AuthorizationErrorKind::InvalidRequest)
+    );
+    assert!(request_log.lock().expect("request lock").is_none());
+}
+
+#[tokio::test]
+async fn given_payload_delete_outside_approved_route_when_executed_then_rejected_before_signing() {
+    let policy_id = HttpPolicyId::try_new("sqs-send").expect("policy ID");
+    let (transport, request_log) = RecordingTransport::new();
+    let executor = HttpExecutor::builder()
+        .policy(sqs_policy(&policy_id))
+        .with_transport(transport)
+        .try_build()
+        .expect("executor");
+    for (method, url) in [
+        (
+            Method::DELETE,
+            "https://sqs.us-east-1.amazonaws.com/123456789012/jobs",
+        ),
+        (
+            Method::POST,
+            "https://sqs.us-east-1.amazonaws.com/123456789012/other",
+        ),
+    ] {
+        let request = HttpRequest::try_new(HttpRequestInput {
+            method,
+            url: Url::parse(url).expect("URL"),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        })
+        .expect("request");
+        let error = executor
+            .execute(
+                &HttpJob::new(policy_id.clone(), request),
+                HttpAttempt::new(ExecutionId::from([7; 16]), AttemptId::from([8; 16]), None),
+            )
+            .await
+            .expect_err("unapproved operation");
+        assert_eq!(error, HttpJobError::EndpointNotApproved);
+    }
+    assert!(request_log.lock().expect("request lock").is_none());
 }

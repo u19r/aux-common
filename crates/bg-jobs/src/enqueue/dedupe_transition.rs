@@ -69,7 +69,14 @@ impl DedupeTransition {
             .as_ref()
             .ok_or(JobSystemError::PayloadCorrupt)?;
         if deduplication.retain_until() != until
-            || keys::dedupe_key(system.namespace(), deduplication.key())? != self.key
+            || keys::dedupe_key(
+                system.namespace(),
+                keys::DedupeIdentity::new(
+                    &self.record.kind,
+                    &self.record.fairness,
+                    deduplication.key(),
+                ),
+            )? != self.key
             || !input.checks().iter().any(|check| check.key() == &self.key)
         {
             return Err(JobSystemError::PayloadCorrupt);

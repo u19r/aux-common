@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use authz_types::{
     AcrLevel, AuthzChallenge, ChallengeType, SessionContext, StepUpConfig, StepUpRule,
 };
-use chrono::Utc;
+use jiff::Timestamp;
 
 #[derive(Debug, Clone)]
 pub enum StepUpResult {
@@ -46,7 +46,7 @@ impl<'a> StepUpEvaluator<'a> {
             action,
             session,
             is_api_key,
-            Utc::now().timestamp(),
+            crate::evaluation::epoch_seconds(Timestamp::now()),
         )
     }
 

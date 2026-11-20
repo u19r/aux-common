@@ -13,9 +13,11 @@ deployed fixture remains pending. Local TCP and HTTP proof does not establish de
 ## Wiring
 
 Supply both processes with the same loopback endpoint and printable ASCII capability token.
-`LambdaIpcConfig::try_new(address, token)` rejects non-loopback addresses, empty or oversized tokens
-and non-printable tokens. The token is at most 256 bytes. Debug output hides configuration values.
+`LambdaIpcConfig::try_new(address, token)` rejects non-loopback addresses, non-printable tokens, and
+tokens shorter than 16 or longer than 256 bytes. Debug output hides configuration values.
 Its default exchange timeout is two seconds; `try_with_timeout` accepts a positive finite override.
+The serial listener waits at most 500 ms for a request frame, and it authenticates the token in
+constant time before decoding the command.
 Bind the server before registering the extension so an early function connection can wait in the
 bounded local path until the actual INVOKE event establishes its authority.
 
@@ -142,11 +144,11 @@ idempotent maximum-register destination for numeric inputs. This demonstrates pr
 not durable storage or atomic receipt implementation. The common crate imports no consumer schema.
 
 ```sh
-cargo +1.99.1 build -p buffered-writes --features lambda \
+cargo +1.100.0 build -p buffered-writes --features lambda \
   --example lambda-extension --example lambda-runtime
 BUFFERED_WRITES_LAMBDA_EXTENSION_EXAMPLE="$CARGO_TARGET_DIR/debug/examples/lambda-extension" \
 BUFFERED_WRITES_LAMBDA_RUNTIME_EXAMPLE="$CARGO_TARGET_DIR/debug/examples/lambda-runtime" \
-  cargo +1.99.1 test -p buffered-writes --features lambda --test lambda_process -- --ignored
+  cargo +1.100.0 test -p buffered-writes --features lambda --test lambda_process -- --ignored
 ```
 
 Set `CARGO_TARGET_DIR` to the repository-approved target slot before these commands. Both binaries
@@ -168,7 +170,7 @@ request ID. They do not prove AWS's notification delivery or the behavior of a d
 For ARM64 `provided.al2023`, the linked target is `aarch64-unknown-linux-gnu.2.34`:
 
 ```sh
-cargo +1.99.1 zigbuild -p buffered-writes --features lambda \
+cargo +1.100.0 zigbuild -p buffered-writes --features lambda \
   --example lambda-extension --example lambda-runtime \
   --target aarch64-unknown-linux-gnu.2.34
 ```
@@ -209,7 +211,7 @@ BUFFERED_WRITES_LAMBDA_REGION=eu-central-1 \
 BUFFERED_WRITES_LAMBDA_ZIP="$PWD/run-artifacts/buffered-writes/lambda-package/lambda-function-arm64.zip" \
 BUFFERED_WRITES_LAMBDA_LAYER_ZIP="$PWD/run-artifacts/buffered-writes/lambda-package/lambda-layer-arm64.zip" \
 BUFFERED_WRITES_LAMBDA_RECEIPT_DIR="$PWD/run-artifacts/buffered-writes/lambda-live" \
-  cargo +1.99.1 test -p buffered-writes --features lambda --test lambda_native \
+  cargo +1.100.0 test -p buffered-writes --features lambda --test lambda_native \
     -- --ignored --test-threads=1
 ```
 

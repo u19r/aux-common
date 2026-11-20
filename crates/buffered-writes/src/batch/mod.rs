@@ -11,6 +11,7 @@ mod limits;
 mod operation_builder;
 mod preparation;
 mod preparation_limits;
+mod queue_envelope;
 mod record;
 mod sealed;
 pub use admission_identity::AdmissionFingerprint;
@@ -25,5 +26,6 @@ pub use preparation::{
 };
 pub use preparation_limits::PreparationLayout;
 pub(crate) use preparation_limits::PreparationLimits;
+pub use queue_envelope::{EnvelopeKey, QueueEnvelope};
 pub use record::{AdmittedRecord, PersistedRecord};
 pub use sealed::{SealedBatch, SealedBatchInput};

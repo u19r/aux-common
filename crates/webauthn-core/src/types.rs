@@ -158,10 +158,10 @@ pub enum SignCountStatus {
         previous: u32,
         current: u32,
     },
-    Unchanged {
-        value: u32,
-    },
-    Regression {
+    /// The counter did not increase after a non-zero counter (equal or
+    /// lower). WebAuthn treats this as a signal that the authenticator may
+    /// have been cloned.
+    NotIncreased {
         previous: u32,
         current: u32,
     },

@@ -137,12 +137,21 @@ impl WildcardPattern {
         Err(ActionPatternParseError::InvalidWildcardShape { field })
     }
 
+    /// Match a catalog identifier, ignoring surrounding whitespace and ASCII
+    /// case, without allocating. Pattern values are lowercase ASCII.
     fn matches(&self, candidate: &str) -> bool {
+        let candidate = candidate.trim().as_bytes();
         match self {
             Self::Any => true,
-            Self::Exact(value) => candidate == value,
-            Self::Prefix(value) => candidate.starts_with(value),
-            Self::Suffix(value) => candidate.ends_with(value),
+            Self::Exact(value) => candidate.eq_ignore_ascii_case(value.as_bytes()),
+            Self::Prefix(value) => candidate
+                .get(..value.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(value.as_bytes())),
+            Self::Suffix(value) => candidate
+                .len()
+                .checked_sub(value.len())
+                .and_then(|start| candidate.get(start..))
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(value.as_bytes())),
         }
     }
 
@@ -155,18 +164,91 @@ fn validate_segment_chars(
     field: &'static str,
     segment: &str,
 ) -> Result<(), ActionPatternParseError> {
-    for character in segment.chars() {
-        if character.is_ascii_lowercase()
-            || character.is_ascii_digit()
-            || character == '_'
-            || character == '-'
-            || character == '.'
-        {
-            continue;
-        }
-        return Err(ActionPatternParseError::InvalidCharacter { field, character });
+    match segment
+        .chars()
+        .find(|character| character.is_ascii_uppercase() || !is_action_name_char(*character))
+    {
+        Some(character) => Err(ActionPatternParseError::InvalidCharacter { field, character }),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// Characters allowed in a catalog action name and in an action reference
+/// (references compare case-insensitively). Excluding `:` and `#` keeps the
+/// `resource_type:action` Cedar action ID and the `#` bundle manifest keys
+/// unambiguous.
+pub(crate) fn is_action_name_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+}
+
+/// A parsed `resource_type:action` reference that may use wildcards.
+pub(crate) struct ActionPattern {
+    resource: WildcardPattern,
+    action: WildcardPattern,
+}
+
+impl ActionPattern {
+    pub(crate) fn parse(
+        resource_type_pattern: &str,
+        action_name_pattern: &str,
+        resource_type_max_len: usize,
+        action_name_max_len: usize,
+    ) -> Result<Self, ActionPatternExpandError> {
+        let resource = WildcardPattern::parse(
+            resource_type_pattern,
+            "resource_type",
+            resource_type_max_len,
+        )
+        .map_err(ActionPatternExpandError::InvalidPattern)?;
+        let action =
+            WildcardPattern::parse(action_name_pattern, "action_name", action_name_max_len)
+                .map_err(ActionPatternExpandError::InvalidPattern)?;
+        Ok(Self { resource, action })
+    }
+
+    /// Catalog entries matched by this pattern, in catalog order.
+    pub(crate) fn matches<'catalog>(
+        &self,
+        resource_types: &'catalog [ResourceType],
+    ) -> impl Iterator<Item = (&'catalog str, &'catalog str)> {
+        resource_types
+            .iter()
+            .filter(|resource_type| self.resource.matches(resource_type.id.as_str()))
+            .flat_map(|resource_type| {
+                resource_type
+                    .actions
+                    .iter()
+                    .filter(|action| self.action.matches(action.name.as_str()))
+                    .map(|action| (resource_type.id.as_str(), action.name.as_str()))
+            })
+    }
+
+    /// Count matches without materializing them, so a caller can bound an
+    /// expansion before allocating it. Duplicate catalog entries are counted
+    /// twice, which keeps the count an upper bound on the expansion.
+    pub(crate) fn count_matches(
+        &self,
+        resource_types: &[ResourceType],
+        resource_type_pattern: &str,
+        action_name_pattern: &str,
+    ) -> Result<usize, ActionPatternExpandError> {
+        match self.matches(resource_types).count() {
+            0 => Err(self.no_matches(resource_type_pattern, action_name_pattern)),
+            count => Ok(count),
+        }
+    }
+
+    fn no_matches(
+        &self,
+        resource_type_pattern: &str,
+        action_name_pattern: &str,
+    ) -> ActionPatternExpandError {
+        ActionPatternExpandError::NoMatches {
+            resource_type_pattern: resource_type_pattern.trim().to_ascii_lowercase(),
+            action_name_pattern: action_name_pattern.trim().to_ascii_lowercase(),
+            used_wildcard: self.resource.uses_wildcard() || self.action.uses_wildcard(),
+        }
+    }
 }
 
 /// Expands resource_type/action patterns against the configured action catalog.
@@ -180,44 +262,21 @@ pub fn expand_action_patterns(
     resource_type_max_len: usize,
     action_name_max_len: usize,
 ) -> Result<Vec<ExpandedActionRef>, ActionPatternExpandError> {
-    let resource_pattern = WildcardPattern::parse(
+    let pattern = ActionPattern::parse(
         resource_type_pattern,
-        "resource_type",
+        action_name_pattern,
         resource_type_max_len,
-    )
-    .map_err(ActionPatternExpandError::InvalidPattern)?;
-    let action_pattern =
-        WildcardPattern::parse(action_name_pattern, "action_name", action_name_max_len)
-            .map_err(ActionPatternExpandError::InvalidPattern)?;
-
-    let mut deduped = BTreeSet::new();
-    for resource_type in resource_types {
-        let resource_type_key = resource_type.id.trim().to_ascii_lowercase();
-        if !resource_pattern.matches(resource_type_key.as_str()) {
-            continue;
-        }
-        for action in &resource_type.actions {
-            let action_name_key = action.name.trim().to_ascii_lowercase();
-            if action_pattern.matches(action_name_key.as_str()) {
-                deduped.insert((resource_type.id.clone(), action.name.clone()));
-            }
-        }
-    }
-
+        action_name_max_len,
+    )?;
+    let deduped = pattern.matches(resource_types).collect::<BTreeSet<_>>();
     if deduped.is_empty() {
-        return Err(ActionPatternExpandError::NoMatches {
-            resource_type_pattern: resource_type_pattern.trim().to_ascii_lowercase(),
-            action_name_pattern: action_name_pattern.trim().to_ascii_lowercase(),
-            used_wildcard: resource_pattern.uses_wildcard() || action_pattern.uses_wildcard(),
-        });
+        return Err(pattern.no_matches(resource_type_pattern, action_name_pattern));
     }
-
-    let expanded = deduped
+    Ok(deduped
         .into_iter()
         .map(|(resource_type, action_name)| ExpandedActionRef {
-            resource_type,
-            action_name,
+            resource_type: resource_type.to_string(),
+            action_name: action_name.to_string(),
         })
-        .collect();
-    Ok(expanded)
+        .collect())
 }

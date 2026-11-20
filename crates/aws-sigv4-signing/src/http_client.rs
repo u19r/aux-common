@@ -109,7 +109,11 @@ impl AwsSigv4HttpClient {
         if extra_headers.contains_key(http::header::HOST) {
             return Err(SigningError::HostHeaderOverride);
         }
-        if !path.starts_with('/') || path.starts_with("//") || path.contains('\\') {
+        if !path.starts_with('/')
+            || path.starts_with("//")
+            || path.contains('\\')
+            || has_dot_segment(path)
+        {
             return Err(SigningError::InvalidUrl);
         }
         let url = format!("{}{}", self.endpoint, path);
@@ -175,6 +179,36 @@ impl AwsSigv4HttpClient {
         self.send_text(method, path, body, extra_headers, Some("application/xml"))
             .await
     }
+}
+
+/// URL normalization resolves `.` and `..` segments, including
+/// percent-encoded dots, so a signed request could leave the endpoint path
+/// prefix. Only the path is checked; query and fragment text may contain dots.
+fn has_dot_segment(path: &str) -> bool {
+    path.split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .split('/')
+        .any(is_dot_segment)
+}
+
+fn is_dot_segment(segment: &str) -> bool {
+    let mut rest = segment;
+    let mut dots = 0_usize;
+    while !rest.is_empty() {
+        rest = if let Some(tail) = rest.strip_prefix('.') {
+            tail
+        } else if let Some(tail) = rest
+            .strip_prefix("%2e")
+            .or_else(|| rest.strip_prefix("%2E"))
+        {
+            tail
+        } else {
+            return false;
+        };
+        dots += 1;
+    }
+    (1..=2).contains(&dots)
 }
 
 async fn signed_text_response(

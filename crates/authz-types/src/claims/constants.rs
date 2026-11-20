@@ -15,6 +15,9 @@ pub const MAX_COMPACT_JWT_BYTES: usize = 16 * 1_024;
 
 /// Claim names owned by the signed access-token protocol or reserved by a
 /// removed protocol contract so they cannot be reintroduced as custom claims.
+/// Every claim that `SessionContext::from_claims` reads for step-up
+/// (`acr`, `amr`, `auth_time`, `mfa_time`) must be listed here, or a custom
+/// claim or claim mapping could forge authentication assurance.
 pub const STRUCTURAL_CLAIM_NAMES: &[&str] = &[
     "cnf",
     "iss",
@@ -27,9 +30,11 @@ pub const STRUCTURAL_CLAIM_NAMES: &[&str] = &[
     "client_id",
     "scope",
     "tenant",
+    "org_id",
     "token_type",
     "principal_type",
     "auth_time",
+    "mfa_time",
     "acr",
     "amr",
     "nonce",

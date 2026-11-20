@@ -72,7 +72,7 @@ impl<T: Send + Sync + 'static> Engine<T> {
             .complete_buffer_operation(deadline, || {
                 self.cfg.buffer.inspect(BufferInspectRequest {
                     operation_id: None,
-                    now_utc_ms: self.cfg.clock.now_utc().timestamp_millis(),
+                    now_utc_ms: crate::observer::utc_millis(self.cfg.clock.now_utc()),
                     now_instant: self.cfg.clock.now_instant(),
                     deadline,
                 })
@@ -188,7 +188,7 @@ impl<T: Send + Sync + 'static> Engine<T> {
                         max_items: self.cfg.preparation.input_items(),
                         max_bytes: self.cfg.preparation.input_bytes(),
                         lease_duration: self.cfg.delivery_policy.lease_duration,
-                        now_utc_ms: self.cfg.clock.now_utc().timestamp_millis(),
+                        now_utc_ms: crate::observer::utc_millis(self.cfg.clock.now_utc()),
                         now_instant: self.cfg.clock.now_instant(),
                         deadline,
                     })
@@ -273,7 +273,7 @@ impl<T: Send + Sync + 'static> Engine<T> {
                     action: BufferSealAction::InstallBatch(sealed),
                     capacity: self.cfg.capacity,
                     lease_duration: self.cfg.delivery_policy.lease_duration,
-                    now_utc_ms: self.cfg.clock.now_utc().timestamp_millis(),
+                    now_utc_ms: crate::observer::utc_millis(self.cfg.clock.now_utc()),
                     deadline,
                 })
             })
@@ -296,7 +296,7 @@ impl<T: Send + Sync + 'static> Engine<T> {
                 action: BufferSealAction::ReleaseCandidate,
                 capacity: self.cfg.capacity,
                 lease_duration: self.cfg.delivery_policy.lease_duration,
-                now_utc_ms: self.cfg.clock.now_utc().timestamp_millis(),
+                now_utc_ms: crate::observer::utc_millis(self.cfg.clock.now_utc()),
                 deadline,
             })
         })
@@ -326,7 +326,7 @@ impl<T: Send + Sync + 'static> Engine<T> {
                 },
                 capacity: self.cfg.capacity,
                 lease_duration: self.cfg.delivery_policy.lease_duration,
-                now_utc_ms: self.cfg.clock.now_utc().timestamp_millis(),
+                now_utc_ms: crate::observer::utc_millis(self.cfg.clock.now_utc()),
                 deadline,
             })
         })

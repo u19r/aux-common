@@ -23,7 +23,6 @@ lru-ttl-cache = { workspace = true }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ed25519-dalek = { workspace = true }
 getrandom = { workspace = true, features = ["wasm_js"] }
-getrandom-02 = { workspace = true }
 jsonwebtoken = { workspace = true, default-features = false }
 p256 = { workspace = true, features = ["ecdsa"] }
 p384 = { workspace = true }

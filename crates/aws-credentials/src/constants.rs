@@ -3,9 +3,9 @@ use std::time::Duration;
 pub(crate) const ECS_RELATIVE_CREDENTIALS_BASE: &str = "http://169.254.170.2";
 pub(crate) const LOCALHOST: &str = "localhost";
 
-pub(crate) const IMDS_TOKEN_URL: &str = "http://169.254.169.254/latest/api/token";
-pub(crate) const IMDS_ROLE_LIST_URL: &str =
-    "http://169.254.169.254/latest/meta-data/iam/security-credentials/";
+pub(crate) const IMDS_BASE_URL: &str = "http://169.254.169.254";
+pub(crate) const IMDS_TOKEN_PATH: &str = "/latest/api/token";
+pub(crate) const IMDS_ROLE_LIST_PATH: &str = "/latest/meta-data/iam/security-credentials/";
 pub(crate) const IMDS_TOKEN_TTL_SECONDS: &str = "21600";
 pub(crate) const IMDS_TOKEN_TTL_HEADER: &str = "X-aws-ec2-metadata-token-ttl-seconds";
 pub(crate) const IMDS_TOKEN_HEADER: &str = "X-aws-ec2-metadata-token";

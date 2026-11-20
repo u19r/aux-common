@@ -76,6 +76,13 @@ impl CompactJws {
         })
     }
 
+    /// Verifies the signature with a verifier prepared for the header
+    /// algorithm.
+    ///
+    /// ES256 and ES384 signatures are malleable, so two distinct compact
+    /// strings can carry the same verified header and payload. Never key replay
+    /// detection or deduplication on token or signature bytes; key them on
+    /// signed claims such as `jti`.
     pub fn verify(&self, verifier: &PreparedVerifier) -> Result<(), JoseError> {
         if verifier.algorithm() != self.header.algorithm() {
             return Err(JoseError::InvalidSignature);

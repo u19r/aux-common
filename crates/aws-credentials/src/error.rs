@@ -4,10 +4,6 @@ use std::{error::Error, fmt};
 pub(crate) enum CredentialProviderErrorKind {
     #[error("no credentials found in environment variables, ECS task metadata, or IMDS")]
     NoDefaultCredentials,
-    #[error("credential providers failed: {}", format_provider_failures(.0))]
-    DefaultChainFailures(Vec<CredentialProviderSource>),
-    #[error("failed to resolve credentials from default chain: {}", format_provider_failures(.0))]
-    BlockingDefaultChainFailures(Vec<CredentialProviderSource>),
     #[error("{endpoint} endpoint returned status {status}")]
     MetadataEndpointStatus {
         endpoint: MetadataEndpoint,
@@ -64,29 +60,12 @@ pub(crate) enum CredentialProviderErrorKind {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum CredentialProviderSource {
-    AwsCliProfile,
-    EcsTaskMetadata,
-    Imds,
-}
-
-#[derive(Debug, Clone, Copy)]
 pub(crate) enum MetadataEndpoint {
     Credential,
     Credentials,
     Token,
     RoleListing,
     RoleCredentials,
-}
-
-impl fmt::Display for CredentialProviderSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AwsCliProfile => f.write_str("aws cli profile"),
-            Self::EcsTaskMetadata => f.write_str("ecs task metadata"),
-            Self::Imds => f.write_str("imds"),
-        }
-    }
 }
 
 impl fmt::Display for MetadataEndpoint {
@@ -99,14 +78,6 @@ impl fmt::Display for MetadataEndpoint {
             Self::RoleCredentials => f.write_str("role credentials"),
         }
     }
-}
-
-fn format_provider_failures(failures: &[CredentialProviderSource]) -> String {
-    failures
-        .iter()
-        .map(|source| format!("{source}: provider request failed"))
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 /// A safe credential failure category. Error sources retain provider-owned

@@ -483,8 +483,7 @@ impl ProbeState {
     pub(crate) fn hotspot_records(&self) -> Vec<HotspotRecord> {
         self.hotspots
             .lock()
-            .map(|guard| guard.values().map(HotspotAggregate::to_record).collect())
-            .unwrap_or_default()
+            .map_or_default(|guard| guard.values().map(HotspotAggregate::to_record).collect())
     }
 
     pub(crate) fn flush(&self) {

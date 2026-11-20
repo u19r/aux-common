@@ -1,6 +1,6 @@
 use aws_lc_rs::{rand::SystemRandom, rsa::KeyPair as RsaKeyPair, signature::RSA_PKCS1_SHA256};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chrono::{Duration, TimeZone, Utc};
+use jiff::{SignedDuration, Timestamp};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -11,7 +11,7 @@ use crate::{
 const METADATA_NS: &str = "urn:oasis:names:tc:SAML:2.0:metadata";
 const DS_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const HTTP_POST_BINDING: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST";
-const NOW: chrono::DateTime<chrono::Utc> = chrono::DateTime::UNIX_EPOCH;
+const NOW: Timestamp = Timestamp::UNIX_EPOCH;
 
 // This is public test material used only to exercise strict DER handling.
 const TEST_CERTIFICATE_DER_B64: &str = "MIIDCzCCAfOgAwIBAgIUQ4GH6mxaRr4BDE3ReyzQ/JTywX0wDQYJKoZIhvcNAQELBQAwFTETMBEGA1UEAwwKYXV4Zm4tdGVzdDAeFw0yNjAyMDcyMDU2MTRaFw0zNjAyMDUyMDU2MTRaMBUxEzARBgNVBAMMCmF1eGZuLXRlc3QwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDbOzlUVTDEzZ01qQpe233hB+IXYMCZRNHX9icrK+mrRRoNj7GgftvTRqBoehCYmB3IGTqSeiGB2heZRKovNka/hxGt85TDgtUU3fGT6GHj4GlZvVLw9Q1coqmghI0qHmFKlIN9wdjUKr0EcyUzLcPPCSt6N2f8Jbg/b7yaBYVGRCdk5D884c67l8kbwyiH8vxUJ4TWCVottniVZriuWO7Gk+D3GQXkd3iDLqA+1xq70B0iwzO9VVm9YBw+AWXqJRgqYLvQZUwjVwaBsNRPvUOJ5vt20jobjKFaWAj0YvtAa+hGEU58bCld/h0KdGsJhkC6Q+1HICfjZrKf4M6lOe4jAgMBAAGjUzBRMB0GA1UdDgQWBBQmzhNLM//Ik6FeXOuo9NEEQbAdYjAfBgNVHSMEGDAWgBQmzhNLM//Ik6FeXOuo9NEEQbAdYjAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQDBMD6da/5ZSb0Yq+566KmJi4cv0iL8FNfwAN6WPRBoc7afnhM3tJDcc4+ko5gIurtiK2qT7ZQzmCicYKRUda6stjQsBTEeF9MRktYOvAd6TUT24w+Q4N18OwmyOgs/LTU5czb8/AyzqPSoN2fq8XunUDQY9x5kRyoIX18DfDLo4mCyq5n6LwpyLBa/ZmXCxXHW6mCU6Wp/9l6IB9ykPgu4MxlhPs5U3jc+AGe4+KkYnGeoKfFclOuGrCqi3XtejAiaTrfHBnEeSVSCZU9s92vAyl1dwfyN2irS/ANceeWQe+Uq3jYfsa6TWh8zasUTdWshogKjnvObWK2lTtCrAqjP";
@@ -595,14 +595,38 @@ fn given_metadata_with_invalid_root_or_required_fields_when_parsing_then_reject(
 #[test]
 fn given_expired_or_future_boundary_metadata_when_parsing_then_compare_with_caller_clock() {
     let valid = protocol_valid_metadata();
-    let expiry = Utc
-        .with_ymd_and_hms(2030, 1, 1, 0, 0, 0)
-        .single()
-        .expect("timestamp");
+    let expiry: Timestamp = "2030-01-01T00:00:00Z".parse().expect("timestamp");
     assert!(UnverifiedMetadata::parse_unverified(&valid, expiry).is_err());
     assert!(
-        UnverifiedMetadata::parse_unverified(&valid, expiry - Duration::nanoseconds(1)).is_ok()
+        UnverifiedMetadata::parse_unverified(&valid, expiry - SignedDuration::from_nanos(1))
+            .is_ok()
     );
+}
+
+#[test]
+fn given_metadata_with_offset_and_fraction_when_parsing_then_compare_utc_instant() {
+    let valid = protocol_valid_metadata().replace(
+        "2030-01-01T00:00:00Z",
+        "2030-01-01T01:00:00.123456789+01:00",
+    );
+    let expiry: Timestamp = "2030-01-01T00:00:00.123456789Z".parse().expect("timestamp");
+    assert!(UnverifiedMetadata::parse_unverified(&valid, expiry).is_err());
+    assert!(
+        UnverifiedMetadata::parse_unverified(&valid, expiry - SignedDuration::from_nanos(1))
+            .is_ok()
+    );
+}
+
+#[test]
+fn given_metadata_with_non_rfc3339_validity_when_parsing_then_reject() {
+    for valid_until in [
+        "2030-01-01T00:00:00Z[UTC]",
+        "2030-01-01T00:00Z",
+        "2030-01-01T00:00:00+00:00:00",
+    ] {
+        let xml = protocol_valid_metadata().replace("2030-01-01T00:00:00Z", valid_until);
+        assert!(UnverifiedMetadata::parse_unverified(&xml, NOW).is_err());
+    }
 }
 
 #[test]
@@ -868,7 +892,7 @@ fn given_expired_metadata_when_parsing_then_reject_even_with_valid_shape() {
         r#"<md:KeyDescriptor use="signing"><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{TEST_CERTIFICATE_DER_B64}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor>"#
     );
     let xml = metadata_xml(&key_descriptors);
-    let after_expiry = chrono::DateTime::from_timestamp(1924982400, 0).expect("2031 timestamp");
+    let after_expiry = Timestamp::from_second(1924982400).expect("2031 timestamp");
 
     // When parsing runs after expiry.
     // Then replay of stale federation metadata fails closed.

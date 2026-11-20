@@ -1,16 +1,18 @@
-use chrono::{TimeZone, Utc};
+use jiff::{civil::date, tz::TimeZone};
 
 use crate::{
     error::ValidationError,
     time::{CronExpression, Timestamp},
 };
 
-fn timestamp(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> Timestamp {
+fn timestamp(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> Timestamp {
     Timestamp::from_millis(
-        Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
-            .single()
+        date(year, month, day)
+            .at(hour, minute, 0, 0)
+            .to_zoned(TimeZone::UTC)
             .expect("test date is valid")
-            .timestamp_millis(),
+            .timestamp()
+            .as_millisecond(),
     )
 }
 
@@ -103,6 +105,23 @@ fn given_an_exact_boundary_when_requesting_next_occurrences_then_at_or_after_is_
             .expect("strict occurrence computes"),
         Some(timestamp(2024, 2, 29, 12, 45))
     );
+}
+
+#[test]
+fn given_a_fractional_start_when_rounding_to_midnight_then_the_weekday_still_applies() {
+    let expression = CronExpression::try_new("0 0 13 * 5").expect("cron parses");
+    let saturday = timestamp(2024, 1, 13, 0, 0);
+    let before_saturday = Timestamp::from_millis(saturday.as_millis() - 1);
+    let friday = timestamp(2024, 9, 13, 0, 0);
+
+    assert_eq!(expression.next_after(before_saturday), Ok(Some(friday)));
+    assert_eq!(expression.next_at_or_after(friday), Ok(Some(friday)));
+}
+
+#[test]
+fn given_a_bce_start_when_finding_the_next_occurrence_then_return_no_occurrence() {
+    let expression = CronExpression::try_new("* * * * *").expect("cron parses");
+    assert_eq!(expression.next_after(timestamp(-1, 1, 1, 0, 0)), Ok(None));
 }
 
 #[test]

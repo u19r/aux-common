@@ -99,7 +99,7 @@ impl<T: Send + Sync + 'static> Engine<T> {
         self.complete_buffer_operation(deadline, || {
             self.cfg.buffer.inspect(BufferInspectRequest {
                 operation_id: operation_id.cloned(),
-                now_utc_ms: self.cfg.clock.now_utc().timestamp_millis(),
+                now_utc_ms: crate::observer::utc_millis(self.cfg.clock.now_utc()),
                 now_instant: self.cfg.clock.now_instant(),
                 deadline,
             })

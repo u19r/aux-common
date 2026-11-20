@@ -374,7 +374,7 @@ fn validate_request(policy: &HttpPolicy, job: &HttpJob) -> Result<(), HttpJobErr
     if job.request.body_bytes() > policy.max_request_bytes().get() {
         return Err(HttpJobError::RequestBodyTooLarge);
     }
-    if !policy.approves(job.request.url()) {
+    if !policy.approves(job.request.method(), job.request.url()) {
         return Err(HttpJobError::EndpointNotApproved);
     }
     Ok(())

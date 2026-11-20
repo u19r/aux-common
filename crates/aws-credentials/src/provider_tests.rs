@@ -13,7 +13,7 @@ use std::{
     path::Path,
     process::Command,
     sync::{
-        Arc, LazyLock, Mutex, MutexGuard,
+        Arc, LazyLock, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
@@ -26,6 +26,7 @@ use crate::{
     AwsResolvedCredentials, AwsStaticCredentials, CredentialSource,
     DefaultChainCredentialsProvider, ProvideCredentials, half_life_refresh_after,
     provider::{
+        AwsCliCredentialProcessOutput, IMDS_BASE_URL_OVERRIDE, MetadataCredentialsResponse,
         credential_cache_ttl, metadata_refresh_after, run_bounded_command,
         validate_aws_cli_output_size,
     },
@@ -54,6 +55,27 @@ fn credential_debug_output_redacts_secret_material() {
     ] {
         assert!(!debug.contains("sentinel-secret-access-key"), "{debug}");
         assert!(!debug.contains("sentinel-session-token"), "{debug}");
+        assert!(debug.contains("[REDACTED]"), "{debug}");
+    }
+}
+
+#[test]
+fn given_secret_bearing_provider_responses_when_debugged_then_secrets_are_redacted() {
+    // Given decoded metadata and AWS CLI responses carrying sentinel secrets.
+    let metadata: MetadataCredentialsResponse = serde_json::from_str(
+        r#"{"AccessKeyId":"AKIDEXAMPLE","SecretAccessKey":"sentinel-secret","Token":"sentinel-token"}"#,
+    )
+    .expect("metadata response");
+    let cli: AwsCliCredentialProcessOutput = serde_json::from_str(
+        r#"{"AccessKeyId":"AKIDEXAMPLE","SecretAccessKey":"sentinel-secret","SessionToken":"sentinel-token"}"#,
+    )
+    .expect("aws cli output");
+
+    // When they are debug formatted.
+    for debug in [format!("{metadata:?}"), format!("{cli:?}")] {
+        // Then neither the secret key nor the session token is rendered.
+        assert!(!debug.contains("sentinel-secret"), "{debug}");
+        assert!(!debug.contains("sentinel-token"), "{debug}");
         assert!(debug.contains("[REDACTED]"), "{debug}");
     }
 }
@@ -382,6 +404,64 @@ fn json_response(status: &str, body: &str) -> String {
     )
 }
 
+const INSTANCE_ROLE_CREDENTIALS: &str =
+    r#"{"AccessKeyId":"AKIDINSTANCEROLE","SecretAccessKey":"instance-role-secret"}"#;
+
+/// Points IMDS at a local listener for the guard's lifetime.
+struct ImdsBaseUrlOverride;
+
+impl ImdsBaseUrlOverride {
+    fn set(base_url: String) -> Self {
+        *IMDS_BASE_URL_OVERRIDE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(base_url);
+        Self
+    }
+}
+
+impl Drop for ImdsBaseUrlOverride {
+    fn drop(&mut self) {
+        *IMDS_BASE_URL_OVERRIDE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
+/// A reachable, enabled IMDS that would serve instance-role credentials, so a
+/// configured provider's failure that falls through is observed instead of
+/// hidden by `AWS_EC2_METADATA_DISABLED`. Start it after the provider
+/// environment guard so IMDS stays enabled.
+struct ReachableImds {
+    requests: Arc<AtomicUsize>,
+    server: thread::JoinHandle<()>,
+    _base_url: ImdsBaseUrlOverride,
+    _enabled: EnvVarGuard,
+}
+
+impl ReachableImds {
+    fn start() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind IMDS listener");
+        let address = listener.local_addr().expect("IMDS address");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server = spawn_counted_http_response(
+            listener,
+            json_response("200 OK", INSTANCE_ROLE_CREDENTIALS),
+            Arc::clone(&requests),
+        );
+        Self {
+            requests,
+            server,
+            _base_url: ImdsBaseUrlOverride::set(format!("http://{address}")),
+            _enabled: EnvVarGuard::set(&[("AWS_EC2_METADATA_DISABLED", None)]),
+        }
+    }
+
+    fn finish(self) -> usize {
+        self.server.join().expect("join IMDS server");
+        self.requests.load(Ordering::SeqCst)
+    }
+}
+
 fn chunked_json_response(body: &str) -> String {
     let mut response = String::from(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: \
@@ -542,9 +622,7 @@ fn resolve_ecs_task_credentials_uri_normalizes_relative_paths() {
 fn validate_ecs_full_uri_rejects_public_http_hosts() {
     let err = validate_ecs_full_uri(&Url::parse("http://example.com/creds").expect("url"))
         .expect_err("public http ecs uri should fail");
-    let source = std::error::Error::source(&err)
-        .map(std::string::ToString::to_string)
-        .unwrap_or_default();
+    let source = std::error::Error::source(&err).map_or_default(std::string::ToString::to_string);
 
     assert!(
         source.contains("must use HTTPS or a loopback/local ECS host"),
@@ -784,11 +862,7 @@ fn ecs_credentials_reject_redirects_before_accepting_alternate_credentials() {
     let source = std::error::Error::source(&error)
         .map(std::string::ToString::to_string)
         .expect("credential chain failure source");
-    assert_eq!(
-        source,
-        "failed to resolve credentials from default chain: ecs task metadata: provider request \
-         failed"
-    );
+    assert_eq!(source, "credentials endpoint returned status 302 Found");
     redirect_requests
         .recv_timeout(Duration::from_secs(1))
         .expect("redirect listener must receive the initial request");
@@ -861,10 +935,7 @@ fn async_ecs_credentials_reject_redirects_before_accepting_alternate_credentials
     let source = std::error::Error::source(&error)
         .map(std::string::ToString::to_string)
         .expect("credential chain failure source");
-    assert_eq!(
-        source,
-        "credential providers failed: ecs task metadata: provider request failed"
-    );
+    assert_eq!(source, "credential endpoint returned status 302 Found");
     redirect_requests
         .recv_timeout(Duration::from_secs(1))
         .expect("redirect listener must receive the initial request");
@@ -1217,9 +1288,7 @@ fn resolve_ecs_task_credentials_uri_rejects_double_slash_relative_paths() {
 
     let error = resolve_ecs_task_credentials_uri()
         .expect_err("double-slash relative URI should be rejected");
-    let source = std::error::Error::source(&error)
-        .map(std::string::ToString::to_string)
-        .unwrap_or_default();
+    let source = std::error::Error::source(&error).map_or_default(std::string::ToString::to_string);
     assert!(
         source.contains("must be a path"),
         "unexpected error: {error:?}"
@@ -1239,9 +1308,7 @@ fn resolve_ecs_task_credentials_uri_rejects_backslash_authority_escape() {
 
     let error = resolve_ecs_task_credentials_uri()
         .expect_err("backslash authority escape should be rejected");
-    let source = std::error::Error::source(&error)
-        .map(std::string::ToString::to_string)
-        .unwrap_or_default();
+    let source = std::error::Error::source(&error).map_or_default(std::string::ToString::to_string);
     assert!(
         source.contains("must be a path"),
         "unexpected error: {error:?}"
@@ -1261,9 +1328,7 @@ fn validate_ecs_full_uri_accepts_https_and_loopback_http_only() {
 
     let err = validate_ecs_full_uri(&Url::parse("ftp://localhost/creds").expect("ftp url"))
         .expect_err("non-http scheme should fail");
-    let source = std::error::Error::source(&err)
-        .map(std::string::ToString::to_string)
-        .unwrap_or_default();
+    let source = std::error::Error::source(&err).map_or_default(std::string::ToString::to_string);
     assert!(
         source.contains("must use HTTP or HTTPS"),
         "unexpected error: {err:?}"
@@ -1586,9 +1651,10 @@ fn given_local_ecs_endpoint_when_async_provider_resolves_then_credentials_and_to
 }
 
 #[test]
-fn given_local_ecs_endpoint_when_async_response_is_forbidden_then_chain_fails_closed() {
+fn given_forbidden_ecs_full_uri_and_reachable_imds_when_async_chain_resolves_then_imds_is_not_used()
+{
     // Given a local ECS endpoint that rejects an otherwise valid credential
-    // response.
+    // response, and an enabled IMDS that would serve the instance role.
     let _lock = env_lock();
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ECS listener");
     let address = listener.local_addr().expect("ECS address");
@@ -1602,6 +1668,7 @@ fn given_local_ecs_endpoint_when_async_response_is_forbidden_then_chain_fails_cl
     fs::create_dir_all(&home_dir).expect("create async status home");
     let endpoint = format!("http://{address}/credentials");
     let _guard = set_provider_environment(Some(&endpoint), None, &home_dir);
+    let imds = ReachableImds::start();
     let provider = DefaultChainCredentialsProvider::new().expect("create credential provider");
     let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
 
@@ -1610,16 +1677,79 @@ fn given_local_ecs_endpoint_when_async_response_is_forbidden_then_chain_fails_cl
         .block_on(provider.provide_credentials())
         .expect_err("forbidden ECS response must fail");
 
-    // Then the ECS failure is reported and alternate providers are not used.
+    // Then the ECS failure is returned and IMDS is never contacted.
     let source = std::error::Error::source(&error)
         .map(std::string::ToString::to_string)
         .expect("credential chain failure source");
-    assert_eq!(
-        source,
-        "credential providers failed: ecs task metadata: provider request failed"
-    );
+    assert_eq!(source, "credential endpoint returned status 403 Forbidden");
+    assert_eq!(imds.finish(), 0, "chain fell through to IMDS");
     server.join().expect("join ECS server");
     fs::remove_dir_all(home_dir).expect("remove async status home");
+}
+
+#[test]
+fn given_forbidden_ecs_full_uri_and_reachable_imds_when_blocking_chain_resolves_then_imds_is_not_used()
+ {
+    // Given a local ECS endpoint that rejects the request, and an enabled IMDS
+    // that would serve the instance role.
+    let _lock = env_lock();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ECS listener");
+    let address = listener.local_addr().expect("ECS address");
+    let server = spawn_http_response(listener, json_response("403 Forbidden", "{}"), None);
+    let home_dir = temp_path("aws-credentials-blocking-status-home", "dir");
+    fs::create_dir_all(&home_dir).expect("create blocking status home");
+    let endpoint = format!("http://{address}/credentials");
+    let _guard = set_provider_environment(Some(&endpoint), None, &home_dir);
+    let imds = ReachableImds::start();
+
+    // When the blocking chain receives the rejected response.
+    let error = resolve_default_chain_credentials_with_expiry()
+        .expect_err("forbidden ECS response must fail");
+
+    // Then the ECS failure is returned and IMDS is never contacted.
+    let source = std::error::Error::source(&error)
+        .map(std::string::ToString::to_string)
+        .expect("credential chain failure source");
+    assert_eq!(source, "credentials endpoint returned status 403 Forbidden");
+    assert_eq!(imds.finish(), 0, "chain fell through to IMDS");
+    server.join().expect("join ECS server");
+    fs::remove_dir_all(home_dir).expect("remove blocking status home");
+}
+
+#[test]
+fn given_rejected_ecs_full_uri_and_reachable_imds_when_chain_resolves_then_imds_is_not_used() {
+    // Given a cleartext ECS full URI outside the allowed hosts, and an enabled
+    // IMDS that would serve the instance role.
+    let _lock = env_lock();
+    let home_dir = temp_path("aws-credentials-rejected-uri-home", "dir");
+    fs::create_dir_all(&home_dir).expect("create rejected URI home");
+    let _guard = set_provider_environment(Some("http://10.0.0.5/creds"), None, &home_dir);
+    let imds = ReachableImds::start();
+    let provider = DefaultChainCredentialsProvider::new().expect("create credential provider");
+    let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
+
+    // When the blocking and asynchronous chains resolve.
+    let errors = [
+        resolve_default_chain_credentials_with_expiry()
+            .expect_err("blocking chain must reject the configured URI"),
+        runtime
+            .block_on(provider.provide_credentials())
+            .expect_err("async chain must reject the configured URI"),
+    ];
+
+    // Then both return the configuration error and IMDS is never contacted.
+    for error in errors {
+        assert_eq!(error.to_string(), "invalid credential configuration");
+        let source = std::error::Error::source(&error)
+            .map(std::string::ToString::to_string)
+            .expect("configuration failure source");
+        assert_eq!(
+            source,
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI must use HTTPS or a loopback/local ECS host"
+        );
+    }
+    assert_eq!(imds.finish(), 0, "chain fell through to IMDS");
+    fs::remove_dir_all(home_dir).expect("remove rejected URI home");
 }
 
 #[test]
@@ -1651,10 +1781,7 @@ fn given_chunked_valid_oversized_metadata_when_async_body_is_bounded_then_limit_
     let source = std::error::Error::source(&error)
         .map(std::string::ToString::to_string)
         .expect("credential chain failure source");
-    assert_eq!(
-        source,
-        "credential providers failed: ecs task metadata: provider request failed"
-    );
+    assert_eq!(source, "credential metadata response was invalid");
     server.join().expect("join ECS server");
     fs::remove_dir_all(home_dir).expect("remove async size home");
 }
@@ -1682,10 +1809,7 @@ fn given_local_ecs_endpoint_when_async_json_is_invalid_then_chain_fails_closed()
     let source = std::error::Error::source(&error)
         .map(std::string::ToString::to_string)
         .expect("credential chain failure source");
-    assert_eq!(
-        source,
-        "credential providers failed: ecs task metadata: provider request failed"
-    );
+    assert_eq!(source, "credential metadata response was not valid JSON");
     server.join().expect("join ECS server");
     fs::remove_dir_all(home_dir).expect("remove async JSON home");
 }
@@ -1717,7 +1841,7 @@ fn given_local_ecs_endpoint_when_credentials_are_incomplete_then_chain_fails_clo
         .expect("credential chain failure source");
     assert_eq!(
         source,
-        "credential providers failed: ecs task metadata: provider request failed"
+        "credential response did not include access key id and secret access key"
     );
     server.join().expect("join ECS server");
     fs::remove_dir_all(home_dir).expect("remove incomplete home");
@@ -1963,10 +2087,12 @@ fn given_no_refresh_deadline_when_cache_ttl_is_computed_then_static_ttl_is_used(
 
 #[cfg(unix)]
 #[test]
-fn given_profile_command_failure_when_blocking_chain_resolves_then_error_is_recoverable() {
+fn given_failing_profile_cli_and_reachable_imds_when_blocking_chain_resolves_then_imds_is_not_used()
+{
     use std::os::unix::fs::PermissionsExt;
 
-    // Given a profile CLI that rejects the requested export.
+    // Given a profile CLI that rejects the requested export, and an enabled
+    // IMDS that would serve the instance role.
     let _lock = env_lock();
     let bin_dir = temp_path("aws-credentials-profile-failure-bin", "dir");
     let home_dir = temp_path("aws-credentials-profile-failure-home", "dir");
@@ -2002,21 +2128,22 @@ exit 7
         ("AWS_EC2_METADATA_DISABLED", Some("true")),
         ("HOME", home_dir.to_str()),
     ]);
+    let imds = ReachableImds::start();
 
     // When the blocking chain invokes the rejected profile provider.
     let error = resolve_default_chain_credentials_with_expiry()
         .expect_err("rejected profile export must fail");
 
     // Then the chain returns the profile-provider failure without contacting
-    // metadata endpoints.
+    // IMDS.
     let source = std::error::Error::source(&error)
         .map(std::string::ToString::to_string)
         .expect("credential chain failure source");
     assert_eq!(
         source,
-        "failed to resolve credentials from default chain: aws cli profile: provider request \
-         failed"
+        "aws cli credential provider rejected the requested profile"
     );
+    assert_eq!(imds.finish(), 0, "chain fell through to IMDS");
     fs::remove_dir_all(bin_dir).expect("remove profile failure bin");
     fs::remove_dir_all(home_dir).expect("remove profile failure home");
 }
@@ -2066,11 +2193,7 @@ fn given_invalid_profile_export_json_when_blocking_chain_resolves_then_credentia
     let source = std::error::Error::source(&error)
         .map(std::string::ToString::to_string)
         .expect("credential chain failure source");
-    assert_eq!(
-        source,
-        "failed to resolve credentials from default chain: aws cli profile: provider request \
-         failed"
-    );
+    assert_eq!(source, "aws cli credential provider returned invalid JSON");
     fs::remove_dir_all(bin_dir).expect("remove profile JSON bin");
     fs::remove_dir_all(home_dir).expect("remove profile JSON home");
 }
@@ -2154,10 +2277,9 @@ fn given_no_provider_configuration_when_async_chain_resolves_then_source_is_expl
 }
 
 #[test]
-fn given_profile_file_and_ecs_failure_when_blocking_chain_resolves_then_all_provider_failures_are_reported()
- {
-    // Given an AWS credentials file that enables profile lookup and an ECS
-    // endpoint that rejects the request.
+fn given_profile_file_and_missing_aws_cli_when_blocking_chain_resolves_then_ecs_is_not_contacted() {
+    // Given an AWS credentials file that enables profile lookup, no aws CLI on
+    // PATH, and a configured ECS endpoint.
     let _lock = env_lock();
     let home_dir = temp_path("aws-credentials-profile-file-home", "dir");
     let bin_dir = temp_path("aws-credentials-profile-file-bin", "dir");
@@ -2166,10 +2288,11 @@ fn given_profile_file_and_ecs_failure_when_blocking_chain_resolves_then_all_prov
     fs::write(home_dir.join(".aws/credentials"), "[default]\n").expect("write profile marker");
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ECS listener");
     let address = listener.local_addr().expect("ECS address");
+    let (ecs_received, ecs_requests) = std::sync::mpsc::channel();
     let server = spawn_http_response(
         listener,
         json_response("503 Service Unavailable", "{}"),
-        None,
+        Some(ecs_received),
     );
     let endpoint = format!("http://{address}/credentials");
     let _guard = EnvVarGuard::set(&[
@@ -2194,20 +2317,21 @@ fn given_profile_file_and_ecs_failure_when_blocking_chain_resolves_then_all_prov
         ("AWS_EC2_METADATA_DISABLED", Some("true")),
     ]);
 
-    // When the chain tries each configured source.
+    // When the chain resolves the configured profile first.
     let error = resolve_default_chain_credentials_with_expiry()
-        .expect_err("profile and ECS failures must not resolve credentials");
+        .expect_err("a failed configured profile must not resolve credentials");
 
-    // Then each failure is named without leaking endpoint or command details.
+    // Then the profile failure is returned without leaking command details and
+    // the later ECS provider is never contacted.
     let source = std::error::Error::source(&error)
         .map(std::string::ToString::to_string)
         .expect("chain failure source");
-    assert_eq!(
-        source,
-        "failed to resolve credentials from default chain: aws cli profile: provider request \
-         failed; ecs task metadata: provider request failed"
-    );
+    assert_eq!(source, "failed to run aws cli credential provider");
     server.join().expect("join ECS server");
+    assert!(
+        ecs_requests.try_recv().is_err(),
+        "chain fell through to ECS after the profile failed"
+    );
     fs::remove_dir_all(bin_dir).expect("remove empty PATH directory");
     fs::remove_dir_all(home_dir).expect("remove profile home");
 }
@@ -2232,11 +2356,7 @@ fn given_local_ecs_endpoint_when_blocking_json_is_invalid_then_chain_fails_close
     let source = std::error::Error::source(&error)
         .map(std::string::ToString::to_string)
         .expect("blocking chain failure source");
-    assert_eq!(
-        source,
-        "failed to resolve credentials from default chain: ecs task metadata: provider request \
-         failed"
-    );
+    assert_eq!(source, "credential metadata response was not valid JSON");
     server.join().expect("join ECS server");
     fs::remove_dir_all(home_dir).expect("remove blocking JSON home");
 }
@@ -2265,11 +2385,7 @@ fn given_declared_oversized_ecs_body_when_blocking_provider_resolves_then_body_i
     let source = std::error::Error::source(&error)
         .map(std::string::ToString::to_string)
         .expect("blocking size failure source");
-    assert_eq!(
-        source,
-        "failed to resolve credentials from default chain: ecs task metadata: provider request \
-         failed"
-    );
+    assert_eq!(source, "credential metadata response was invalid");
     server.join().expect("join ECS server");
     fs::remove_dir_all(home_dir).expect("remove blocking size home");
 }
@@ -2301,10 +2417,7 @@ fn given_declared_oversized_ecs_body_when_async_provider_resolves_then_body_is_r
     let source = std::error::Error::source(&error)
         .map(std::string::ToString::to_string)
         .expect("async size failure source");
-    assert_eq!(
-        source,
-        "credential providers failed: ecs task metadata: provider request failed"
-    );
+    assert_eq!(source, "credential metadata response was invalid");
     server.join().expect("join ECS server");
     fs::remove_dir_all(home_dir).expect("remove async size home");
 }

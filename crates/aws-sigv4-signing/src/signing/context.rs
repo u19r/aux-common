@@ -1,8 +1,8 @@
 use std::time::SystemTime;
 
 use aws_credentials::Credentials;
-use chrono::{DateTime, Utc};
 use hmac::{Hmac, KeyInit as _, Mac as _};
+use jiff::Timestamp;
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
@@ -26,9 +26,12 @@ impl<'a> SigningContext<'a> {
         if !is_scope_component(region) || !is_scope_component(service) {
             return Err(SigningError::PrepareRequest);
         }
-        let time: DateTime<Utc> = time.into();
-        let datetime = time.format("%Y%m%dT%H%M%SZ").to_string();
-        let scope = format!("{}/{region}/{service}/aws4_request", time.format("%Y%m%d"));
+        let time = Timestamp::try_from(time).map_err(|_| SigningError::PrepareRequest)?;
+        let datetime = time.strftime("%Y%m%dT%H%M%SZ").to_string();
+        let scope = format!(
+            "{}/{region}/{service}/aws4_request",
+            time.strftime("%Y%m%d")
+        );
         Ok(Self {
             credentials,
             datetime,

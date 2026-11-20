@@ -1,5 +1,5 @@
 [package]
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 name = "aux-common-fuzz"
 version = "0.0.0"
 publish = false
@@ -126,6 +126,8 @@ tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "macros", "ti
 
 [dependencies.authz-cedar]
 path = "../crates/authz-cedar"
+[dependencies.authz-runtime]
+path = "../crates/authz-runtime"
 [dependencies.authz-types]
 path = "../crates/authz-types"
 [dependencies.aws-credentials]
@@ -138,8 +140,9 @@ version = "1.19.0"
 version = "0.23.1"
 [dependencies.bg-jobs-http]
 path = "../crates/bg-jobs-http"
-[dependencies.chrono]
-version = "0.4.45"
+[dependencies.jiff]
+version = "0.2.46"
+features = ["serde"]
 [dependencies.ciborium]
 version = "0.2.2"
 [dependencies.hmac]
@@ -172,4 +175,4 @@ path = "../crates/webauthn-core"
 path = "../crates/xml-security"
 
 [workspace.package]
-rust-version = "1.99.1"
+rust-version = "1.100.0"

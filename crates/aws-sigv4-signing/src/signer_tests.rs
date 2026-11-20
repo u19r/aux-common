@@ -181,7 +181,6 @@ async fn presign_request_matches_aws_s3_golden_vector() {
             "GET",
             &uri,
             &HeaderMap::new(),
-            SignableBody::UnsignedPayload,
             Duration::from_hours(24),
             signing_time,
         )
@@ -196,6 +195,70 @@ async fn presign_request_matches_aws_s3_golden_vector() {
         signature.as_deref(),
         Some("aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404")
     );
+}
+
+fn presigned_signature(presigned: &Uri) -> String {
+    Url::parse(&presigned.to_string())
+        .expect("presigned url")
+        .query_pairs()
+        .find_map(|(key, value)| (key == "X-Amz-Signature").then(|| value.into_owned()))
+        .expect("presigned signature")
+}
+
+#[tokio::test]
+async fn given_s3_export_download_when_presigned_then_payload_is_unsigned_not_empty_body_hash() {
+    // Given the S3 GET that export downloads used to presign over an empty
+    // body hash.
+    let credentials = AwsStaticCredentials {
+        access_key_id: "AKIAIOSFODNN7EXAMPLE".to_owned(),
+        secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_owned(),
+        session_token: None,
+    };
+    let signer = AwsRequestSigner::new(
+        "us-east-1",
+        CredentialSource::Static(credentials.clone()),
+        "s3",
+    )
+    .expect("signer");
+    let uri: Uri = "https://examplebucket.s3.amazonaws.com/exports/report.csv"
+        .parse()
+        .expect("uri");
+    let headers = HeaderMap::new();
+    let expiry = Duration::from_hours(1);
+
+    // When the download URL is presigned.
+    let presigned = signer
+        .presign_request_at("GET", &uri, &headers, expiry, reference_time())
+        .await
+        .expect("presigned request");
+
+    // Then the signature covers UNSIGNED-PAYLOAD, as S3 query authentication
+    // requires, and not SHA-256 of the empty body.
+    let unsigned_payload = reference_signature(
+        ReferenceRequest {
+            method: "GET",
+            uri: &uri,
+            headers: &headers,
+            body: &SignableBody::UnsignedPayload,
+        },
+        &credentials,
+        "s3",
+        Some(expiry),
+    );
+    let empty_body_hash = reference_signature(
+        ReferenceRequest {
+            method: "GET",
+            uri: &uri,
+            headers: &headers,
+            body: &SignableBody::Bytes(&[]),
+        },
+        &credentials,
+        "s3",
+        Some(expiry),
+    );
+    let actual = presigned_signature(&presigned);
+    assert_eq!(actual, unsigned_payload);
+    assert_ne!(actual, empty_body_hash);
 }
 
 #[tokio::test]
@@ -228,13 +291,7 @@ async fn sign_request_preserves_explicit_host_header_and_presign_uses_query_para
     );
 
     let presigned = signer
-        .presign_request(
-            "GET",
-            &uri,
-            &base_headers,
-            SignableBody::Bytes(&[]),
-            Duration::from_mins(2),
-        )
+        .presign_request("GET", &uri, &base_headers, Duration::from_mins(2))
         .await
         .expect("presigned uri");
     let presigned_url = Url::parse(&presigned.to_string()).expect("presigned url");
@@ -288,13 +345,7 @@ async fn given_subsecond_presign_expiry_when_presigning_then_rejects_request() {
         Duration::from_millis(999),
     ] {
         let error = signer
-            .presign_request(
-                "GET",
-                &uri,
-                &HeaderMap::new(),
-                SignableBody::Bytes(&[]),
-                expiry,
-            )
+            .presign_request("GET", &uri, &HeaderMap::new(), expiry)
             .await
             .expect_err("subsecond expiry must be rejected");
 
@@ -317,13 +368,7 @@ async fn given_expiry_over_seven_days_when_presigning_then_rejects_request() {
     let uri: Uri = "https://api.example.com/customers".parse().expect("uri");
 
     let error = signer
-        .presign_request(
-            "GET",
-            &uri,
-            &HeaderMap::new(),
-            SignableBody::Bytes(&[]),
-            Duration::from_secs(604_801),
-        )
+        .presign_request("GET", &uri, &HeaderMap::new(), Duration::from_secs(604_801))
         .await
         .expect_err("expiry above AWS limit must be rejected");
 
@@ -473,38 +518,24 @@ async fn given_protocol_cases_when_signing_then_match_test_only_aws_reference() 
                     expected,
                     "{service} {url} {body:?}"
                 );
-                let expiry = Duration::from_mins(2);
-                let expected = reference_signature(
-                    ReferenceRequest {
-                        method,
-                        uri: &uri,
-                        headers: &headers,
-                        body,
-                    },
-                    &credentials,
-                    service,
-                    Some(expiry),
-                );
-                let presigned = signer
-                    .presign_request_at(
-                        method,
-                        &uri,
-                        &headers,
-                        body.clone(),
-                        expiry,
-                        reference_time(),
-                    )
-                    .await
-                    .unwrap();
-                let url = Url::parse(&presigned.to_string()).unwrap();
-                let actual = url
-                    .query_pairs()
-                    .find(|(key, _)| key == "X-Amz-Signature")
-                    .unwrap()
-                    .1
-                    .into_owned();
-                assert_eq!(actual, expected, "{service} {url} {body:?}");
             }
+            let expiry = Duration::from_mins(2);
+            let expected = reference_signature(
+                ReferenceRequest {
+                    method,
+                    uri: &uri,
+                    headers: &headers,
+                    body: &SignableBody::UnsignedPayload,
+                },
+                &credentials,
+                service,
+                Some(expiry),
+            );
+            let presigned = signer
+                .presign_request_at(method, &uri, &headers, expiry, reference_time())
+                .await
+                .unwrap();
+            assert_eq!(presigned_signature(&presigned), expected, "{service} {url}");
         }
     }
 }
@@ -566,13 +597,7 @@ async fn signature(signer: &AwsRequestSigner, path_and_query: &str) -> String {
         .parse()
         .unwrap();
     signer
-        .presign_request(
-            "GET",
-            &uri,
-            &HeaderMap::new(),
-            SignableBody::Bytes(b""),
-            Duration::from_secs(600),
-        )
+        .presign_request("GET", &uri, &HeaderMap::new(), Duration::from_secs(600))
         .await
         .unwrap()
         .to_string()
@@ -645,7 +670,6 @@ async fn given_existing_query_when_presigned_then_preserve_original_path_and_que
             "GET",
             &uri,
             &HeaderMap::new(),
-            SignableBody::Bytes(b""),
             Duration::from_mins(2),
             reference_time(),
         )

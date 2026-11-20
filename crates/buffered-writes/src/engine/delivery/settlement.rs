@@ -99,13 +99,21 @@ impl<T: Send + Sync + 'static> DeliveryTurn<'_, T> {
         &mut self,
         leased: &LeasedSealedBatch,
     ) -> HandoffOutcome {
-        let Some(queue) = &self.engine.cfg.queue else {
+        let Some(fallback) = &self.engine.cfg.queue else {
             return HandoffOutcome::Retained;
+        };
+        let envelope = match fallback.key.seal(leased.batch.clone()) {
+            Ok(envelope) => envelope,
+            Err(_) => {
+                return self.retain_queue_failure(QueueError::Permanent {
+                    reason: "failed to encode sealed batch envelope",
+                });
+            }
         };
         match self
             .engine
             .complete_engine_operation(self.deadline, || {
-                queue.publish(leased.batch.clone(), self.deadline)
+                fallback.queue.publish(envelope, self.deadline)
             })
             .await
         {
@@ -144,7 +152,7 @@ impl<T: Send + Sync + 'static> DeliveryTurn<'_, T> {
                     batch_id: leased.batch.batch_id(),
                     fencing_token: leased.fencing_token,
                     disposition,
-                    now_utc_ms: self.engine.cfg.clock.now_utc().timestamp_millis(),
+                    now_utc_ms: crate::observer::utc_millis(self.engine.cfg.clock.now_utc()),
                     deadline: self.deadline,
                 })
             })

@@ -10,9 +10,8 @@ use crate::{
     ResourceType, Role, RoleActionLimit, RoleActionRef, RoleLimitCountScope, RoleLimitCountSource,
     RoleLimitEnforcementMode, RoleLimitThresholds, RolePermission, Scope, ScopeMappingEntry,
     StepUpConfig, StepUpRule, ValidationError,
-    configuration::{
-        configuration_model::{ActionPatternCache, expand_action_patterns_cached},
-        constants::{ACTION_MAX, RESOURCE_TYPE_MAX},
+    configuration::configuration_model::{
+        ActionPatternExpansionCache, expand_action_patterns_shared,
     },
 };
 
@@ -116,16 +115,44 @@ fn given_wildcard_catalog_identifiers_when_validated_then_catalog_boundary_rejec
     // them.
     assert!(errors.iter().any(|error| matches!(
         error,
-        ValidationError::InvalidFormat { field, message }
-            if *field == "resource_types[].id"
-                && message == "catalog identifiers must not contain wildcards"
+        ValidationError::InvalidFormat { field, .. } if *field == "resource_types[].id"
     )));
     assert!(errors.iter().any(|error| matches!(
         error,
-        ValidationError::InvalidFormat { field, message }
+        ValidationError::InvalidFormat { field, .. }
             if *field == "resource_types[].actions[].name"
-                && message == "catalog identifiers must not contain wildcards"
     )));
+}
+
+#[test]
+fn given_separator_characters_in_catalog_identifiers_when_validated_then_rejected() {
+    // Given resource type `a` with action `b:c` and resource type `a:b` with
+    // action `c`, which would share the Cedar action ID `a:b:c`, plus a
+    // resource type that collides with the `#` bundle manifest key.
+    for (resource_type, action) in [("a", "b:c"), ("a:b", "c"), ("doc#1", "read")] {
+        let mut model = base_model();
+        model.resource_types[0].id = resource_type.into();
+        model.resource_types[0].actions[0].name = action.into();
+        model.permissions[0].actions[0].resource_type = resource_type.into();
+        model.permissions[0].actions[0].action_name = action.into();
+        model.roles[0].actions.clear();
+
+        // When the catalog is validated.
+        let errors = model
+            .into_validated()
+            .expect_err("separator characters must be rejected");
+
+        // Then the catalog boundary rejects the ambiguous identifier.
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                ValidationError::InvalidFormat { field, .. }
+                    if *field == "resource_types[].id"
+                        || *field == "resource_types[].actions[].name"
+            )),
+            "{resource_type}:{action} must be rejected: {errors:?}"
+        );
+    }
 }
 
 #[test]
@@ -165,8 +192,11 @@ fn given_empty_entity_fields_when_validated_then_each_entity_reports_its_boundar
         .expect_err("empty entity fields must be rejected");
 
     // Then every owning validator reports its malformed input.
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidFormat { field, .. } if *field == "resource_types[].id"
+    )));
     for field in [
-        "resource_types[].id",
         "resource_types[].name",
         "resource_types[].actions[].name",
         "permissions[].id",
@@ -612,28 +642,17 @@ fn repeated_wildcard_expansion_reuses_the_catalog_match() {
             .collect(),
         context_schema: None,
     }];
-    let mut cache = ActionPatternCache::new();
+    let mut cache = ActionPatternExpansionCache::new();
 
-    let first = expand_action_patterns_cached(
-        &mut cache,
-        &resource_types,
-        "document",
-        "read-*",
-        RESOURCE_TYPE_MAX,
-        ACTION_MAX,
-    )
-    .expect("first wildcard expansion");
-    let second = expand_action_patterns_cached(
-        &mut cache,
-        &resource_types,
-        "DOCUMENT",
-        "READ-*",
-        RESOURCE_TYPE_MAX,
-        ACTION_MAX,
-    )
-    .expect("cached wildcard expansion");
+    let first = expand_action_patterns_shared(&mut cache, &resource_types, "document", "read-*")
+        .expect("first wildcard expansion");
+    let second = expand_action_patterns_shared(&mut cache, &resource_types, "DOCUMENT", "READ-*")
+        .expect("cached wildcard expansion");
 
-    assert_eq!(first, second);
+    assert!(
+        std::rc::Rc::ptr_eq(&first, &second),
+        "duplicate patterns must share one expansion"
+    );
     assert_eq!(
         cache.len(),
         1,
@@ -1620,4 +1639,193 @@ fn given_provider_json_without_flag_when_deserialized_then_allow_any_audience_is
 
     assert!(!provider.allow_any_audience);
     assert!(provider.is_missing_audience_policy());
+}
+
+fn wide_catalog() -> Vec<ResourceType> {
+    (0..MAX_RESOURCE_TYPES)
+        .map(|resource_index| ResourceType {
+            id: format!("rt{resource_index}"),
+            name: format!("Resource {resource_index}"),
+            description: None,
+            actions: (0..MAX_ACTIONS_PER_RESOURCE_TYPE)
+                .map(|action_index| crate::ActionDefinition {
+                    name: format!("a{action_index}"),
+                    description: None,
+                })
+                .collect(),
+            context_schema: None,
+        })
+        .collect()
+}
+
+fn wildcard_permission(index: usize) -> Permission {
+    Permission {
+        id: format!("p{index}:x"),
+        name: format!("p{index}"),
+        description: None,
+        actions: vec![PermissionActionRef {
+            resource_type: "*".into(),
+            action_name: "*".into(),
+        }],
+        not_actions: Vec::new(),
+    }
+}
+
+#[test]
+fn given_wildcard_permissions_over_a_wide_catalog_when_validated_then_rejects_before_expanding() {
+    // Given the maximum catalog (25,600 actions) and 1,024 permissions that
+    // each reference `*:*`, which would expand to 26.2M action references.
+    let mut model = base_model();
+    model.resource_types = wide_catalog();
+    model.permissions = (0..MAX_PERMISSIONS).map(wildcard_permission).collect();
+    model.roles.clear();
+
+    // When the configuration is validated.
+    let guard = alloc_counter::AllocationGuard::start(
+        module_path!(),
+        "given_wildcard_permissions_over_a_wide_catalog_when_validated_then_rejects_before_expanding",
+        file!(),
+        line!(),
+        None,
+    );
+    let errors = model
+        .into_validated()
+        .expect_err("expanded permission actions exceed the per-entry cap");
+    let report = guard.finish();
+
+    // Then the per-entry and aggregate caps reject it from match counts, and
+    // validation stays within a small allocation budget instead of
+    // materializing the expansion (gigabytes before the fix).
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::LimitExceeded { resource: "permission_actions", actual, .. }
+            if *actual == MAX_RESOURCE_TYPES * MAX_ACTIONS_PER_RESOURCE_TYPE
+    )));
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::LimitExceeded {
+            resource: "expanded_action_refs",
+            ..
+        }
+    )));
+    assert!(
+        report.allocated_bytes < 32 * 1024 * 1024,
+        "validation allocated {} bytes in {} allocations",
+        report.allocated_bytes,
+        report.allocation_count
+    );
+}
+
+#[test]
+fn given_wildcard_role_actions_with_distinct_scopes_when_validated_then_rejects_before_expanding() {
+    // Given roles whose `*:*` actions are not deduplicated because each
+    // carries a distinct scope list.
+    let mut model = base_model();
+    model.resource_types = wide_catalog();
+    model.permissions.clear();
+    let scope_lists = [
+        vec![Scope::Tenant],
+        vec![Scope::Org],
+        vec![Scope::Own],
+        vec![Scope::Tenant, Scope::Org],
+    ];
+    model.roles = (0..20)
+        .map(|role_index| Role {
+            id: format!("role_{role_index}"),
+            name: format!("role_{role_index}"),
+            description: None,
+            permissions: Vec::new(),
+            actions: scope_lists
+                .iter()
+                .map(|scopes| RoleActionRef {
+                    resource_type: "*".into(),
+                    action_name: "*".into(),
+                    scopes: scopes.clone(),
+                    limit: None,
+                })
+                .collect(),
+            not_actions: Vec::new(),
+            assignment_policy: permanent_policy_spec(),
+        })
+        .collect();
+
+    // When the configuration is validated.
+    let errors = model
+        .into_validated()
+        .expect_err("expanded role actions exceed the per-entry cap");
+
+    // Then per-role and policy-link caps reject it before expansion.
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::LimitExceeded {
+            resource: "role_actions",
+            ..
+        }
+    )));
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::LimitExceeded {
+            resource: "policy_links",
+            ..
+        }
+    )));
+}
+
+#[test]
+fn given_entries_within_caps_but_too_many_policy_links_when_validated_then_rejected() {
+    // Given one 250-action permission granted by roles with 100 scopes each:
+    // every entry is within its cap, but the roles would generate 125,000
+    // policy links.
+    let mut model = base_model();
+    model.resource_types = vec![ResourceType {
+        id: "doc".into(),
+        name: "Doc".into(),
+        description: None,
+        actions: (0..250)
+            .map(|index| crate::ActionDefinition {
+                name: format!("a{index}"),
+                description: None,
+            })
+            .collect(),
+        context_schema: None,
+    }];
+    model.permissions = vec![Permission {
+        id: "doc:all".into(),
+        name: "doc_all".into(),
+        description: None,
+        actions: vec![PermissionActionRef {
+            resource_type: "doc".into(),
+            action_name: "*".into(),
+        }],
+        not_actions: Vec::new(),
+    }];
+    let scopes = [Scope::Tenant, Scope::Org, Scope::Own, Scope::Shared]
+        .into_iter()
+        .cycle()
+        .take(MAX_ROLE_ENTRY_SCOPES)
+        .collect::<Vec<_>>();
+    model.roles = (0..5)
+        .map(|role_index| Role {
+            id: format!("role_{role_index}"),
+            name: format!("role_{role_index}"),
+            description: None,
+            permissions: vec![RolePermission {
+                permission_id: PermissionId::new("doc:all").expect("permission id"),
+                scopes: scopes.clone(),
+            }],
+            actions: Vec::new(),
+            not_actions: Vec::new(),
+            assignment_policy: permanent_policy_spec(),
+        })
+        .collect();
+
+    // When the configuration is validated.
+    let errors = model.validate().expect_err("policy links exceed the cap");
+
+    // Then the policy-link cap rejects it.
+    assert!(errors.iter().any(|error| matches!(
+        error,
+        ValidationError::LimitExceeded { resource: "policy_links", actual, .. }
+            if *actual == 5 * 250 * MAX_ROLE_ENTRY_SCOPES
+    )));
 }

@@ -45,7 +45,7 @@ impl<'a, T: Send + Sync + 'static> DeliveryTurn<'a, T> {
     ) -> bool {
         let age = leased
             .batch
-            .age_at_utc_ms(self.engine.cfg.clock.now_utc().timestamp_millis());
+            .age_at_utc_ms(crate::observer::utc_millis(self.engine.cfg.clock.now_utc()));
         if self.engine.mode_and_health().1 == SinkHealth::Open
             && age >= self.engine.cfg.delivery_policy.fallback_age
         {
@@ -77,7 +77,7 @@ impl<'a, T: Send + Sync + 'static> DeliveryTurn<'a, T> {
     ) -> bool {
         let age = leased
             .batch
-            .age_at_utc_ms(self.engine.cfg.clock.now_utc().timestamp_millis());
+            .age_at_utc_ms(crate::observer::utc_millis(self.engine.cfg.clock.now_utc()));
         if force_all_ages || age >= self.engine.cfg.delivery_policy.fallback_age {
             match self.try_handoff_leased(leased).await {
                 HandoffOutcome::Transferred => return true,

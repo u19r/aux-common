@@ -16,6 +16,7 @@ file.
 ```rust
 use bg_jobs_aws::{CredentialSource, SigV4Authorizer};
 use bg_jobs_http::{ApprovedEndpoint, HttpExecutor, HttpPolicy, HttpPolicyId};
+use http::Method;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let policy_id = HttpPolicyId::try_new("signed-api")?;
@@ -26,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let policy = HttpPolicy::builder(policy_id)
         .endpoint(ApprovedEndpoint::exact("api.example.com")?)
+        .route(Method::POST, "/v1/")
         .authorizer(authorizer)
         .try_build()?;
     let _executor = HttpExecutor::try_new([policy])?;
@@ -34,8 +36,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 The executor validates HTTPS, policy approval, request limits, and the attempt deadline before it
-invokes the authorizer. Signing then receives the method, approved URL, non-sensitive headers, and
-body. The HTTP boundary preserves its stable idempotency/attempt headers and rejects an authorizer
+invokes the authorizer; the policy pins the approved method and path prefix. Signing then receives
+the method, approved URL, non-sensitive headers, and body, and rejects any caller-supplied `x-amz-*`
+header, because signed AWS headers select the operation (`x-amz-target`, `x-amz-copy-source`,
+`x-amz-acl`). The HTTP boundary preserves its stable idempotency/attempt headers and rejects an authorizer
 that changes them. Credential values, signed headers, and signer diagnostics do not enter durable
 job values, telemetry, or typed errors.
 

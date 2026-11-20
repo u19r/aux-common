@@ -39,6 +39,7 @@ fn access_token_claims_with_scope(
         client_id: "client_123".to_string(),
         scope,
         tenant: "tenant_123".to_string(),
+        organization_id: None,
         principal_type: PrincipalType::User,
         auth_time: Some(1_699_999_000),
         acr: Some("urn:example:acr:mfa".to_string()),
@@ -88,8 +89,29 @@ fn access_token_claims_round_trip_preserves_custom_json_and_scope_wire_format() 
 }
 
 #[test]
+fn org_claim_round_trips_as_org_id_and_is_absent_without_an_org() {
+    let mut claims = access_token_claims();
+    let encoded = serde_json::to_value(&claims).expect("claims serialize");
+    assert!(encoded.get("org_id").is_none());
+
+    claims.organization_id = Some("org_123".to_string());
+    let encoded = serde_json::to_value(&claims).expect("claims serialize");
+    assert_eq!(encoded["org_id"], "org_123");
+    let decoded: OAuthAccessTokenClaims =
+        serde_json::from_value(encoded).expect("claims deserialize");
+    assert_eq!(decoded, claims);
+
+    claims.organization_id = Some(String::new());
+    assert_eq!(
+        claims.validate(),
+        Err(ClaimBoundsError::Empty { field: "org_id" })
+    );
+}
+
+#[test]
 fn given_structural_or_removed_claim_names_when_used_as_custom_claims_then_rejected() {
     for name in [
+        "org_id",
         "access_profile_session_reference",
         "permission_set_id",
         "permission_set_revision",

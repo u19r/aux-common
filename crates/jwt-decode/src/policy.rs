@@ -19,7 +19,7 @@ pub struct VerificationPolicy {
     pub(crate) nonce: Option<String>,
     pub(crate) max_issued_age: Option<Duration>,
     pub(crate) leeway: Duration,
-    pub(crate) allowed_header_types: Vec<String>,
+    pub(crate) allow_missing_access_typ: bool,
     pub(crate) require_issued_at: bool,
 }
 
@@ -73,7 +73,7 @@ pub struct VerificationPolicyBuilder {
     nonce: Option<String>,
     max_issued_age: Option<Duration>,
     leeway: Duration,
-    allowed_header_types: Vec<String>,
+    allow_missing_access_typ: bool,
     require_issued_at: bool,
 }
 
@@ -91,7 +91,7 @@ impl VerificationPolicyBuilder {
             nonce: None,
             max_issued_age: None,
             leeway: DEFAULT_LEEWAY,
-            allowed_header_types: default_header_types(token_kind),
+            allow_missing_access_typ: false,
             require_issued_at: true,
         }
     }
@@ -172,19 +172,20 @@ impl VerificationPolicyBuilder {
         self
     }
 
+    /// Kept for existing callers. Access `typ` matching already accepts
+    /// `at+jwt` and `application/at+jwt` in any ASCII case, so this changes
+    /// nothing.
     #[must_use]
-    pub fn allow_application_access_token_typ(mut self) -> Self {
-        if self.token_kind == TokenKind::Access {
-            self.allowed_header_types
-                .push("application/at+jwt".to_owned());
-        }
+    pub fn allow_application_access_token_typ(self) -> Self {
         self
     }
 
+    /// Also accept an access token whose header omits `typ`. A present `typ`
+    /// must still name `at+jwt`.
     #[must_use]
     pub fn allow_missing_access_token_typ(mut self) -> Self {
         if self.token_kind == TokenKind::Access {
-            self.allowed_header_types.push(String::new());
+            self.allow_missing_access_typ = true;
         }
         self
     }
@@ -204,7 +205,7 @@ impl VerificationPolicyBuilder {
             nonce: self.nonce,
             max_issued_age: self.max_issued_age,
             leeway: self.leeway,
-            allowed_header_types: self.allowed_header_types,
+            allow_missing_access_typ: self.allow_missing_access_typ,
             require_issued_at: self.require_issued_at,
         })
     }
@@ -248,7 +249,6 @@ impl VerificationPolicyBuilder {
 
     fn without_access_typ(mut self) -> Self {
         self.validate_access_typ = false;
-        self.allowed_header_types.clear();
         self
     }
 
@@ -293,12 +293,5 @@ impl VerificationPolicyBuilder {
         JwtDecodeError::new(JwtDecodeErrorKind::PolicyInvalid(
             PolicyErrorKind::OutOfRange(name),
         ))
-    }
-}
-
-fn default_header_types(token_kind: TokenKind) -> Vec<String> {
-    match token_kind {
-        TokenKind::Access => vec!["at+jwt".to_owned()],
-        TokenKind::Id | TokenKind::Refresh => Vec::new(),
     }
 }

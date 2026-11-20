@@ -58,6 +58,35 @@ fn given_external_or_internal_doctype_when_parsing_then_reject() {
 }
 
 #[test]
+fn given_parameter_entity_expansion_in_internal_subset_when_parsing_then_reject_before_the_parser_expands_it()
+ {
+    // The `xml` crate expands `%name;` references inside an entity value
+    // without a limit and reports the DOCTYPE only after the subset closes.
+    // Each level here multiplies the stored value by ten. The subset is left
+    // unterminated so that a parser-level rejection would surface as a parse
+    // error after full expansion, while the pre-parse rejection reports the
+    // unsupported DOCTYPE immediately. The depth stays small enough to be
+    // cheap even if this check regresses.
+    let mut bomb = String::from(r#"<!DOCTYPE r [<!ENTITY % a0 "xxxxxxxxxx">"#);
+    for level in 1..=5 {
+        let references = format!("%a{};", level - 1).repeat(10);
+        write!(bomb, r#"<!ENTITY % a{level} "{references}">"#).expect("write to String");
+    }
+
+    assert_eq!(
+        parse_xml_to_element(&bomb).map(|_| ()),
+        Err(XmlSecurityError::Unsupported {
+            message: "DOCTYPE is not supported".to_string(),
+        })
+    );
+    let declared = format!(r#"<?xml version="1.0" encoding="UTF-8"?>{bomb}]><r/>"#);
+    assert!(matches!(
+        parse_xml_to_element(&declared),
+        Err(XmlSecurityError::Unsupported { .. })
+    ));
+}
+
+#[test]
 fn given_comments_or_processing_instructions_when_parsing_then_reject() {
     for xml in [
         r#"<?xml-stylesheet type="text/xsl" href="https://attacker.invalid/a.xsl"?><a/>"#,
@@ -268,6 +297,30 @@ fn given_size_or_depth_limit_when_parsing_then_reject_before_unbounded_allocatio
 
     assert!(XmlLimits::try_new(0, 1).is_err());
     assert!(XmlLimits::try_new(1, 0).is_err());
+}
+
+#[test]
+fn given_depth_limit_above_stack_safe_bound_when_constructing_limits_then_reject() {
+    // Given the deepest accepted limit, when a document reaches it on a
+    // thread with a typical async-worker stack, then parsing,
+    // canonicalisation, and drop complete without overflowing.
+    let limits = XmlLimits::try_new(64 * 1024, 256).expect("stack-safe depth limit");
+    let deep = nested_document(256);
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let element = parse_with_limits(&deep, limits).expect("document at the depth limit");
+            element.canonicalize_unverified().expect("canonical bytes");
+        })
+        .expect("spawn bounded-stack thread")
+        .join()
+        .expect("deep document handled within a 2 MiB stack");
+
+    // A deeper limit would let attacker nesting recurse past the stack.
+    assert!(matches!(
+        XmlLimits::try_new(512 * 1024, 257),
+        Err(XmlSecurityError::Shape { .. })
+    ));
 }
 
 #[test]

@@ -673,12 +673,9 @@ fn step_up_policy_includes_auth_age_guard() {
         "RecentAuth must require the dedicated assurance level: {policy_text}"
     );
     assert!(
-        policy_text.contains("token_present"),
-        "auth age guard should allow api keys"
-    );
-    assert!(
-        policy_text.contains("context._authz.token_present && context._authz.token_valid"),
-        "an API-key exemption must not bypass an invalid token"
+        policy_text
+            .contains("context._authz.token_is_subject_credential && context._authz.token_valid"),
+        "only a valid subject-bound API key may skip the session step-up guard"
     );
 }
 
@@ -790,7 +787,7 @@ fn matching_role_shapes_share_one_template_and_one_link_per_role() {
                 description: None,
                 permissions: vec![authz_types::RolePermission {
                     permission_id: PermissionId::new("document:reader").expect("permission id"),
-                    scopes: vec![Scope::Org],
+                    scopes: vec![Scope::Own],
                 }],
                 actions: vec![],
                 not_actions: vec![],
@@ -802,7 +799,7 @@ fn matching_role_shapes_share_one_template_and_one_link_per_role() {
                 description: None,
                 permissions: vec![authz_types::RolePermission {
                     permission_id: PermissionId::new("document:reader").expect("permission id"),
-                    scopes: vec![Scope::Org],
+                    scopes: vec![Scope::Own],
                 }],
                 actions: vec![],
                 not_actions: vec![],
@@ -1404,5 +1401,28 @@ fn relationship_scope_policies_present() {
         policy_text.contains("resource.org_parents")
             && policy_text.contains("contains(principal.org_id)"),
         "org relationship scope condition rendered"
+    );
+}
+
+#[test]
+fn given_org_scope_when_generating_then_resource_grant_satisfies_only_that_roles_guard() {
+    // Given a role whose permission entry is org-scoped.
+    let config = relationship_scope_configuration(Scope::Org)
+        .into_validated()
+        .expect("valid config");
+
+    // When generating its policy.
+    let policies_json = generate_static_policies(&config).expect("policies");
+    let policy_text = template_texts(&parse_policy_set(&policies_json)).join("\n");
+
+    // Then the org guard is the principal's org membership or a resource
+    // grant naming this role, never a principal attribute shared by roles.
+    assert!(
+        policy_text.contains(
+            "(resource.org_id == principal.org_id)) || \
+             context._authz.resource_scopes.contains({resource: resource, role: \
+             Authz::Role::\"reader\"})"
+        ),
+        "{policy_text}"
     );
 }

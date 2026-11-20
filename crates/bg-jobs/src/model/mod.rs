@@ -17,6 +17,8 @@ mod panic_boundary;
 #[cfg(test)]
 mod polling_tests;
 mod record;
+#[cfg(test)]
+mod record_tests;
 mod remote_claim;
 #[cfg(test)]
 mod remote_claim_tests;

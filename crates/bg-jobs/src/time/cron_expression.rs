@@ -6,7 +6,8 @@ use core::{
 };
 use std::num::NonZeroU16;
 
-use chrono::{DateTime, Utc};
+use jiff::{Zoned, tz::TimeZone};
+use jiff_cron::{Schedule, TimeUnitSpec as _};
 
 use super::Timestamp;
 use crate::error::ValidationError;
@@ -15,7 +16,8 @@ use crate::error::ValidationError;
 #[derive(Clone, Debug, Eq)]
 pub struct CronExpression {
     canonical: String,
-    schedule: cron::Schedule,
+    schedule: Schedule,
+    weekdays: u8,
 }
 
 impl CronExpression {
@@ -31,10 +33,11 @@ impl CronExpression {
         let input = expression.as_ref();
         let fields = validate_cron_fields(input)?;
         let canonical = fields.join(" ");
-        let schedule = parse_cron_schedule(fields)?;
+        let (schedule, weekdays) = parse_cron_schedule(fields)?;
         Ok(Self {
             canonical,
             schedule,
+            weekdays,
         })
     }
 
@@ -44,12 +47,44 @@ impl CronExpression {
 
     /// Returns the first UTC occurrence strictly after `after`.
     pub fn next_after(&self, after: Timestamp) -> Result<Option<Timestamp>, ValidationError> {
-        let datetime = timestamp_to_utc(after)?;
-        self.schedule
-            .after(&datetime)
-            .next()
-            .map(timestamp_from_utc)
-            .transpose()
+        // Occurrences are on whole seconds, so truncating to the preceding
+        // second preserves strictly-after behavior.
+        let datetime = jiff::Timestamp::from_second(after.as_millis().div_euclid(1_000))
+            .map_err(|_| ValidationError::Overflow {
+                field: "cron timestamp",
+            })?
+            .to_zoned(TimeZone::UTC);
+        if datetime.year() < 0 {
+            // The cron schedule only covers 1970 through 2100. Preserve the
+            // previous evaluator's empty result for BCE inputs.
+            return Ok(None);
+        }
+        Ok(self
+            .find_next_occurrence(datetime)
+            .map(|next| Timestamp::from_millis(next.timestamp().as_millisecond())))
+    }
+
+    fn find_next_occurrence(&self, mut after: Zoned) -> Option<Zoned> {
+        const SECONDS_PER_DAY: i64 = 86_400;
+        loop {
+            let candidate = self.schedule.after(after).next()?;
+            let weekday = candidate.weekday().to_sunday_zero_offset();
+            if self.weekdays & (1 << weekday) != 0 {
+                return Some(candidate);
+            }
+
+            // Move directly to the next allowed UTC day. The scheduler can
+            // then skip any dates excluded by the month or day-of-month.
+            let days = (1..7).find(|days| self.weekdays & (1 << ((weekday + days) % 7)) != 0)?;
+            let utc_day = candidate
+                .timestamp()
+                .as_second()
+                .div_euclid(SECONDS_PER_DAY);
+            let midnight = (utc_day + i64::from(days)) * SECONDS_PER_DAY;
+            after = jiff::Timestamp::from_second(midnight - 1)
+                .ok()?
+                .to_zoned(TimeZone::UTC);
+        }
     }
 
     /// Returns the first UTC occurrence at or after `at`.
@@ -131,8 +166,8 @@ fn validate_cron_fields(input: &str) -> Result<[&str; 5], ValidationError> {
     Ok(fields)
 }
 
-fn parse_cron_schedule(fields: [&str; 5]) -> Result<cron::Schedule, ValidationError> {
-    // `cron` uses the Quartz-style 1..=7 weekday domain (Sunday is 1),
+fn parse_cron_schedule(fields: [&str; 5]) -> Result<(Schedule, u8), ValidationError> {
+    // `jiff-cron` uses the Quartz-style 1..=7 weekday domain (Sunday is 1),
     // while the portable five-field contract uses the POSIX 0..=7
     // domain (Sunday is 0 or 7). Keep the persisted spelling canonical
     // and adapt only the parser input at this boundary.
@@ -140,15 +175,25 @@ fn parse_cron_schedule(fields: [&str; 5]) -> Result<cron::Schedule, ValidationEr
         normalize_parser_weekday(fields[4]).ok_or(ValidationError::InvalidValue {
             field: "cron expression",
         })?;
-    let parser_input = format!(
-        "0 {} {} {} {} {} *",
-        fields[0], fields[1], fields[2], fields[3], parser_fields
-    );
-    let schedule =
-        cron::Schedule::from_str(&parser_input).map_err(|_| ValidationError::InvalidValue {
+    let parse_with_weekdays = |weekdays: &str| {
+        Schedule::from_str(&format!(
+            "0 {} {} {} {} {weekdays} *",
+            fields[0], fields[1], fields[2], fields[3]
+        ))
+        .map_err(|_| ValidationError::InvalidValue {
             field: "cron expression",
-        })?;
-    Ok(schedule)
+        })
+    };
+    let schedule = parse_with_weekdays(&parser_fields)?;
+    let weekdays = schedule
+        .days_of_week()
+        .iter()
+        .fold(0, |mask, day| mask | (1 << (day - 1)));
+    if schedule.days_of_week().is_all() {
+        Ok((schedule, weekdays))
+    } else {
+        Ok((parse_with_weekdays("*")?, weekdays))
+    }
 }
 
 impl PartialEq for CronExpression {
@@ -253,14 +298,4 @@ fn normalize_weekday_number(value: u8) -> Option<u8> {
         1..=6 => Some(value + 1),
         _ => None,
     }
-}
-
-fn timestamp_to_utc(timestamp: Timestamp) -> Result<DateTime<Utc>, ValidationError> {
-    DateTime::from_timestamp_millis(timestamp.as_millis()).ok_or(ValidationError::Overflow {
-        field: "cron timestamp",
-    })
-}
-
-fn timestamp_from_utc(datetime: DateTime<Utc>) -> Result<Timestamp, ValidationError> {
-    Ok(Timestamp::from_millis(datetime.timestamp_millis()))
 }

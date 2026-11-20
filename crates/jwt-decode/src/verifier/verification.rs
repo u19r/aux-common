@@ -11,6 +11,18 @@ use crate::{
     claims_policy::ClaimsPolicy, error::Result, json::CompactToken,
 };
 
+const ACCESS_TOKEN_TYP: &str = "at+jwt";
+const MEDIA_TYPE_PREFIX: &str = "application/";
+
+/// Verifies compact signed JWTs against a key source and a
+/// [`VerificationPolicy`].
+///
+/// ES256 and ES384 signatures are malleable: when `(r, s)` verifies, the
+/// distinct encoding `(r, n - s)` verifies for the same claims and key, so one
+/// verified claim set can arrive as two different token strings. Never key
+/// replay detection, revocation, deduplication, or rate limiting on signature
+/// or token bytes; key them on signed claims such as `jti`. A token-digest
+/// cache is safe only as a cache whose miss performs full verification.
 #[derive(Clone)]
 pub struct JwtVerifier {
     jwks_source: JwksSource,
@@ -24,6 +36,10 @@ impl JwtVerifier {
         JwtVerifierBuilder::default()
     }
 
+    /// Verifies the signature, header, and claims, then deserializes `T`.
+    ///
+    /// ECDSA token bytes are malleable; see [`JwtVerifier`] before keying any
+    /// replay or deduplication state on the token.
     pub async fn verify<T>(
         &self,
         token: &str,
@@ -278,21 +294,30 @@ impl JwtVerifier {
         if Self::has_unsupported_key_material(header) {
             return Err(JwtDecodeError::new(JwtDecodeErrorKind::UnsupportedHeader));
         }
-        if policy.validate_access_typ && !Self::access_typ_allowed(header, policy) {
+        let names_access_token = header
+            .typ
+            .as_deref()
+            .map(|typ| Self::media_subtype(typ).eq_ignore_ascii_case(ACCESS_TOKEN_TYP));
+        if policy.validate_access_typ
+            && !names_access_token.unwrap_or(policy.allow_missing_access_typ)
+        {
             return Err(JwtDecodeError::new(JwtDecodeErrorKind::TokenTypeMismatch));
         }
-        if policy.token_kind == TokenKind::Id && header.typ.as_deref() == Some("at+jwt") {
+        if policy.token_kind == TokenKind::Id && names_access_token == Some(true) {
             return Err(JwtDecodeError::new(JwtDecodeErrorKind::TokenTypeMismatch));
         }
         Ok(())
     }
 
-    fn access_typ_allowed(header: &Header, policy: &VerificationPolicy) -> bool {
-        let typ = header.typ.as_deref().unwrap_or_default();
-        policy
-            .allowed_header_types
-            .iter()
-            .any(|allowed| allowed == typ)
+    /// RFC 7515 section 4.1.9: `typ` compares ASCII case-insensitively and may
+    /// omit the `application/` prefix, so `at+jwt`, `AT+JWT`, and
+    /// `Application/at+jwt` name one media type. Both the access-token check
+    /// and the ID-token rejection compare through this one normalization.
+    fn media_subtype(typ: &str) -> &str {
+        typ.get(..MEDIA_TYPE_PREFIX.len())
+            .filter(|prefix| prefix.eq_ignore_ascii_case(MEDIA_TYPE_PREFIX))
+            .and_then(|_| typ.get(MEDIA_TYPE_PREFIX.len()..))
+            .unwrap_or(typ)
     }
 
     fn has_unsupported_key_material(header: &Header) -> bool {
@@ -318,15 +343,9 @@ impl JwtVerifier {
         key: &DecodingKey,
         algorithm: SignatureAlgorithm,
     ) -> Result<()> {
-        let signature = if algorithm == SignatureAlgorithm::ES256 {
-            crate::constants::normalize_low_s_encoded(compact.signature)
-                .ok_or_else(|| JwtDecodeError::new(JwtDecodeErrorKind::SignatureInvalid))?
-        } else {
-            compact.signature.to_owned()
-        };
         #[cfg(target_arch = "wasm32")]
         return crate::wasm_signature::verify(
-            &signature,
+            compact.signature,
             compact.message.as_bytes(),
             key,
             algorithm,
@@ -334,7 +353,7 @@ impl JwtVerifier {
 
         #[cfg(not(target_arch = "wasm32"))]
         match jsonwebtoken::crypto::verify(
-            &signature,
+            compact.signature,
             compact.message.as_bytes(),
             key,
             algorithm.to_backend(),

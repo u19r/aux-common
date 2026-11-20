@@ -856,3 +856,56 @@ fn assert_only_queue_wake_check_conflicts(
         assert!(!snapshot.iter().any(|(key, _)| key == checks[0].key()));
     }
 }
+
+#[test]
+fn given_same_dedupe_key_in_two_fairness_scopes_when_enqueued_then_neither_returns_the_other_job() {
+    let engine = system(
+        FakeStore::new(),
+        FairnessPolicy::Scoped {
+            weight: std::num::NonZeroU16::MIN,
+        },
+        1,
+    );
+    let deduplication = dedupe(b"daily", Timestamp::from_millis(10_000));
+    let scope = |tenant: &[u8]| {
+        FairnessClass::from(FairnessPath::new(
+            FairnessKey::try_new(tenant).expect("fairness key"),
+            None,
+        ))
+    };
+    for (id, tenant) in [(5, b"tenant-a"), (6, b"tenant-b")] {
+        let result = block_on(engine.enqueue_raw(
+            job(
+                id,
+                Bytes::from_static(b"payload"),
+                scope(tenant.as_slice()),
+                Timestamp::ZERO,
+                None,
+                Some(deduplication.clone()),
+            ),
+            Timestamp::ZERO,
+        ))
+        .expect("enqueue commits");
+        assert_eq!(result.job_id, JobId::from([id; 16]));
+        assert_eq!(result.disposition, EnqueueDisposition::Enqueued);
+    }
+}
+
+#[test]
+fn given_same_dedupe_key_for_two_kinds_when_keyed_then_identities_differ() {
+    let namespace = Namespace::try_new(b"jobs").expect("namespace");
+    let key = DeduplicationKey::try_new(b"daily").expect("dedupe key");
+    let fairness = FairnessClass::low_volume();
+    let export = JobKind::try_new("export").expect("kind");
+    let webhook = JobKind::try_new("webhook").expect("kind");
+    let export = crate::keys::DedupeIdentity::new(&export, &fairness, &key);
+    let webhook = crate::keys::DedupeIdentity::new(&webhook, &fairness, &key);
+    assert_ne!(
+        crate::keys::dedupe_key(&namespace, export).expect("key"),
+        crate::keys::dedupe_key(&namespace, webhook).expect("key")
+    );
+    assert_ne!(
+        crate::keys::dedupe_expiry_key(&namespace, export, Timestamp::ZERO).expect("key"),
+        crate::keys::dedupe_expiry_key(&namespace, webhook, Timestamp::ZERO).expect("key")
+    );
+}

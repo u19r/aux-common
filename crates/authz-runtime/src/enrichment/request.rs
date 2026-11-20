@@ -4,7 +4,7 @@ use std::{
 };
 
 use authz_types::{EvaluationRequest, JwtContext, RoleScope, Subject};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -28,12 +28,16 @@ pub struct SubjectAccessSnapshot {
     pub subject: Subject,
     pub assignments: Vec<EffectiveRoleAssignment>,
     pub subject_parents: Vec<ParentRef>,
+    /// Ignored. Resource scopes derive only from the assignments that cover
+    /// the requested resource; the field stays for existing callers that
+    /// construct this snapshot.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub resource_scopes: HashMap<String, HashSet<String>>,
     pub fetched_at_ms: i64,
 }
 
 impl SubjectAccessSnapshot {
-    pub fn active_assignments_at(&self, now: DateTime<Utc>) -> Vec<EffectiveRoleAssignment> {
+    pub fn active_assignments_at(&self, now: Timestamp) -> Vec<EffectiveRoleAssignment> {
         self.assignments
             .iter()
             .filter(|assignment| assignment.is_active_at(now))
@@ -133,7 +137,6 @@ pub struct EnrichedCedarRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubjectParentTemplate {
     pub parents: Vec<ParentRef>,
-    pub resource_scopes: HashMap<String, HashSet<String>>,
 }
 
 pub fn build_subject_parent_template(
@@ -141,31 +144,14 @@ pub fn build_subject_parent_template(
     relationship_parents: &[ParentRef],
     tenant_id: &str,
 ) -> SubjectParentTemplate {
-    let mut parents = Vec::with_capacity(
-        assignments
-            .len()
-            .saturating_mul(2)
-            .saturating_add(relationship_parents.len()),
-    );
-    let mut resource_scopes: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut parents =
+        Vec::with_capacity(assignments.len().saturating_add(relationship_parents.len()));
 
+    // Role membership is not a parent fact: the evaluator derives Cedar role
+    // parents from the assignments that cover each requested resource.
     for assignment in assignments {
-        parents.push(ParentRef {
-            ref_type: "role".to_string(),
-            id: assignment.role_id.clone(),
-        });
         if let Some(scope_type) = assignment.scope_type.as_deref() {
             match classify_scope(scope_type) {
-                ScopeKind::Resource {
-                    resource_type: Some(scope_resource_type),
-                } => {
-                    if let Some(scope_id) = assignment.scope_id.as_deref() {
-                        resource_scopes
-                            .entry(scope_resource_type.to_string())
-                            .or_default()
-                            .insert(scope_id.to_string());
-                    }
-                }
                 ScopeKind::Org => {
                     if let Some(scope_id) = assignment.scope_id.as_deref() {
                         parents.push(ParentRef {
@@ -188,20 +174,14 @@ pub fn build_subject_parent_template(
                         id: tenant_id.to_string(),
                     });
                 }
-                ScopeKind::Resource {
-                    resource_type: None,
-                }
-                | ScopeKind::Other => {}
+                ScopeKind::Resource { .. } | ScopeKind::Other => {}
             }
         }
     }
 
     parents.extend(relationship_parents.iter().cloned());
     dedupe_parents(&mut parents);
-    SubjectParentTemplate {
-        parents,
-        resource_scopes,
-    }
+    SubjectParentTemplate { parents }
 }
 
 pub fn enrich_request_with_snapshots(
@@ -217,7 +197,7 @@ pub fn enrich_request_with_snapshots(
         trusted_context,
         subject_access,
         resource_access,
-        Utc::now(),
+        Timestamp::now(),
         SnapshotFreshnessPolicy::default(),
     )
 }
@@ -228,7 +208,7 @@ pub fn enrich_request_with_snapshots_at(
     trusted_context: &TrustedAuthorizationContext,
     subject_access: &SubjectAccessSnapshot,
     resource_access: &ResourceAccessSnapshot,
-    now: DateTime<Utc>,
+    now: Timestamp,
     freshness: SnapshotFreshnessPolicy,
 ) -> AuthzRuntimeResult<EnrichedCedarRequest> {
     if !trusted_context.matches_subject(&request.subject) {
@@ -255,28 +235,32 @@ pub fn enrich_request_with_snapshots_at(
     {
         return Err(AuthzRuntimeError::ResourceSnapshotMismatch);
     }
-    let now_ms = now.timestamp_millis();
+    let now_ms = now.as_millisecond() - i64::from(now.subsec_nanosecond() % 1_000_000 < 0);
     freshness.validate("subject", subject_access.fetched_at_ms, now_ms)?;
     freshness.validate("resource", resource_access.fetched_at_ms, now_ms)?;
     validate_resource_org_parents(&resource_access.resource_parents)?;
 
-    let mut subject_parents = subject_access.subject_parents.clone();
+    // Role parents are never taken from the snapshot. Cedar role membership
+    // comes only from the evaluator's covering-role set, so a snapshot role
+    // parent or a relationship whose target is a role cannot grant a role
+    // that does not cover the requested resource.
+    let mut subject_parents = subject_access
+        .subject_parents
+        .iter()
+        .filter(|parent| !is_role_parent(parent))
+        .cloned()
+        .collect::<Vec<_>>();
     let mut resource_parents = resource_access.resource_parents.clone();
-    let mut has_resource_scoped_assignment = subject_access
-        .resource_scopes
-        .get(request.resource.resource_type.as_str())
-        .is_some_and(|resource_ids| resource_ids.contains(request.resource.id.as_str()));
 
     if let Some(jwt_ctx) = request.jwt_context.as_ref()
         && jwt_ctx.is_complete()
     {
-        add_jwt_role_parents(
+        add_jwt_scope_parents(
             jwt_ctx,
             &request,
             &resource_access.properties,
             tenant_id,
             &mut subject_parents,
-            &mut has_resource_scoped_assignment,
         );
     }
 
@@ -302,15 +286,6 @@ pub fn enrich_request_with_snapshots_at(
     inject_org_parent_property(&subject_parents, &mut subject_props);
     inject_org_parent_property(&resource_parents, &mut resource_props);
 
-    if has_resource_scoped_assignment
-        && let (Value::Object(subject_map), Value::Object(resource_map)) =
-            (&mut subject_props, &resource_props)
-        && !subject_map.contains_key("org_id")
-        && let Some(org_value) = resource_map.get("org_id").cloned()
-    {
-        subject_map.insert("org_id".to_string(), org_value);
-    }
-
     request.subject.properties = Some(subject_props);
     request.resource.properties = Some(resource_props);
     request.context = Some(authz_types::Context {
@@ -324,23 +299,17 @@ pub fn enrich_request_with_snapshots_at(
     })
 }
 
-fn add_jwt_role_parents(
+fn add_jwt_scope_parents(
     jwt_ctx: &JwtContext,
     request: &EvaluationRequest,
     resource_properties: &Value,
     tenant_id: &str,
     subject_parents: &mut Vec<ParentRef>,
-    has_resource_scoped_assignment: &mut bool,
 ) {
     for role in &jwt_ctx.roles {
         if !jwt_role_scope_applies(&role.scope, request, resource_properties) {
             continue;
         }
-        subject_parents.push(ParentRef {
-            ref_type: "role".to_string(),
-            id: role.role_id.clone(),
-        });
-
         match &role.scope {
             RoleScope::Global => {
                 subject_parents.push(ParentRef {
@@ -354,19 +323,15 @@ fn add_jwt_role_parents(
                     id: org_id.clone(),
                 });
             }
-            RoleScope::Resource {
-                resource_type,
-                resource_id,
-            } => {
-                if resource_type == &request.resource.resource_type
-                    && resource_id == &request.resource.id
-                {
-                    *has_resource_scoped_assignment = true;
-                }
-            }
-            RoleScope::Group { .. } => {}
+            RoleScope::Resource { .. } | RoleScope::Group { .. } => {}
         }
     }
+}
+
+/// Parent types are canonicalized when they become Cedar entity types, so
+/// compare in that form: `role`, `Role`, and `_role` all name `Authz::Role`.
+fn is_role_parent(parent: &ParentRef) -> bool {
+    authz_cedar::to_pascal_case(&parent.ref_type) == "Role"
 }
 
 fn jwt_role_scope_applies(

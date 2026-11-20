@@ -68,7 +68,7 @@ async fn inspect(buffer: &MemoryBuffer) -> buffered_writes::BufferSnapshot {
     buffer
         .inspect(BufferInspectRequest {
             operation_id: None,
-            now_utc_ms: chrono::Utc::now().timestamp_millis(),
+            now_utc_ms: jiff::Timestamp::now().as_millisecond(),
             now_instant: Instant::now(),
             deadline: Deadline::after(Duration::from_secs(1)),
         })
@@ -162,7 +162,7 @@ impl RetainedPartialBatch {
                 max_items: 25,
                 max_bytes: 65536,
                 lease_duration: Duration::from_secs(5),
-                now_utc_ms: self.clock.now_utc().timestamp_millis(),
+                now_utc_ms: self.clock.now_utc().as_millisecond(),
                 now_instant: self.clock.now_instant(),
                 deadline: Deadline::after(Duration::from_secs(1)),
             })
@@ -187,7 +187,7 @@ impl RetainedPartialBatch {
                 batch_id: leased.batch.batch_id(),
                 fencing_token: leased.fencing_token,
                 disposition,
-                now_utc_ms: self.clock.now_utc().timestamp_millis(),
+                now_utc_ms: self.clock.now_utc().as_millisecond(),
                 deadline: Deadline::after(Duration::from_secs(1)),
             })
             .await;

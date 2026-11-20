@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 authz-cedar = { workspace = true }
 authz-types = { workspace = true }
-chrono = { workspace = true }
+jiff = { workspace = true }
 metrics-facade = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

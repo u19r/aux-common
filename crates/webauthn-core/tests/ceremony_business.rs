@@ -143,8 +143,7 @@ fn given_changed_challenge_when_asserting_then_reject_without_success() {
 //
 // When assertion verification runs
 //
-// Then it returns Initial, Increased, Unchanged, or Regression exactly as
-// documented
+// Then it returns Initial, Increased, or NotIncreased exactly as documented
 #[test]
 fn given_each_counter_transition_when_asserting_then_return_status() {
     let fixture = CeremonyFixture::new();
@@ -158,10 +157,16 @@ fn given_each_counter_transition_when_asserting_then_return_status() {
                 current: 5,
             },
         ),
-        (5, SignCountStatus::Unchanged { value: 5 }),
+        (
+            5,
+            SignCountStatus::NotIncreased {
+                previous: 5,
+                current: 5,
+            },
+        ),
         (
             6,
-            SignCountStatus::Regression {
+            SignCountStatus::NotIncreased {
                 previous: 6,
                 current: 5,
             },

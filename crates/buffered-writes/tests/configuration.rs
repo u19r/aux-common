@@ -5,6 +5,10 @@ use buffered_writes::{
 };
 use bytes::Bytes;
 
+fn envelope_key() -> buffered_writes::EnvelopeKey {
+    buffered_writes::EnvelopeKey::try_new([7; 32]).unwrap()
+}
+
 struct VersionCodec(String);
 impl RecordCodec<u32> for VersionCodec {
     fn version(&self) -> &str {
@@ -75,6 +79,7 @@ fn given_invalid_versions_when_configured_then_reject_before_opening_retention()
             ReplayWorker::builder(
                 "configuration/v1",
                 InMemoryQueue::default(),
+                envelope_key(),
                 sink(SinkLimits::default())
             )
             .strategy_version(invalid.clone())
@@ -85,6 +90,7 @@ fn given_invalid_versions_when_configured_then_reject_before_opening_retention()
             ReplayWorker::builder(
                 "configuration/v1",
                 InMemoryQueue::default(),
+                envelope_key(),
                 sink(SinkLimits::default())
             )
             .with_codec(VersionCodec(invalid))

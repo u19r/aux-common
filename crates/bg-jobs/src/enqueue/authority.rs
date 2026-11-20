@@ -46,7 +46,10 @@ fn enqueue_read_keys<S: JobStore>(
 ) -> JobResult<(Vec<StoreKey>, bool), S::Error> {
     let mut read_keys = vec![job_key.clone()];
     let has_dedupe = if let Some(deduplication) = &job.deduplication {
-        read_keys.push(keys::dedupe_key(system.namespace(), deduplication.key())?);
+        read_keys.push(keys::dedupe_key(
+            system.namespace(),
+            keys::DedupeIdentity::new(&job.kind, &job.fairness, deduplication.key()),
+        )?);
         true
     } else {
         false

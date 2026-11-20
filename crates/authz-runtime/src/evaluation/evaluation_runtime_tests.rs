@@ -6,7 +6,7 @@ use authz_types::{
     FineGrainedScopes, MAX_PERMISSIONS, Permission, PermissionActionRef, PermissionId,
     ResourceType, Role, RoleActionRef, RolePermission, Scope, TokenContext, TokenScopeConfig,
 };
-use chrono::Utc;
+use jiff::Timestamp;
 
 use crate::{
     ActionPolicyDecision, EvaluationRuntime, PermissionBits, RoleBits, action_policy_decision_bits,
@@ -133,7 +133,8 @@ fn given_persisted_token_ceiling_when_resolving_permissions_then_unknown_ids_can
     );
 
     // When the public runtime resolves the persisted ceiling at a fixed time.
-    let resolved = runtime.resolve_token_permissions_at(&user_permissions, &token, Utc::now());
+    let resolved =
+        runtime.resolve_token_permissions_at(&user_permissions, &token, Timestamp::now());
 
     // Then only the permission still present in the validated configuration
     // survives.
@@ -176,7 +177,8 @@ fn given_stale_permission_bit_when_resolving_fine_grained_token_then_unknown_bit
     );
 
     // When the public resolver intersects the fine-grained ceiling.
-    let resolved = runtime.resolve_token_permissions_at(&user_permissions, &token, Utc::now());
+    let resolved =
+        runtime.resolve_token_permissions_at(&user_permissions, &token, Timestamp::now());
 
     // Then the current permission is retained and stale state cannot grant or
     // panic.
@@ -230,7 +232,7 @@ fn given_valid_scope_when_resolving_repeatedly_then_cached_policy_path_allocates
         TokenScopeConfig::with_scopes(vec!["document:read".to_string()])
             .expect("valid coarse scope"),
     );
-    let now = Utc::now();
+    let now = Timestamp::now();
     let guard = AllocationGuard::start(
         module_path!(),
         "given_valid_scope_when_resolving_repeatedly_then_cached_policy_path_allocates_nothing",
@@ -341,4 +343,29 @@ fn permission(id: &str) -> Permission {
 fn permanent_assignment_policy() -> AccessAssignmentPolicySpec {
     AccessAssignmentPolicySpec::try_new(AccessAssignmentMode::PermanentOrTemporary, None)
         .expect("valid assignment policy")
+}
+
+#[test]
+fn given_pre_epoch_clock_when_resolving_expiration_then_preserves_floor_seconds() {
+    let runtime = runtime_with_compiled_action_masks();
+    let user_permissions = PermissionBits::default();
+    let mut token = TokenContext::new(
+        "token_full".to_string(),
+        "user_1".to_string(),
+        TokenScopeConfig::full_access(),
+    );
+    token.expires_at = Some(0);
+    let now: Timestamp = "1969-12-31T23:59:59.999999999Z"
+        .parse()
+        .expect("valid timestamp");
+    assert!(
+        runtime
+            .resolve_token_permissions_at(&user_permissions, &token, now)
+            .is_valid
+    );
+    assert!(
+        !runtime
+            .resolve_token_permissions_at(&user_permissions, &token, Timestamp::UNIX_EPOCH,)
+            .is_valid
+    );
 }

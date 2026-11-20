@@ -106,7 +106,7 @@ fn inspect(buffer: &DiskBuffer) -> crate::BufferSnapshot {
     runtime()
         .block_on(buffer.inspect(BufferInspectRequest {
             operation_id: Some(OperationId::try_from("seed-operation").unwrap()),
-            now_utc_ms: chrono::Utc::now().timestamp_millis(),
+            now_utc_ms: jiff::Timestamp::now().as_millisecond(),
             now_instant: Instant::now(),
             deadline: Deadline::after(Duration::from_secs(2)),
         }))
@@ -390,7 +390,7 @@ fn given_open_write_when_killed_after_claim_seal_or_settlement_then_replay_prese
         })
         .unwrap();
         let clock =
-            crate::TestClock::with_utc_millis(chrono::Utc::now().timestamp_millis() + 60_000);
+            crate::TestClock::with_utc_millis(jiff::Timestamp::now().as_millisecond() + 60_000);
         clock.set_auto_advance_on_sleep(false);
         let writer = BufferedWrites::builder("disk-crash/v1", sink)
             .with_clock(clock)
@@ -525,7 +525,7 @@ async fn given_dispatched_append_when_caller_cancels_before_sync_then_retry_pres
     let snapshot = buffer
         .inspect(BufferInspectRequest {
             operation_id: Some(OperationId::try_from("seed-operation").unwrap()),
-            now_utc_ms: chrono::Utc::now().timestamp_millis(),
+            now_utc_ms: jiff::Timestamp::now().as_millisecond(),
             now_instant: Instant::now(),
             deadline: Deadline::after(Duration::from_secs(2)),
         })
@@ -625,7 +625,7 @@ fn given_sink_progress_when_killed_during_settlement_then_recovery_preserves_kno
             )
             .unwrap();
             let clock =
-                crate::TestClock::with_utc_millis(chrono::Utc::now().timestamp_millis() + 60_000);
+                crate::TestClock::with_utc_millis(jiff::Timestamp::now().as_millisecond() + 60_000);
             clock.set_auto_advance_on_sleep(false);
             let writer = BufferedWrites::builder("disk-crash/v1", sink)
                 .with_clock(clock)
@@ -694,7 +694,7 @@ async fn given_disk_delivery_when_cancelled_during_claim_seal_or_settle_then_rec
         let snapshot = buffer
             .inspect(BufferInspectRequest {
                 operation_id: None,
-                now_utc_ms: chrono::Utc::now().timestamp_millis(),
+                now_utc_ms: jiff::Timestamp::now().as_millisecond(),
                 now_instant: Instant::now(),
                 deadline: Deadline::after(Duration::from_secs(2)),
             })
@@ -705,7 +705,7 @@ async fn given_disk_delivery_when_cancelled_during_claim_seal_or_settle_then_rec
         drop(buffer);
         let buffer = open(&directory.0);
         let clock =
-            crate::TestClock::with_utc_millis(chrono::Utc::now().timestamp_millis() + 60_000);
+            crate::TestClock::with_utc_millis(jiff::Timestamp::now().as_millisecond() + 60_000);
         clock.set_auto_advance_on_sleep(false);
         let writer = BufferedWrites::builder("disk-crash/v1", sink)
             .with_clock(clock)
@@ -719,7 +719,7 @@ async fn given_disk_delivery_when_cancelled_during_claim_seal_or_settle_then_rec
             buffer
                 .inspect(BufferInspectRequest {
                     operation_id: None,
-                    now_utc_ms: chrono::Utc::now().timestamp_millis(),
+                    now_utc_ms: jiff::Timestamp::now().as_millisecond(),
                     now_instant: Instant::now(),
                     deadline: Deadline::after(Duration::from_secs(2))
                 })
@@ -740,7 +740,7 @@ async fn given_disk_renewal_when_caller_cancels_before_sync_then_recovered_lease
         .await
         .unwrap();
     let buffer = open(&directory.0);
-    let now = chrono::Utc::now().timestamp_millis() + 60_000;
+    let now = jiff::Timestamp::now().as_millisecond() + 60_000;
     let request = crate::BufferClaimRequest {
         max_watermark: None,
         allow_open_claim: true,

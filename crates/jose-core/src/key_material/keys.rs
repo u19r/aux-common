@@ -46,20 +46,18 @@ impl PreparedVerifier {
         self.algorithm
     }
 
+    /// Verifies `signature` over `message` with the prepared key.
+    ///
+    /// ES256 and ES384 signatures are malleable: when `(r, s)` verifies, the
+    /// distinct encoding `(r, n - s)` verifies for the same message and key.
+    /// Never key replay detection, deduplication, or rate limiting on
+    /// signature or token bytes; key them on signed claims such as `jti`.
     pub fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), JoseError> {
         if self.algorithm == JwsAlgorithm::EdDsa
             && signature.len() == 64
             && !valid_ed25519_point(&signature[..32])
         {
             return Err(JoseError::InvalidSignature);
-        }
-        if self.algorithm == JwsAlgorithm::Es256 {
-            let normalized =
-                crate::constants::normalize_low_s(signature).ok_or(JoseError::InvalidSignature)?;
-            return self
-                .key
-                .verify_sig(message, &normalized)
-                .map_err(|_| JoseError::InvalidSignature);
         }
         self.key
             .verify_sig(message, signature)

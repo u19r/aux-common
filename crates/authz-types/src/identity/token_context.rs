@@ -1,6 +1,6 @@
 //! Token context supplied during authorization evaluation for API key requests.
 
-use chrono::Utc;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -85,7 +85,7 @@ impl TokenContext {
     }
 
     pub fn is_expired(&self) -> bool {
-        self.is_expired_at(Utc::now().timestamp())
+        self.is_expired_at(Timestamp::now().as_second())
     }
 
     pub(crate) fn is_expired_at(&self, now: i64) -> bool {

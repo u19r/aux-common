@@ -142,6 +142,145 @@ async fn given_id_policy_when_header_is_access_token_type_then_rejects_token() {
     assert_eq!(error.kind(), &JwtDecodeErrorKind::TokenTypeMismatch);
 }
 
+#[tokio::test]
+async fn given_id_policy_when_header_names_access_token_type_in_any_spelling_then_rejects_token() {
+    // Given an ID-token policy, claims that pass its token-type claim gate, and
+    // access-token typ spellings that RFC 7515 section 4.1.9 treats as the
+    // same media type.
+    let verifier = build_verifier();
+    let policy = VerificationPolicy::id_token()
+        .issuer("https://issuer.example")
+        .expect("issuer")
+        .audience("aux-api")
+        .expect("audience")
+        .build()
+        .expect("ID-token policy");
+    let id_claims = || Claims {
+        token_type: TokenKind::Id,
+        ..valid_claims()
+    };
+    verifier
+        .verify::<Claims>(&signed_token(id_header(), id_claims()), &policy)
+        .await
+        .expect("control: the same claims verify under a JWT typ");
+
+    for typ in ["application/at+jwt", "AT+JWT", "Application/AT+JWT"] {
+        let mut header = id_header();
+        header.typ = Some(typ.to_owned());
+
+        // When each token reaches the closed token-kind/header-type rule.
+        let error = verifier
+            .verify::<Claims>(&signed_token(header, id_claims()), &policy)
+            .await
+            .expect_err("every at+jwt spelling must be rejected as an ID token");
+
+        // Then the normalized media type cannot cross the ID-token boundary.
+        assert_eq!(
+            error.kind(),
+            &JwtDecodeErrorKind::TokenTypeMismatch,
+            "typ {typ}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn given_access_policy_when_header_names_access_token_type_in_any_spelling_then_accepts() {
+    // Given the default access-token policy and equivalent typ spellings.
+    let verifier = build_verifier();
+
+    for typ in [
+        "at+jwt",
+        "application/at+jwt",
+        "AT+JWT",
+        "Application/AT+JWT",
+    ] {
+        let mut header = id_header();
+        header.typ = Some(typ.to_owned());
+
+        // When each token is verified.
+        let verified = verifier
+            .verify::<Claims>(&signed_token(header, valid_claims()), &policy())
+            .await;
+
+        // Then one normalized comparison accepts every spelling.
+        assert!(verified.is_ok(), "typ {typ}");
+    }
+    for typ in ["application/jwt", "jwt", "", "application/"] {
+        let mut header = id_header();
+        header.typ = Some(typ.to_owned());
+        let error = verifier
+            .verify::<Claims>(&signed_token(header, valid_claims()), &policy())
+            .await
+            .expect_err("other media types must not satisfy an access-token policy");
+        assert_eq!(
+            error.kind(),
+            &JwtDecodeErrorKind::TokenTypeMismatch,
+            "typ {typ}"
+        );
+    }
+}
+
+#[test]
+fn given_es256_token_and_its_n_minus_s_mirror_when_verifying_then_both_verify() {
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
+
+    // Given a valid ES256 token and the distinct token whose signature
+    // replaces s with n - s.
+    let key = SigningKey::from_slice(&[7_u8; 32]).expect("P-256 test key");
+    let point = key.verifying_key().to_sec1_point(false);
+    let jwks = json!({"keys": [{
+        "kty": "EC",
+        "kid": "es-key",
+        "crv": "P-256",
+        "alg": "ES256",
+        "use": "sig",
+        "x": base64_url_encode(point.x().expect("x coordinate")),
+        "y": base64_url_encode(point.y().expect("y coordinate")),
+    }]});
+    let header = base64_url_encode(br#"{"alg":"ES256","kid":"es-key","typ":"JWT"}"#);
+    let claims = json!({
+        "iss": "https://issuer.example",
+        "aud": "aux-api",
+        "exp": 1_700_000_300_i64,
+        "iat": 1_699_999_990_i64,
+        "jti": "token-1",
+    });
+    let claims = base64_url_encode(claims.to_string().as_bytes());
+    let message = format!("{header}.{claims}");
+    let signature: Signature = key.sign(message.as_bytes());
+    let mirrored =
+        Signature::from_scalars(signature.r(), -signature.s()).expect("mirrored signature");
+    let token = format!("{message}.{}", base64_url_encode(&signature.to_bytes()));
+    let mirrored_token = format!("{message}.{}", base64_url_encode(&mirrored.to_bytes()));
+    assert_ne!(token, mirrored_token, "the mirror is a distinct token");
+
+    let verifier = JwtVerifier::builder()
+        .jwks_source(JwksSource::json_string(jwks.to_string()).expect("ES256 JWKS"))
+        .allowed_algorithms(
+            AllowedAlgorithms::asymmetric([SignatureAlgorithm::ES256]).expect("allowlist"),
+        )
+        .clock(Arc::new(FixedClock))
+        .build()
+        .expect("verifier");
+    let policy = VerificationPolicy::generic_jwt()
+        .issuer("https://issuer.example")
+        .expect("issuer")
+        .audience("aux-api")
+        .expect("audience")
+        .build()
+        .expect("policy");
+
+    // When both encodings are verified.
+    // Then both verify with the same signed claims, so replay state must key
+    // on `jti`, never on token bytes.
+    for candidate in [&token, &mirrored_token] {
+        let claims = verifier
+            .verify_static_json_claims_only(candidate, &policy)
+            .expect("both encodings verify");
+        assert_eq!(claims["jti"], "token-1");
+    }
+}
+
 #[test]
 fn given_local_hmac_source_when_verifying_static_claims_then_accepts_valid_signature() {
     // Given an explicitly configured local HMAC source and symmetric allowlist.
@@ -777,7 +916,7 @@ async fn given_hmac_signature_under_rs256_header_when_verifying_then_rejects_tok
     );
     let signature = jsonwebtoken::crypto::sign(
         message.as_bytes(),
-        &EncodingKey::from_secret(HMAC_SECRET),
+        &EncodingKey::from_secret(HMAC_SECRET).expect("valid HMAC test key"),
         Algorithm::HS256,
     )
     .expect("hmac sign");
@@ -1173,28 +1312,6 @@ async fn given_duplicate_header_member_when_verifying_then_rejects_token() {
         error.kind(),
         JwtDecodeErrorKind::ClaimsInvalid(crate::ClaimErrorKind::DuplicateJsonMember)
     ));
-}
-
-#[tokio::test]
-async fn given_access_token_with_application_typ_when_policy_allows_then_accepts() {
-    let mut header = Header::new(Algorithm::RS256);
-    header.kid = Some("test-key".to_owned());
-    header.typ = Some("application/at+jwt".to_owned());
-    let policy = VerificationPolicy::access_token()
-        .issuer("https://issuer.example")
-        .unwrap()
-        .audience("aux-api")
-        .unwrap()
-        .client_id("client-123")
-        .unwrap()
-        .allow_application_access_token_typ()
-        .build()
-        .unwrap();
-
-    build_verifier()
-        .verify::<Claims>(&signed_token(header, valid_claims()), &policy)
-        .await
-        .unwrap();
 }
 
 #[tokio::test]

@@ -28,6 +28,12 @@ pub struct ValidatedDpopProof {
 }
 
 impl DpopValidationInput<'_> {
+    /// Validates the proof signature, header, and claims.
+    ///
+    /// ES256 proof signatures are malleable: `(r, s)` and `(r, n - s)` both
+    /// verify, so one proof can arrive as two distinct strings. Key replay
+    /// detection on the key thumbprint and signed `jti`, never on proof or
+    /// signature bytes.
     pub fn validate(&self) -> Result<ValidatedDpopProof, DpopError> {
         let jws = LosslessJws::parse(self.proof)?;
         validate_header(jws.header(), self.algorithms)?;

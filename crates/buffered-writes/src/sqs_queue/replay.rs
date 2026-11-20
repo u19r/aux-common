@@ -19,6 +19,10 @@ use crate::{
 };
 
 impl ReplayQueue for SqsQueue {
+    fn has_quarantine_target(&self) -> bool {
+        self.quarantine.is_some()
+    }
+
     fn receive(
         &self,
         max_messages: usize,

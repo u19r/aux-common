@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "tools": {
+    "mold": {
+      "selection": "3.0.0",
+      "revision": "",
+      "downloads": {
+        "x86_64": {
+          "url": "https://github.com/rui314/mold/releases/download/v3.0.0/mold-3.0.0-x86_64-linux.tar.gz",
+          "sha256": "6c90d4a474c7c0409dfb575be03a5345878ac14fdba18de8b40fa58c60121189"
+        },
+        "aarch64": {
+          "url": "https://github.com/rui314/mold/releases/download/v3.0.0/mold-3.0.0-aarch64-linux.tar.gz",
+          "sha256": "52c759d3689babaea4c42af2f31062a74ab83e17ffb5a8090232534c67b70577"
+        }
+      }
+    },
+    "wasi_sdk": {
+      "selection": "24",
+      "revision": "",
+      "downloads": {
+        "arm64": {
+          "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-arm64-linux.tar.gz",
+          "sha256": "ae6c1417ea161e54bc54c0a168976af57a0c6e53078857886057a71a0d928646"
+        }
+      }
+    }
+  },
+  "images": {
+    "rust_builder": {
+      "selection": "docker.io/library/rust:1.99.1-bookworm",
+      "digest": "sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8",
+      "revision": ""
+    },
+    "debian_runtime": {
+      "selection": "docker.io/library/debian:bookworm-slim",
+      "digest": "sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8",
+      "revision": ""
+    }
+  },
+  "actions": {
+    "actions_checkout": {
+      "selection": "actions/checkout@v7.0.1",
+      "revision": "3d3c42e5aac5ba805825da76410c181273ba90b1"
+    },
+    "actions_cache": {
+      "selection": "actions/cache@v6.1.0",
+      "revision": "55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
+    }
+  }
+}

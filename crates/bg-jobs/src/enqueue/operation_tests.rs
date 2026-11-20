@@ -336,7 +336,11 @@ fn given_completed_work_with_expired_deduplication_when_scheduler_observes_it_th
     let engine = system(store.clone(), FairnessPolicy::low_volume(), 1);
     let mut seed = crate::test_helper::low_volume_job(30, Timestamp::ZERO);
     let dedupe = crate::test_helper::dedupe(b"expired-unique", Timestamp::from_millis(1));
-    let key = crate::keys::dedupe_key(engine.namespace(), dedupe.key()).unwrap();
+    let key = crate::keys::dedupe_key(
+        engine.namespace(),
+        crate::keys::DedupeIdentity::new(&seed.kind, &seed.fairness, dedupe.key()),
+    )
+    .unwrap();
     seed.deduplication = Some(dedupe);
     block_on(engine.enqueue_raw(seed.clone(), Timestamp::ZERO)).unwrap();
     let claim = block_on(engine.claim(seed.job_id, Timestamp::ZERO)).unwrap();

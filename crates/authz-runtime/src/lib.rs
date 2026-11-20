@@ -26,8 +26,8 @@ pub use evaluation::{
     ScopedPermissionBits,
 };
 pub use local::{
-    ActionPolicyDecision, LocalAuthzEvaluator, LocalBatchEvaluationInput, LocalEvaluationInput,
-    TrustedAuthorizationContext, action_policy_decision_bits, best_permission_for_action_with_bits,
-    permissions_for_request_bits,
+    ActionPolicyDecision, EvaluationPurpose, LocalAuthzEvaluator, LocalBatchEvaluationInput,
+    LocalEvaluationInput, TrustedAuthorizationContext, action_policy_decision_bits,
+    best_permission_for_action_with_bits, permissions_for_request_bits,
 };
 pub use step_up::{StepUpEvaluator, StepUpResult};

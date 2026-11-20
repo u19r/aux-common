@@ -13,4 +13,4 @@ mod recovery_configuration;
 mod state;
 mod wake;
 
-pub(crate) use state::{Engine, EngineConfig, ScopeExtractor};
+pub(crate) use state::{Engine, EngineConfig, FallbackQueue, ScopeExtractor};

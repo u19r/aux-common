@@ -78,7 +78,8 @@ Remote sources fetch through `http-request::HttpClient` and cache parsed JWKS do
 
 Remote cache keys include both JWKS URL and expected issuer. Unknown `kid` values force one refresh
 before returning `KeyNotFound`, which supports normal key rotation without trusting header-provided
-URLs.
+URLs. The cached document is replaced only after the refresh succeeds, so a failed refresh keeps
+serving the last good document.
 
 `JwksCachePolicy` bounds capacity, fallback TTL, refresh TTL, maximum body size, and stale-on-error.
 Stale-on-error is short-lived availability behavior; call `JwksSource::invalidate_issuer` when an
@@ -86,12 +87,18 @@ issuer or key source is considered compromised.
 
 ## Profile Notes
 
-`VerificationPolicy::access_token()` requires `typ = "at+jwt"` by default. Compatibility methods can
-allow `application/at+jwt` or a missing access-token header type, but those choices are deliberately
-explicit.
+`VerificationPolicy::access_token()` requires `typ = "at+jwt"` by default. Header `typ` compares
+ASCII case-insensitively with any `application/` prefix removed (RFC 7515 section 4.1.9), so
+`application/at+jwt` and `AT+JWT` name the same type. `allow_missing_access_token_typ` also accepts
+an absent access-token header type; that choice is deliberately explicit.
 
-`VerificationPolicy::id_token()` validates issuer, audience, expiry, issued-at, nonce when supplied,
-and `azp` when multiple audiences are present and a client ID is configured.
+`VerificationPolicy::id_token()` rejects every spelling of the `at+jwt` header type and validates
+issuer, audience, expiry, issued-at, nonce when supplied, and `azp` when multiple audiences are
+present and a client ID is configured.
+
+ES256 and ES384 signatures are malleable: when `(r, s)` verifies, `(r, n - s)` also verifies, so one
+claim set can arrive as two distinct token strings. Key replay detection, revocation, and
+deduplication on signed claims such as `jti`, never on token or signature bytes.
 
 `VerificationPolicy::refresh_token()` validates only the signed credential shape. Rotation,
 one-time-use checks, idle timeout, family invalidation, and revocation storage remain caller-owned.

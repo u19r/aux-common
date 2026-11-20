@@ -346,7 +346,7 @@ fn append_scoped_action_policies(
 
         for scope in scopes {
             let mut conditions = Vec::new();
-            if let Some(scope_guard) = scope_guard_expr(scope, &role.id, &role.name) {
+            if let Some(scope_guard) = scope_guard_expr(scope, &role.id) {
                 conditions.push(scope_guard);
             }
             conditions.push(token_guard_expr(&action_id));
@@ -393,7 +393,7 @@ fn append_scoped_role_action_policies(
 
         for scope in &action_ref.scopes {
             let mut conditions = Vec::new();
-            if let Some(scope_guard) = scope_guard_expr(scope, &role.id, &role.name) {
+            if let Some(scope_guard) = scope_guard_expr(scope, &role.id) {
                 conditions.push(scope_guard);
             }
             conditions.push(token_guard_expr(&action_id));
@@ -448,10 +448,22 @@ fn build_static_policy_text(
     )
 }
 
-fn scope_expr(scope: &Scope) -> &'static str {
-    match scope {
-        Scope::Tenant => "",
-        Scope::Org => ORG_SCOPE_GUARD,
+fn scope_guard_expr(scope: &Scope, role_id: &str) -> Option<String> {
+    let guard = match scope {
+        Scope::Tenant => return None,
+        Scope::Resource { .. } => return Some(resource_scope_guard_expr(role_id)),
+        // The principal's org comes from its org membership. A role granted on
+        // this exact resource also satisfies its own org scope there; that
+        // grant is per role, so it never widens another role's org scope.
+        Scope::Org => {
+            return Some(balanced_boolean_expr(
+                &[
+                    format!("({ORG_SCOPE_GUARD})"),
+                    resource_scope_guard_expr(role_id),
+                ],
+                "||",
+            ));
+        }
         Scope::Group => {
             "resource has group_id && principal has group_id && resource.group_id == \
              principal.group_id"
@@ -467,25 +479,8 @@ fn scope_expr(scope: &Scope) -> &'static str {
             "resource has group_parents && principal has group_id && \
              resource.group_parents.contains(principal.group_id)"
         }
-        Scope::Resource { .. } => "",
-    }
-}
-
-fn scope_guard_expr(scope: &Scope, role_id: &str, role_display_name: &str) -> Option<String> {
-    match scope {
-        Scope::Resource { .. } => Some(resource_scope_guard_expr(role_id)),
-        Scope::Org if role_display_name.starts_with("org:owner") => {
-            Some(ORG_SCOPE_GUARD.to_string())
-        }
-        _ => {
-            let expr = scope_expr(scope);
-            if expr.is_empty() {
-                None
-            } else {
-                Some(expr.to_string())
-            }
-        }
-    }
+    };
+    Some(guard.to_string())
 }
 
 fn build_condition_clause(conditions: &[String]) -> String {
@@ -622,13 +617,19 @@ fn step_up_guard_expr(rule: &StepUpRule) -> String {
     }
 
     let session_ok = balanced_boolean_expr(&clauses, "&&");
+    // Capacity accounting meters an action that is authorized, with step-up,
+    // where it runs, so no step-up rule holds it (LIMITS-STEPUP-1).
+    let capacity_accounting = authz_ctx_field("capacity_accounting");
     if rule.applies_to_api_keys {
-        session_ok
+        balanced_boolean_expr(&[capacity_accounting, session_ok], "||")
     } else {
-        let token_present = authz_ctx_field("token_present");
+        // Only the subject's own API key is exempt. A delegated service token
+        // authenticates the calling PEP, so the subject's session still has
+        // to satisfy the rule.
+        let subject_credential = authz_ctx_field("token_is_subject_credential");
         let token_valid = authz_ctx_field("token_valid");
-        let valid_token = balanced_boolean_expr(&[token_present, token_valid], "&&");
-        balanced_boolean_expr(&[valid_token, session_ok], "||")
+        let valid_subject_key = balanced_boolean_expr(&[subject_credential, token_valid], "&&");
+        balanced_boolean_expr(&[capacity_accounting, valid_subject_key, session_ok], "||")
     }
 }
 

@@ -3,17 +3,27 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{DateTime, TimeZone as _, Utc};
 use futures_util::future::BoxFuture;
+use jiff::Timestamp;
 
 use crate::configuration::{AdmissionStatus, BatchId, DurabilityClass, OperationId};
 
 /// Injected monotonic and wall-clock time source.
 pub trait Clock: Send + Sync + 'static {
     fn now_instant(&self) -> Instant;
-    fn now_utc(&self) -> DateTime<Utc>;
+    fn now_utc(&self) -> Timestamp;
     fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()>;
 }
+
+/// Keep persisted milliseconds rounded toward the earlier instant, including
+/// before 1970.
+pub(crate) fn utc_millis(timestamp: Timestamp) -> i64 {
+    timestamp.as_millisecond() - i64::from(timestamp.subsec_nanosecond() % 1_000_000 < 0)
+}
+
+#[cfg(test)]
+#[path = "observer_tests.rs"]
+mod tests;
 
 impl dyn Clock {
     pub(crate) async fn complete_before<F: std::future::Future>(
@@ -42,20 +52,18 @@ impl Clock for ProductionClock {
         Instant::now()
     }
 
-    fn now_utc(&self) -> DateTime<Utc> {
-        Utc::now()
+    fn now_utc(&self) -> Timestamp {
+        Timestamp::now()
     }
 
     fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
         Box::pin(async move {
             #[cfg(feature = "tokio")]
-            {
+            if tokio::runtime::Handle::try_current().is_ok() {
                 tokio::time::sleep(duration).await;
+                return;
             }
-            #[cfg(not(feature = "tokio"))]
-            {
-                futures_timer::Delay::new(duration).await;
-            }
+            futures_timer::Delay::new(duration).await;
         })
     }
 }
@@ -143,14 +151,12 @@ impl Clock for TestClock {
         }
     }
 
-    fn now_utc(&self) -> DateTime<Utc> {
+    fn now_utc(&self) -> Timestamp {
         let millis = match self.state.lock() {
             Ok(guard) => guard.utc_millis,
             Err(poisoned) => poisoned.into_inner().utc_millis,
         };
-        Utc.timestamp_millis_opt(millis)
-            .single()
-            .unwrap_or_else(Utc::now)
+        Timestamp::from_millisecond(millis).unwrap_or_else(|_| Timestamp::now())
     }
 
     fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {

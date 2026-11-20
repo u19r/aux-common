@@ -14,6 +14,30 @@ use crate::{
     *,
 };
 
+fn dedupe_store_key(
+    namespace: &Namespace,
+    key: &DeduplicationKey,
+) -> Result<StoreKey, StoreDataError> {
+    let job = low_volume_job(0, Timestamp::ZERO);
+    crate::keys::dedupe_key(
+        namespace,
+        crate::keys::DedupeIdentity::new(&job.kind, &job.fairness, key),
+    )
+}
+
+fn dedupe_expiry_store_key(
+    namespace: &Namespace,
+    key: &DeduplicationKey,
+    until: Timestamp,
+) -> Result<StoreKey, StoreDataError> {
+    let job = low_volume_job(0, Timestamp::ZERO);
+    crate::keys::dedupe_expiry_key(
+        namespace,
+        crate::keys::DedupeIdentity::new(&job.kind, &job.fairness, key),
+        until,
+    )
+}
+
 fn engine<S: JobStore>(store: S, owner: u8) -> JobSystem<S> {
     JobSystem::new(
         store,
@@ -58,7 +82,7 @@ fn given_retained_deduplication_when_idle_before_expiry_then_the_scheduler_reque
     assert!(
         !store
             .contains(
-                &crate::keys::dedupe_key(
+                &dedupe_store_key(
                     system.namespace(),
                     &DeduplicationKey::try_new(b"retained").unwrap()
                 )
@@ -79,13 +103,13 @@ fn given_negative_and_positive_expiry_times_when_maintenance_runs_then_only_due_
         let value = crate::keys::dedupe_value(&JobId::from([id; 16]), until).unwrap();
         store
             .put_raw(
-                crate::keys::dedupe_key(system.namespace(), &identity).unwrap(),
+                dedupe_store_key(system.namespace(), &identity).unwrap(),
                 value.clone(),
             )
             .unwrap();
         store
             .put_raw(
-                crate::keys::dedupe_expiry_key(system.namespace(), &identity, until).unwrap(),
+                dedupe_expiry_store_key(system.namespace(), &identity, until).unwrap(),
                 value,
             )
             .unwrap();
@@ -96,7 +120,7 @@ fn given_negative_and_positive_expiry_times_when_maintenance_runs_then_only_due_
         assert_eq!(
             store
                 .contains(
-                    &crate::keys::dedupe_key(
+                    &dedupe_store_key(
                         system.namespace(),
                         &DeduplicationKey::try_new([id]).unwrap()
                     )
@@ -132,7 +156,7 @@ impl JobStore for ExpiryRaceStore {
         self.inner.capabilities()
     }
     async fn get(&self, key: StoreKey) -> Result<Option<Bytes>, Self::Error> {
-        let target = crate::keys::dedupe_key(
+        let target = dedupe_store_key(
             &Namespace::try_new(b"jobs").unwrap(),
             &DeduplicationKey::try_new(b"retained").unwrap(),
         )
@@ -160,7 +184,7 @@ impl JobStore for ExpiryRaceStore {
         self.inner.read_range(request).await
     }
     async fn transact(&self, input: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
-        let key = crate::keys::dedupe_key(
+        let key = dedupe_store_key(
             &Namespace::try_new(b"jobs").unwrap(),
             &DeduplicationKey::try_new(b"retained").unwrap(),
         )
@@ -261,10 +285,9 @@ fn given_expired_identity_replaced_during_cleanup_when_the_stale_cleanup_dispatc
     *store.action.lock().unwrap() = Some(Race::Replace);
     drive(&system, Timestamp::from_millis(2));
     let identity = DeduplicationKey::try_new(b"retained").unwrap();
-    let value =
-        block_on(store.get(crate::keys::dedupe_key(system.namespace(), &identity).unwrap()))
-            .unwrap()
-            .unwrap();
+    let value = block_on(store.get(dedupe_store_key(system.namespace(), &identity).unwrap()))
+        .unwrap()
+        .unwrap();
     assert_eq!(
         crate::keys::decode_dedupe_value(&value).unwrap(),
         (JobId::from([2; 16]), Timestamp::from_millis(50))
@@ -273,12 +296,8 @@ fn given_expired_identity_replaced_during_cleanup_when_the_stale_cleanup_dispatc
         store
             .inner
             .contains(
-                &crate::keys::dedupe_expiry_key(
-                    system.namespace(),
-                    &identity,
-                    Timestamp::from_millis(50)
-                )
-                .unwrap()
+                &dedupe_expiry_store_key(system.namespace(), &identity, Timestamp::from_millis(50))
+                    .unwrap()
             )
             .unwrap()
     );
@@ -418,19 +437,15 @@ fn given_stale_missing_identity_read_when_retiring_expiry_then_native_guard_pres
     assert!(
         store
             .inner
-            .contains(&crate::keys::dedupe_key(system.namespace(), &identity).unwrap())
+            .contains(&dedupe_store_key(system.namespace(), &identity).unwrap())
             .unwrap()
     );
     assert!(
         store
             .inner
             .contains(
-                &crate::keys::dedupe_expiry_key(
-                    system.namespace(),
-                    &identity,
-                    Timestamp::from_millis(1)
-                )
-                .unwrap()
+                &dedupe_expiry_store_key(system.namespace(), &identity, Timestamp::from_millis(1))
+                    .unwrap()
             )
             .unwrap()
     );
@@ -438,7 +453,7 @@ fn given_stale_missing_identity_read_when_retiring_expiry_then_native_guard_pres
     assert!(
         !store
             .inner
-            .contains(&crate::keys::dedupe_key(system.namespace(), &identity).unwrap())
+            .contains(&dedupe_store_key(system.namespace(), &identity).unwrap())
             .unwrap()
     );
 }
@@ -573,7 +588,7 @@ fn given_a_durable_expiry_entry_when_cleaning_then_one_native_cas_is_sufficient_
     assert!(
         !store
             .contains(
-                &crate::keys::dedupe_key(
+                &dedupe_store_key(
                     system.namespace(),
                     &DeduplicationKey::try_new(b"retained").unwrap()
                 )

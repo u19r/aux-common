@@ -141,7 +141,7 @@ impl LambdaExtensionEvent {
     pub(super) fn deadline(&self) -> Result<Deadline, LifecycleError> {
         let anchor = Instant::now();
         let now_ms =
-            u64::try_from(chrono::Utc::now().timestamp_millis()).map_err(|_| api_failure())?;
+            u64::try_from(jiff::Timestamp::now().as_millisecond()).map_err(|_| api_failure())?;
         let (Self::Invoke { deadline_ms, .. } | Self::Shutdown { deadline_ms, .. }) = self;
         let remaining = Duration::from_millis(deadline_ms.saturating_sub(now_ms));
         anchor.checked_add(remaining).ok_or_else(api_failure)?;

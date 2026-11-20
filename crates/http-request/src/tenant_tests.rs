@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     io::{self, Read, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream},
     process::Command,
     sync::{
         Arc, Mutex,
@@ -22,8 +22,9 @@ use reqwest::{
 use crate::{
     HttpRequestDispatchStatus, HttpRequestError, HttpRequestErrorKind, RetryConfig,
     constants::{
-        REDIRECT_BLOCKED_HOST_MISMATCH, REDIRECT_BLOCKED_METHOD_CHANGE,
-        REDIRECT_BLOCKED_SCHEME_CHANGE, REDIRECT_BLOCKED_TOO_MANY, SSRF_BLOCKED_DNS_EMPTY,
+        DEFAULT_TENANT_REQUEST_TIMEOUT, REDIRECT_BLOCKED_HOST_MISMATCH,
+        REDIRECT_BLOCKED_METHOD_CHANGE, REDIRECT_BLOCKED_SCHEME_CHANGE, REDIRECT_BLOCKED_TOO_MANY,
+        RESERVED_IP_RANGES, SSRF_BLOCKED_ALLOWED_DOMAIN_INVALID, SSRF_BLOCKED_DNS_EMPTY,
         SSRF_BLOCKED_DNS_FAILURE, SSRF_BLOCKED_DNS_TIMEOUT, SSRF_BLOCKED_DOMAIN_NOT_ALLOWLISTED,
         SSRF_BLOCKED_FRAGMENT, SSRF_BLOCKED_HOST_HEADER, SSRF_BLOCKED_IP_LITERAL,
         SSRF_BLOCKED_MISSING_HOST, SSRF_BLOCKED_PORT, SSRF_BLOCKED_RESERVED_IP,
@@ -48,6 +49,25 @@ impl Resolve for SequenceDnsResolver {
             .pop_front()
             .expect("DNS response");
         Box::pin(async move { Ok(Box::new(addrs.into_iter()) as Addrs) })
+    }
+}
+
+/// Answers every lookup with `address` after `delay`, counting lookups.
+struct DelayedDnsResolver {
+    delay: Duration,
+    address: SocketAddr,
+    lookups: Arc<AtomicUsize>,
+}
+
+impl Resolve for DelayedDnsResolver {
+    fn resolve(&self, _name: Name) -> Resolving {
+        self.lookups.fetch_add(1, Ordering::Relaxed);
+        let delay = self.delay;
+        let address = self.address;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Ok(Box::new(std::iter::once(address)) as Addrs)
+        })
     }
 }
 
@@ -79,7 +99,6 @@ async fn ssrf_owner_validates_every_connector_resolution() {
             allowed_ports: vec![443],
             max_dns_addresses: 8,
             allow_loopback_ips: false,
-            dns_timeout: Duration::from_secs(1),
         },
         Arc::new(SequenceDnsResolver {
             responses: Mutex::new(VecDeque::from([
@@ -111,14 +130,13 @@ async fn ssrf_preflight_dns_resolution_honors_configured_timeout() {
         allowed_ports: vec![443],
         max_dns_addresses: 8,
         allow_loopback_ips: true,
-        dns_timeout: Duration::ZERO,
     });
     let url = Url::parse("https://localhost/credentials").expect("URL");
 
     let error = protector
-        .resolve_and_validate(&url)
+        .resolve_and_validate(&url, tokio::time::Instant::now())
         .await
-        .expect_err("zero DNS budget must fail closed");
+        .expect_err("exhausted DNS budget must fail closed");
     assert!(matches!(
         error,
         HttpRequestError::SsrfBlocked {
@@ -135,7 +153,6 @@ async fn given_shared_ssrf_owner_when_preflight_and_connector_resolve_then_polic
             allowed_ports: vec![443],
             max_dns_addresses: 8,
             allow_loopback_ips: false,
-            dns_timeout: Duration::from_secs(1),
         },
         Arc::new(SequenceDnsResolver {
             responses: Mutex::new(VecDeque::from([
@@ -147,7 +164,7 @@ async fn given_shared_ssrf_owner_when_preflight_and_connector_resolve_then_polic
     let url = Url::parse("https://approved.example.com/credentials").expect("approved URL");
 
     owner
-        .resolve_and_validate(&url)
+        .resolve_and_validate(&url, one_second_deadline())
         .await
         .expect("preflight should accept the public first answer");
 
@@ -169,7 +186,6 @@ async fn given_site_local_ipv6_destination_when_preflighting_then_blocks_reserve
             allowed_ports: vec![443],
             max_dns_addresses: 8,
             allow_loopback_ips: false,
-            dns_timeout: Duration::from_secs(1),
         },
         Arc::new(SequenceDnsResolver {
             responses: Mutex::new(VecDeque::from([vec![SocketAddr::new(
@@ -182,7 +198,7 @@ async fn given_site_local_ipv6_destination_when_preflighting_then_blocks_reserve
 
     // When the SSRF preflight validates its DNS answer.
     let error = protector
-        .resolve_and_validate(&url)
+        .resolve_and_validate(&url, one_second_deadline())
         .await
         .expect_err("site-local IPv6 DNS answer must be rejected");
 
@@ -208,7 +224,6 @@ async fn given_local_use_nat64_destination_when_preflighting_then_blocks_reserve
             allowed_ports: vec![443],
             max_dns_addresses: 8,
             allow_loopback_ips: false,
-            dns_timeout: Duration::from_secs(1),
         },
         Arc::new(SequenceDnsResolver {
             responses: Mutex::new(VecDeque::from([vec![SocketAddr::new(
@@ -223,7 +238,7 @@ async fn given_local_use_nat64_destination_when_preflighting_then_blocks_reserve
 
     // When the SSRF preflight validates its DNS answer.
     let error = protector
-        .resolve_and_validate(&url)
+        .resolve_and_validate(&url, one_second_deadline())
         .await
         .expect_err("local-use NAT64 IPv6 DNS answer must be rejected");
 
@@ -250,7 +265,6 @@ async fn given_many_dns_answers_when_resolving_then_applies_cap_before_collectin
             allowed_ports: vec![443],
             max_dns_addresses: 2,
             allow_loopback_ips: false,
-            dns_timeout: Duration::from_secs(1),
         },
         Arc::new(CountingDnsResolver {
             yielded: Arc::clone(&yielded),
@@ -575,6 +589,10 @@ async fn run_proxy_bypass_child() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 }
 
+fn one_second_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_secs(1)
+}
+
 fn expect_http_error<T>(result: Result<T, HttpRequestError>, message: &str) -> HttpRequestError {
     match result {
         Ok(_) => panic!("{message}"),
@@ -752,7 +770,6 @@ async fn given_flipping_dns_between_preflights_when_simulating_rebinding_then_se
             allowed_ports: vec![443],
             max_dns_addresses: 8,
             allow_loopback_ips: false,
-            dns_timeout: Duration::from_secs(1),
         },
         Arc::new(SequenceDnsResolver {
             responses: Mutex::new(VecDeque::from([
@@ -765,7 +782,7 @@ async fn given_flipping_dns_between_preflights_when_simulating_rebinding_then_se
 
     // When validation runs against the first answer.
     protector
-        .resolve_and_validate(&url)
+        .resolve_and_validate(&url, one_second_deadline())
         .await
         .expect("public answer validates");
 
@@ -773,7 +790,7 @@ async fn given_flipping_dns_between_preflights_when_simulating_rebinding_then_se
     // validated set (or re-validating, as the connector resolver does on
     // every resolution) closes the window.
     let error = protector
-        .resolve_and_validate(&url)
+        .resolve_and_validate(&url, one_second_deadline())
         .await
         .expect_err("rebound metadata must fail closed");
     assert!(matches!(
@@ -1260,7 +1277,7 @@ async fn tenant_http_client_when_host_is_ip_literal_without_loopback_override_th
 {
     let error = expect_http_error(
         TenantHttpClient::builder("tenant")
-            .allowlist(vec![AllowedDomain::exact("127.0.0.1")])
+            .allowlist(vec![AllowedDomain::exact("example.com")])
             .allowed_schemes(vec!["http".to_string()])
             .allowed_ports(vec![80])
             .build()
@@ -1468,7 +1485,6 @@ async fn given_allowlisted_local_hostname_when_sending_then_uses_custom_dns_reso
             allowed_ports: vec![server.port()],
             max_dns_addresses: 8,
             allow_loopback_ips: true,
-            dns_timeout: Duration::from_secs(1),
         },
         Arc::new(SequenceDnsResolver {
             responses: Mutex::new(VecDeque::from([vec![SocketAddr::from((
@@ -1822,7 +1838,6 @@ async fn given_empty_dns_answer_when_resolving_then_blocks_empty_result() {
             allowed_ports: vec![443],
             max_dns_addresses: 8,
             allow_loopback_ips: false,
-            dns_timeout: Duration::from_secs(1),
         },
         Arc::new(SequenceDnsResolver {
             responses: Mutex::new(VecDeque::from([Vec::new()])),
@@ -1852,7 +1867,6 @@ async fn given_site_local_ipv6_dns_answer_when_resolving_then_blocks_reserved_ip
             allowed_ports: vec![443],
             max_dns_addresses: 8,
             allow_loopback_ips: false,
-            dns_timeout: Duration::from_secs(1),
         },
         Arc::new(SequenceDnsResolver {
             responses: Mutex::new(VecDeque::from([vec![SocketAddr::new(
@@ -1886,7 +1900,6 @@ async fn given_local_use_nat64_dns_answer_when_resolving_then_blocks_reserved_ip
             allowed_ports: vec![443],
             max_dns_addresses: 8,
             allow_loopback_ips: false,
-            dns_timeout: Duration::from_secs(1),
         },
         Arc::new(SequenceDnsResolver {
             responses: Mutex::new(VecDeque::from([vec![SocketAddr::new(
@@ -1981,4 +1994,348 @@ async fn given_fixture_dns_without_loopback_permission_when_tenant_requests_then
         }
     ));
     assert!(server.requests().is_empty());
+}
+
+const RESERVED_PREFIX_ISATAP_PROOFS: [&str; 8] = [
+    "fd00:ec2::5efe:808:808",
+    "fe80::5efe:808:808",
+    "fec0::5efe:808:808",
+    "2002:a9fe:a9fe::5efe:808:808",
+    "2002:7f00:1::5efe:808:808",
+    "2001:0:a9fe:a9fe:0:5efe:808:808",
+    "ff02::5efe:808:808",
+    "2001:db8::5efe:808:808",
+];
+
+#[test]
+fn given_isatap_identifier_under_reserved_ipv6_prefix_when_checking_then_blocks_with_and_without_loopback_opt_in()
+ {
+    // Given ISATAP identifiers wrapping public 8.8.8.8 under reserved prefixes.
+    for address in RESERVED_PREFIX_ISATAP_PROOFS {
+        let ip = address.parse::<IpAddr>().expect("ISATAP proof address");
+
+        // When the resolved address reaches the blocking predicate.
+        // Then the reserved IPv6 range still blocks it; the public embedded
+        // IPv4 address cannot exempt it.
+        assert!(
+            is_blocked_ip(ip, false),
+            "reserved ISATAP leaked: {address}"
+        );
+        assert!(
+            is_blocked_ip(ip, true),
+            "reserved ISATAP leaked with loopback opt-in: {address}"
+        );
+    }
+}
+
+#[test]
+fn given_any_interface_identifier_under_reserved_ipv6_range_when_checking_then_blocks() {
+    // Given every reserved IPv6 range and interface identifiers that embed
+    // public IPv4 addresses (ISATAP with and without the u/l bit) or none.
+    let identifiers: [u128; 5] = [
+        0x0000_5efe_0808_0808,
+        0x0200_5efe_0808_0808,
+        0x0000_0000_0808_0808,
+        0x1234_5678_9abc_def0,
+        0xffff_ffff_ffff_ffff,
+    ];
+    let ranges = RESERVED_IP_RANGES
+        .iter()
+        .filter_map(|range| range.parse::<ipnet::Ipv6Net>().ok());
+    for range in ranges {
+        let network = u128::from(range.network());
+        let host_mask = u128::from(range.hostmask());
+        for identifier in identifiers {
+            let ip = Ipv6Addr::from(network | (identifier & host_mask));
+
+            // When the address reaches the blocking predicate.
+            // Then the range blocks it whatever its identifier; only the
+            // loopback opt-in exempts `::1`.
+            assert!(
+                is_blocked_ip(IpAddr::V6(ip), false),
+                "{ip} escaped reserved range {range}"
+            );
+            assert!(
+                ip.is_loopback() || is_blocked_ip(IpAddr::V6(ip), true),
+                "{ip} escaped reserved range {range} with loopback opt-in"
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_dns_answering_just_inside_budget_when_sending_then_one_deadline_bounds_attempts_and_retries()
+ {
+    // Given DNS that answers after 9.9 s of the default 10 s budget and the
+    // default retry policy, which used to restart the budget per attempt.
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let client = TenantHttpClient::builder("tenant")
+        .allowlist(vec![AllowedDomain::exact("slow.example.test")])
+        .allowed_schemes(vec!["http".to_string()])
+        .allowed_ports(vec![80])
+        .allow_loopback_ips(true)
+        .test_dns_resolver(Arc::new(DelayedDnsResolver {
+            delay: Duration::from_millis(9_900),
+            address: SocketAddr::from(([127, 0, 0, 1], 9)),
+            lookups: Arc::clone(&lookups),
+        }))
+        .build()
+        .expect("tenant client");
+    let started_at = tokio::time::Instant::now();
+
+    // When a retryable GET is sent.
+    let error = expect_http_error(
+        client.get("http://slow.example.test/resource").send().await,
+        "the operation deadline should expire",
+    );
+
+    // Then the first attempt gets only the remaining 100 ms, no retry starts
+    // after the deadline, and the operation ends at the configured budget.
+    assert_eq!(error.kind(), HttpRequestErrorKind::Timeout, "{error:?}");
+    assert_eq!(
+        tokio::time::Instant::now() - started_at,
+        DEFAULT_TENANT_REQUEST_TIMEOUT
+    );
+    assert_eq!(lookups.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_request_timeout_shorter_than_dns_when_sending_then_preflight_stops_at_request_deadline()
+ {
+    // Given DNS slower than an 8 s request timeout.
+    let client = TenantHttpClient::builder("tenant")
+        .allowlist(vec![AllowedDomain::exact("slow.example.test")])
+        .test_dns_resolver(Arc::new(DelayedDnsResolver {
+            delay: Duration::from_millis(9_900),
+            address: SocketAddr::from(([93, 184, 216, 34], 443)),
+            lookups: Arc::new(AtomicUsize::new(0)),
+        }))
+        .build()
+        .expect("tenant client");
+    let started_at = tokio::time::Instant::now();
+
+    // When the request carries its own shorter timeout.
+    let error = expect_http_error(
+        client
+            .get("https://slow.example.test/resource")
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await,
+        "the request deadline should bound DNS preflight",
+    );
+
+    // Then DNS preflight fails closed at that deadline before dispatch.
+    assert!(
+        matches!(
+            error,
+            HttpRequestError::SsrfBlocked {
+                reason: SSRF_BLOCKED_DNS_TIMEOUT
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        tokio::time::Instant::now() - started_at,
+        Duration::from_secs(8)
+    );
+    assert_eq!(
+        error.dispatch_status(),
+        HttpRequestDispatchStatus::NotDispatched
+    );
+}
+
+#[tokio::test]
+async fn given_redirect_chain_with_slow_dns_when_sending_then_one_deadline_bounds_every_hop() {
+    // Given a same-origin 307 loop whose every DNS lookup takes 300 ms, so
+    // each hop costs about 600 ms against a 1 s operation budget.
+    let server = TestServer::spawn(6, |_request_index, _request| {
+        TestResponse::redirect("HTTP/1.1 307 Temporary Redirect", Some("/next".to_string()))
+    });
+    let client = TenantHttpClient::builder("tenant")
+        .allowlist(vec![AllowedDomain::exact("redirect.example.test")])
+        .allowed_schemes(vec!["http".to_string()])
+        .allowed_ports(vec![80])
+        .allow_loopback_ips(true)
+        .timeout(Duration::from_secs(1))
+        .retry(RetryConfig {
+            max_retries: 0,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            retry_non_idempotent: false,
+        })
+        .test_dns_resolver(Arc::new(DelayedDnsResolver {
+            delay: Duration::from_millis(300),
+            address: SocketAddr::from(([127, 0, 0, 1], server.port())),
+            lookups: Arc::new(AtomicUsize::new(0)),
+        }))
+        .build()
+        .expect("tenant client");
+    let started_at = std::time::Instant::now();
+
+    // When the redirect chain is followed.
+    let error = expect_http_error(
+        client
+            .get("http://redirect.example.test/start")
+            .send()
+            .await,
+        "the operation deadline should stop the redirect chain",
+    );
+
+    // Then the deadline stops the chain on a later hop instead of granting
+    // each hop a fresh budget up to the redirect limit.
+    let elapsed = started_at.elapsed();
+    assert!(elapsed < Duration::from_millis(1_500), "took {elapsed:?}");
+    assert!(
+        !matches!(error, HttpRequestError::RedirectBlocked { .. }),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        error.dispatch_status(),
+        HttpRequestDispatchStatus::PossiblyDispatched
+    );
+    assert!(server.requests().len() < 6);
+}
+
+#[tokio::test]
+async fn given_post_redirect_whose_next_hop_rebinds_when_sending_then_reports_possibly_dispatched()
+{
+    // Given a POST whose first hop is delivered and answered with a 307, and
+    // whose next hop's DNS preflight rebinds to a private address.
+    let server = TestServer::spawn(1, |_request_index, _request| {
+        TestResponse::redirect("HTTP/1.1 307 Temporary Redirect", Some("/b".to_string()))
+    });
+    let public = SocketAddr::from(([127, 0, 0, 1], server.port()));
+    let rebound = SocketAddr::from(([10, 0, 0, 1], server.port()));
+    let client = TenantHttpClient::builder("tenant")
+        .allowlist(vec![AllowedDomain::exact("a.example.test")])
+        .allowed_schemes(vec!["http".to_string()])
+        .allowed_ports(vec![80])
+        .allow_loopback_ips(true)
+        .test_dns_resolver(Arc::new(SequenceDnsResolver {
+            responses: Mutex::new(VecDeque::from([vec![public], vec![public], vec![rebound]])),
+        }))
+        .build()
+        .expect("tenant client");
+
+    // When the redirect is followed.
+    let error = expect_http_error(
+        client
+            .post("http://a.example.test/")
+            .body("payload")
+            .send()
+            .await,
+        "the rebound hop should be blocked",
+    );
+
+    // Then the SSRF block is reported as possibly dispatched, because the
+    // POST body already reached the destination on the first hop.
+    assert!(
+        matches!(
+            &error,
+            HttpRequestError::AfterDispatch { source }
+                if matches!(
+                    **source,
+                    HttpRequestError::SsrfBlocked {
+                        reason: SSRF_BLOCKED_RESERVED_IP
+                    }
+                )
+        ),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        error.dispatch_status(),
+        HttpRequestDispatchStatus::PossiblyDispatched
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, b"payload".to_vec());
+}
+
+#[test]
+fn given_empty_subdomain_rule_when_building_then_rejects_allowlist() {
+    // Given the empty subdomain rule that matched every trailing-dot host.
+    let rule = AllowedDomain::with_subdomains("");
+
+    // When the tenant client is built.
+    let error = TenantHttpClient::new("tenant", vec![rule])
+        .err()
+        .expect("empty allowlist entry must fail");
+
+    // Then the allowlist is rejected.
+    assert!(
+        matches!(
+            error,
+            HttpRequestError::SsrfBlocked {
+                reason: SSRF_BLOCKED_ALLOWED_DOMAIN_INVALID
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn given_non_canonical_allowlist_hosts_when_building_then_rejects_each() {
+    // Given entries that a parsed URL host can never equal, or IP literals
+    // without the loopback opt-in.
+    for host in [
+        "",
+        ".",
+        "..",
+        "example.com.",
+        ".example.com",
+        "a..example.com",
+        "Example.com",
+        "b\u{fc}cher.de",
+        "exa%6dple.com",
+        "8.8.8.8",
+        "127.0.0.1",
+        "[::1]",
+        "[2001:db8::1]",
+    ] {
+        for rule in [
+            AllowedDomain::exact(host),
+            AllowedDomain::with_subdomains(host),
+        ] {
+            // When the tenant client is built.
+            let result = TenantHttpClient::new("tenant", vec![rule]);
+
+            // Then the allowlist is rejected.
+            assert!(
+                matches!(
+                    result,
+                    Err(HttpRequestError::SsrfBlocked {
+                        reason: SSRF_BLOCKED_ALLOWED_DOMAIN_INVALID
+                    })
+                ),
+                "accepted allowlist host {host:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn given_canonical_allowlist_hosts_when_building_then_accepts_each() {
+    // Given canonical domains, and loopback literals with the opt-in.
+    for (host, allow_loopback_ips) in [
+        ("example.com", false),
+        ("xn--bcher-kva.de", false),
+        ("127.0.0.1", true),
+        ("[::1]", true),
+    ] {
+        // When the tenant client is built.
+        let result = TenantHttpClient::builder("tenant")
+            .allowlist(vec![AllowedDomain::with_subdomains(host)])
+            .allow_loopback_ips(allow_loopback_ips)
+            .build();
+
+        // Then the allowlist is accepted.
+        assert!(result.is_ok(), "rejected allowlist host {host:?}");
+    }
+
+    // A non-canonical loopback spelling stays rejected even with the opt-in.
+    let result = TenantHttpClient::builder("tenant")
+        .allowlist(vec![AllowedDomain::exact("127.1")])
+        .allow_loopback_ips(true)
+        .build();
+    assert!(result.is_err());
 }

@@ -1,9 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    hint::black_box,
-    sync::Arc,
-    time::Instant,
-};
+use std::{collections::HashMap, hint::black_box, sync::Arc, time::Instant};
 
 use alloc_counter::AllocationGuard;
 use authz_types::{
@@ -13,21 +8,21 @@ use authz_types::{
     RoleActionRef, RoleAssignment, RoleScope, Scope, ScopeMappingEntry, SessionContext,
     StepUpConfig, StepUpRule, Subject, TokenContext, TokenScopeConfig, TokenSubjectBinding,
 };
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
 use crate::{
-    ActionPolicyDecision, EffectiveRoleAssignment, EvaluationRuntime, LocalAuthzEvaluator,
-    LocalBatchEvaluationInput, LocalEvaluationInput, ParentRef, ResourceAccessSnapshot,
-    SnapshotFreshnessPolicy, SubjectAccessSnapshot, TrustedAuthorizationContext,
-    action_policy_decision_bits, best_permission_for_action_with_bits,
+    ActionPolicyDecision, EffectiveRoleAssignment, EvaluationPurpose, EvaluationRuntime,
+    LocalAuthzEvaluator, LocalBatchEvaluationInput, LocalEvaluationInput, ParentRef,
+    ResourceAccessSnapshot, SnapshotFreshnessPolicy, SubjectAccessSnapshot,
+    TrustedAuthorizationContext, action_policy_decision_bits, best_permission_for_action_with_bits,
     build_subject_parent_template, local::inject_internal_context, permissions_for_request_bits,
 };
 
 fn prepare_legacy_internal_context(
     runtime: &EvaluationRuntime,
     input: &LocalEvaluationInput,
-    now: chrono::DateTime<Utc>,
+    now: Timestamp,
 ) -> authz_cedar::PreparedCedarEvaluation {
     let assignments = input.subject_access.active_assignments_at(now);
     let scoped = permissions_for_request_bits(
@@ -38,15 +33,17 @@ fn prepare_legacy_internal_context(
         &input.request.subject,
         &input.subject_access.subject_parents,
     );
-    let internal = crate::local::build_internal_context_at(
+    let internal = crate::local::build_internal_context_at(&crate::local::InternalContextInput {
         runtime,
-        &input.request,
-        &scoped.permissions,
-        input.trusted_context.token_context(),
-        &assignments,
-        input.trusted_context.session_context(),
+        request: &input.request,
+        effective_permissions: &scoped.permissions,
+        token_ctx: input.trusted_context.token_context(),
+        assignments: &assignments,
+        resource_scoped_roles: &crate::RoleBits::default(),
+        session_ctx: input.trusted_context.session_context(),
+        purpose: EvaluationPurpose::Action,
         now,
-    );
+    });
     let mut enriched = crate::enrich_request_with_snapshots_at(
         &input.tenant_id,
         input.request.clone(),
@@ -85,7 +82,7 @@ fn prepare_legacy_internal_context(
 fn prepare_typed_internal_context(
     runtime: &EvaluationRuntime,
     input: &LocalEvaluationInput,
-    now: chrono::DateTime<Utc>,
+    now: Timestamp,
 ) -> authz_cedar::PreparedCedarEvaluation {
     let assignments = input.subject_access.active_assignments_at(now);
     let scoped = permissions_for_request_bits(
@@ -96,16 +93,19 @@ fn prepare_typed_internal_context(
         &input.request.subject,
         &input.subject_access.subject_parents,
     );
-    let internal = crate::local::build_cedar_internal_context_at(
-        runtime,
-        &input.request,
-        &scoped.permissions,
-        input.trusted_context.token_context(),
-        &assignments,
-        input.trusted_context.session_context(),
-        now,
-    )
-    .expect("typed internal context");
+    let internal =
+        crate::local::build_cedar_internal_context_at(&crate::local::InternalContextInput {
+            runtime,
+            request: &input.request,
+            effective_permissions: &scoped.permissions,
+            token_ctx: input.trusted_context.token_context(),
+            assignments: &assignments,
+            resource_scoped_roles: &crate::RoleBits::default(),
+            session_ctx: input.trusted_context.session_context(),
+            purpose: EvaluationPurpose::Action,
+            now,
+        })
+        .expect("typed internal context");
     let enriched = crate::enrich_request_with_snapshots_at(
         &input.tenant_id,
         input.request.clone(),
@@ -213,7 +213,7 @@ fn cedar_diagnostics_log_only_allowlisted_metadata() {
 }
 
 #[test]
-fn build_subject_parent_template_dedupes_parents_and_tracks_resource_scopes() {
+fn build_subject_parent_template_dedupes_parents() {
     let assignments = vec![
         assignment("role_reader", Some("tenant"), None),
         assignment("role_editor", Some("org"), Some("org_1")),
@@ -232,15 +232,8 @@ fn build_subject_parent_template_dedupes_parents_and_tracks_resource_scopes() {
         vec![
             parent("group", "group_1"),
             parent("org", "org_1"),
-            parent("role", "role_doc"),
-            parent("role", "role_editor"),
-            parent("role", "role_reader"),
             parent("tenant", "tenant_1"),
         ]
-    );
-    assert_eq!(
-        template.resource_scopes.get("document"),
-        Some(&HashSet::from(["doc_1".to_string()]))
     );
 }
 
@@ -292,7 +285,7 @@ fn enrich_request_with_snapshots_injects_org_properties_without_storage() {
         &TrustedAuthorizationContext::default(),
         &subject_access,
         &resource_access,
-        Utc::now(),
+        Timestamp::now(),
         crate::SnapshotFreshnessPolicy::for_tests(),
     )
     .expect("snapshot enrichment should succeed");
@@ -345,7 +338,7 @@ fn enrich_request_with_snapshots_rejects_mismatched_resource_snapshot() {
         &TrustedAuthorizationContext::default(),
         &subject_access,
         &resource_access,
-        Utc::now(),
+        Timestamp::now(),
         crate::SnapshotFreshnessPolicy::for_tests(),
     )
     .expect_err("wrong resource snapshot should fail closed");
@@ -390,9 +383,7 @@ fn enrich_request_with_snapshots_rejects_stale_subject_snapshot() {
         &TrustedAuthorizationContext::default(),
         &subject_access,
         &resource_access,
-        Utc.timestamp_millis_opt(600_000)
-            .single()
-            .expect("test timestamp"),
+        Timestamp::from_millisecond(600_000).expect("test timestamp"),
         SnapshotFreshnessPolicy::new(
             std::time::Duration::from_millis(5_000),
             std::time::Duration::from_millis(30),
@@ -442,9 +433,7 @@ fn enrich_request_with_snapshots_rejects_future_resource_snapshot() {
         &TrustedAuthorizationContext::default(),
         &subject_access,
         &resource_access,
-        Utc.timestamp_millis_opt(100_000)
-            .single()
-            .expect("test timestamp"),
+        Timestamp::from_millisecond(100_000).expect("test timestamp"),
         SnapshotFreshnessPolicy::new(
             std::time::Duration::from_secs(60),
             std::time::Duration::from_millis(30),
@@ -472,10 +461,7 @@ fn local_evaluator_default_policy_rejects_stale_snapshots() {
         session_context: None,
         token_context: None,
     };
-    let now = Utc
-        .timestamp_millis_opt(600_000)
-        .single()
-        .expect("test timestamp");
+    let now = Timestamp::from_millisecond(600_000).expect("test timestamp");
     let error = evaluator
         .evaluate_at(
             LocalEvaluationInput {
@@ -536,7 +522,7 @@ fn inject_internal_context_replaces_non_object_context_with_reserved_object() {
 #[test]
 fn typed_internal_context_preserves_non_object_context_normalization() {
     let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
-    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let now = Timestamp::from_second(1_000).expect("timestamp");
     let request = EvaluationRequest {
         subject: Subject::user("user_1"),
         resource: Resource::new("document", "doc_1"),
@@ -578,17 +564,14 @@ fn typed_internal_context_preserves_non_object_context_normalization() {
 
 #[test]
 fn effective_assignments_filter_expired_entries_at_supplied_clock() {
-    let now = Utc
-        .timestamp_opt(1_800_000_000, 0)
-        .single()
-        .expect("test timestamp should be valid");
+    let now = Timestamp::from_second(1_800_000_000).expect("test timestamp should be valid");
     let snapshot = SubjectAccessSnapshot {
         tenant_id: "tenant_1".to_string(),
         subject: Subject::user("user_1"),
         assignments: vec![
             assignment("role_active", Some("tenant"), None),
             EffectiveRoleAssignment {
-                expires_at: Some(now - chrono::Duration::seconds(1)),
+                expires_at: Some(now - jiff::SignedDuration::from_secs(1)),
                 ..assignment("role_expired", Some("tenant"), None)
             },
         ],
@@ -694,7 +677,7 @@ fn complete_jwt_context_can_grant_role_permissions() {
 #[test]
 fn local_evaluator_ignores_wire_jwt_context_without_trusted_context() {
     let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
-    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let now = Timestamp::from_second(1_000).expect("timestamp");
     let request = EvaluationRequest {
         subject: Subject::user("user_1"),
         resource: Resource::new("document", "doc_1"),
@@ -747,7 +730,7 @@ fn local_evaluator_ignores_wire_jwt_context_without_trusted_context() {
 #[test]
 fn local_evaluator_accepts_jwt_only_when_context_is_explicitly_trusted() {
     let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
-    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let now = Timestamp::from_second(1_000).expect("timestamp");
     let jwt_context = JwtContext::complete(
         Vec::new(),
         Vec::new(),
@@ -805,7 +788,7 @@ fn local_evaluator_accepts_jwt_only_when_context_is_explicitly_trusted() {
 #[test]
 fn trusted_context_bound_to_another_subject_is_rejected() {
     let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
-    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let now = Timestamp::from_second(1_000).expect("timestamp");
     let jwt_context = JwtContext::complete(
         Vec::new(),
         Vec::new(),
@@ -899,7 +882,7 @@ fn snapshot_enrichment_ignores_wire_jwt_context_without_trusted_context() {
         &TrustedAuthorizationContext::default(),
         &subject_access,
         &resource_access,
-        Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        Timestamp::from_second(1_000).expect("timestamp"),
         SnapshotFreshnessPolicy::for_tests(),
     )
     .expect("snapshot enrichment");
@@ -955,7 +938,7 @@ fn given_wire_session_and_token_context_without_trusted_context_when_enriching_t
         &TrustedAuthorizationContext::default(),
         &subject_access,
         &resource_access,
-        Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        Timestamp::from_second(1_000).expect("timestamp"),
         SnapshotFreshnessPolicy::for_tests(),
     )
     .expect("wire credentials are not an enrichment source");
@@ -968,7 +951,7 @@ fn given_wire_session_and_token_context_without_trusted_context_when_enriching_t
                 subject_access,
                 resource_access,
             },
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+            Timestamp::from_second(1_000).expect("timestamp"),
         )
         .expect("evaluation");
 
@@ -1022,7 +1005,7 @@ fn mismatched_jwt_resource_roles_are_not_added_to_cedar_parents() {
         &TrustedAuthorizationContext::default(),
         &subject_access,
         &resource_access,
-        Utc::now(),
+        Timestamp::now(),
         crate::SnapshotFreshnessPolicy::for_tests(),
     )
     .expect("snapshot enrichment");
@@ -1059,10 +1042,7 @@ fn off_scope_snapshot_role_parent_cannot_grant_a_tenant_role() {
                         Some("doc_2"),
                     )],
                     subject_parents: vec![parent("role", "reader")],
-                    resource_scopes: HashMap::from([(
-                        "document".to_string(),
-                        HashSet::from(["doc_2".to_string()]),
-                    )]),
+                    resource_scopes: HashMap::new(),
                     fetched_at_ms: 1,
                 },
                 resource_access: ResourceAccessSnapshot {
@@ -1076,7 +1056,7 @@ fn off_scope_snapshot_role_parent_cannot_grant_a_tenant_role() {
                 request,
                 trusted_context: TrustedAuthorizationContext::default(),
             },
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+            Timestamp::from_second(1_000).expect("timestamp"),
         )
         .expect("evaluation");
 
@@ -1117,7 +1097,7 @@ fn given_cross_tenant_snapshot_when_evaluating_then_rejects() {
             request,
             trusted_context: TrustedAuthorizationContext::default(),
         },
-        Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        Timestamp::from_second(1_000).expect("timestamp"),
     );
 
     assert!(matches!(
@@ -1165,7 +1145,7 @@ fn given_role_subject_with_out_of_scope_assignment_when_evaluating_then_denies()
                     fetched_at_ms: 1,
                 },
             },
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+            Timestamp::from_second(1_000).expect("timestamp"),
         )
         .expect("evaluation");
 
@@ -1209,7 +1189,7 @@ fn given_role_subject_without_assignment_when_role_is_tenant_scoped_then_allows(
                     fetched_at_ms: 1,
                 },
             },
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+            Timestamp::from_second(1_000).expect("timestamp"),
         )
         .expect("evaluation");
 
@@ -1283,7 +1263,7 @@ fn given_trusted_group_parent_when_group_assignment_scopes_user_then_allows() {
                     fetched_at_ms: 1,
                 },
             },
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+            Timestamp::from_second(1_000).expect("timestamp"),
         )
         .expect("evaluation");
 
@@ -1334,7 +1314,7 @@ fn given_foreign_group_assignment_without_parent_when_evaluating_then_denies() {
                     fetched_at_ms: 1,
                 },
             },
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+            Timestamp::from_second(1_000).expect("timestamp"),
         )
         .expect("evaluation");
 
@@ -1396,7 +1376,7 @@ fn public_resource_does_not_allow_undeclared_read_action() {
         request,
         trusted_context: TrustedAuthorizationContext::default(),
     };
-    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let now = Timestamp::from_second(1_000).expect("timestamp");
 
     let response = evaluator.evaluate_at(input, now).expect("evaluation");
 
@@ -1420,7 +1400,7 @@ fn caller_resource_org_cannot_override_snapshot_org_for_org_scope() {
         session_context: None,
         token_context: None,
     };
-    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let now = Timestamp::from_second(1_000).expect("timestamp");
 
     let response = evaluator
         .evaluate_at(
@@ -1496,7 +1476,8 @@ fn given_empty_action_batch_when_evaluating_then_returns_no_decisions() {
                 subject_access: &subject_access,
                 resource_access: &resource_access,
             },
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+            EvaluationPurpose::Action,
+            Timestamp::from_second(1_000).expect("timestamp"),
         )
         .expect("empty batches are a valid no-op");
 
@@ -1554,10 +1535,7 @@ fn given_token_bound_to_another_org_when_evaluating_then_denies_before_policy() 
 
     // When evaluating the organization-bound request.
     let response = evaluator
-        .evaluate_at(
-            input,
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
-        )
+        .evaluate_at(input, Timestamp::from_second(1_000).expect("timestamp"))
         .expect("token organization mismatch is a deny response");
 
     // Then the token ceiling rejects before Cedar can evaluate the policy.
@@ -1617,10 +1595,7 @@ fn given_subject_token_without_owner_org_assignment_when_evaluating_then_denies(
 
     // When evaluating the request with a tenant-only owner snapshot.
     let response = evaluator
-        .evaluate_at(
-            input,
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
-        )
+        .evaluate_at(input, Timestamp::from_second(1_000).expect("timestamp"))
         .expect("owner organization mismatch is a deny response");
 
     // Then an org-bound token cannot elevate a tenant-only owner.
@@ -1647,16 +1622,19 @@ fn given_session_context_when_building_internal_context_then_preserves_trusted_a
     let session = SessionContext::with_mfa(900, 950, "otp");
 
     // When translating the session into Cedar's typed internal context.
-    let internal = crate::local::build_cedar_internal_context_at(
-        &runtime,
-        &request,
-        &crate::PermissionBits::default(),
-        None,
-        &[],
-        Some(&session),
-        Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
-    )
-    .expect("session context should be representable");
+    let internal =
+        crate::local::build_cedar_internal_context_at(&crate::local::InternalContextInput {
+            runtime: &runtime,
+            request: &request,
+            effective_permissions: &crate::PermissionBits::default(),
+            token_ctx: None,
+            assignments: &[],
+            resource_scoped_roles: &crate::RoleBits::default(),
+            session_ctx: Some(&session),
+            purpose: EvaluationPurpose::Action,
+            now: Timestamp::from_second(1_000).expect("timestamp"),
+        })
+        .expect("session context should be representable");
 
     // Then Cedar receives the assurance level, methods, and non-negative ages.
     assert!(internal.session_present);
@@ -1704,7 +1682,7 @@ fn given_non_positive_snapshot_timestamp_when_enriching_then_rejects_timestamp()
         &TrustedAuthorizationContext::default(),
         &subject_access,
         &resource_access,
-        Utc.timestamp_millis_opt(1_000).single().expect("timestamp"),
+        Timestamp::from_millisecond(1_000).expect("timestamp"),
         SnapshotFreshnessPolicy::default(),
     )
     .expect_err("non-positive snapshot timestamps must fail closed");
@@ -1754,7 +1732,7 @@ fn given_subject_snapshot_for_another_subject_when_enriching_then_rejects() {
         &TrustedAuthorizationContext::default(),
         &subject_access,
         &resource_access,
-        Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        Timestamp::from_second(1_000).expect("timestamp"),
         SnapshotFreshnessPolicy::for_tests(),
     )
     .expect_err("subject snapshot mismatch must fail closed");
@@ -1802,7 +1780,7 @@ fn given_resource_snapshot_from_another_tenant_when_enriching_then_rejects() {
         &TrustedAuthorizationContext::default(),
         &subject_access,
         &resource_access,
-        Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        Timestamp::from_second(1_000).expect("timestamp"),
         SnapshotFreshnessPolicy::for_tests(),
     )
     .expect_err("cross-tenant resource snapshots must fail closed");
@@ -1815,7 +1793,7 @@ fn given_resource_snapshot_from_another_tenant_when_enriching_then_rejects() {
 }
 
 #[test]
-fn given_resource_scoped_trusted_role_when_enriching_then_copies_resource_org_to_subject() {
+fn given_resource_scoped_snapshot_when_enriching_then_does_not_copy_resource_org_to_subject() {
     // Given a trusted resource-scoped role and authoritative resource org.
     let subject = Subject::user("user_1").with_properties(json!({"department": "engineering"}));
     let request = EvaluationRequest {
@@ -1833,10 +1811,7 @@ fn given_resource_scoped_trusted_role_when_enriching_then_copies_resource_org_to
         subject,
         assignments: Vec::new(),
         subject_parents: Vec::new(),
-        resource_scopes: HashMap::from([(
-            "document".to_string(),
-            HashSet::from(["doc_1".to_string()]),
-        )]),
+        resource_scopes: HashMap::new(),
         fetched_at_ms: 1,
     };
     let resource_access = ResourceAccessSnapshot {
@@ -1855,16 +1830,17 @@ fn given_resource_scoped_trusted_role_when_enriching_then_copies_resource_org_to
         &TrustedAuthorizationContext::default(),
         &subject_access,
         &resource_access,
-        Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        Timestamp::from_second(1_000).expect("timestamp"),
         SnapshotFreshnessPolicy::for_tests(),
     )
     .expect("resource-scoped snapshot should enrich");
 
-    // Then caller-supplied resource properties are replaced and subject org is
-    // derived safely.
+    // Then caller-supplied resource properties are replaced, and a resource
+    // grant does not become org membership shared by every role (a role
+    // granted on this resource satisfies its own org scope in Cedar instead).
     assert_eq!(
         enriched.request.subject.properties,
-        Some(json!({"department": "engineering", "org_id": "org_1"}))
+        Some(json!({"department": "engineering"}))
     );
     assert_eq!(
         enriched.request.resource.properties,
@@ -1873,7 +1849,7 @@ fn given_resource_scoped_trusted_role_when_enriching_then_copies_resource_org_to
 }
 
 #[test]
-fn given_trusted_jwt_org_and_resource_roles_when_enriching_then_adds_only_applicable_parents() {
+fn given_trusted_jwt_org_and_resource_roles_when_enriching_then_adds_only_scope_parents() {
     // Given trusted JWT roles covering this resource's authoritative
     // organization and id.
     let subject = Subject::user("user_1");
@@ -1935,28 +1911,19 @@ fn given_trusted_jwt_org_and_resource_roles_when_enriching_then_adds_only_applic
         &TrustedAuthorizationContext::from_validated_parts(&subject, Some(jwt_context), None, None),
         &subject_access,
         &resource_access,
-        Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        Timestamp::from_second(1_000).expect("timestamp"),
         SnapshotFreshnessPolicy::for_tests(),
     )
     .expect("trusted JWT role scopes should enrich");
 
-    // Then matching org/resource roles are present, while group roles remain
-    // unsupported here.
+    // Then the matching org scope is a parent, while role membership is left
+    // to the evaluator's covering-role set.
     assert!(enriched.subject_parents.contains(&parent("org", "org_1")));
-    assert!(
-        enriched
-            .subject_parents
-            .contains(&parent("role", "org_reader"))
-    );
-    assert!(
-        enriched
-            .subject_parents
-            .contains(&parent("role", "document_reader"))
-    );
     assert!(
         !enriched
             .subject_parents
-            .contains(&parent("role", "group_reader"))
+            .iter()
+            .any(|parent| parent.ref_type == "role")
     );
 }
 
@@ -2056,7 +2023,7 @@ fn given_scope_mapping_cycle_when_resolving_token_then_unions_each_scope_once() 
     let resolved = runtime.resolve_token_permissions_at(
         &user_permissions,
         &token,
-        Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        Timestamp::from_second(1_000).expect("timestamp"),
     );
 
     // Then both reachable permissions are retained and cycle traversal
@@ -2088,7 +2055,7 @@ fn given_persisted_scope_ceiling_when_live_mapping_gains_permission_then_existin
     let resolved = runtime.resolve_token_permissions_at(
         &user_permissions,
         &token,
-        Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        Timestamp::from_second(1_000).expect("timestamp"),
     );
 
     // Then the persisted read ceiling remains authoritative and write stays
@@ -2134,7 +2101,7 @@ fn given_wildcard_fine_grained_permission_when_resource_bucket_matches_then_allo
     let resolved = runtime.resolve_token_permissions_at(
         &user_permissions,
         &token,
-        Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        Timestamp::from_second(1_000).expect("timestamp"),
     );
 
     // Then the wildcard is accepted only for the declared resource bucket.
@@ -2167,7 +2134,7 @@ fn given_wildcard_fine_grained_permission_when_resource_bucket_differs_then_deni
     let resolved = runtime.resolve_token_permissions_at(
         &user_permissions,
         &token,
-        Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+        Timestamp::from_second(1_000).expect("timestamp"),
     );
 
     // Then wildcard grants document:read but never the unrelated project:read
@@ -2189,10 +2156,7 @@ fn given_default_snapshot_policy_when_age_and_future_skew_reach_boundaries_then_
         session_context: None,
         token_context: None,
     };
-    let now = Utc
-        .timestamp_millis_opt(1_000_000)
-        .single()
-        .expect("timestamp");
+    let now = Timestamp::from_millisecond(1_000_000).expect("timestamp");
     let enrich = |subject_fetched_at_ms, resource_fetched_at_ms| {
         crate::enrich_request_with_snapshots_at(
             "tenant_1",
@@ -2581,7 +2545,7 @@ fn prepared_local_batch_frame_profile() {
 
     for cardinality in [1, 4, 16] {
         let evaluator = LocalAuthzEvaluator::new(runtime_with_batch_actions(cardinality));
-        let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+        let now = Timestamp::from_second(1_000).expect("timestamp");
         let subject_access = SubjectAccessSnapshot {
             tenant_id: "tenant_1".to_string(),
             subject: Subject::user("user_1"),
@@ -2634,6 +2598,7 @@ fn prepared_local_batch_frame_profile() {
                         subject_access: &subject_access,
                         resource_access: &resource_access,
                     },
+                    EvaluationPurpose::Action,
                     now,
                 )
                 .expect("batch evaluation");
@@ -2653,7 +2618,7 @@ fn prepared_local_batch_frame_profile() {
 fn prepared_local_batch_matches_individual_action_evaluations() {
     let cardinality = 4;
     let evaluator = LocalAuthzEvaluator::new(runtime_with_batch_actions(cardinality));
-    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let now = Timestamp::from_second(1_000).expect("timestamp");
     let subject_access = SubjectAccessSnapshot {
         tenant_id: "tenant_1".to_string(),
         subject: Subject::user("user_1"),
@@ -2711,6 +2676,7 @@ fn prepared_local_batch_matches_individual_action_evaluations() {
                 subject_access: &subject_access,
                 resource_access: &resource_access,
             },
+            EvaluationPurpose::Action,
             now,
         )
         .expect("prepared batch evaluation");
@@ -2761,7 +2727,8 @@ fn prepared_local_batch_uses_the_explicit_action_sequence() {
                 subject_access,
                 resource_access,
             },
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+            EvaluationPurpose::Action,
+            Timestamp::from_second(1_000).expect("timestamp"),
         )
         .expect("batch evaluation");
     assert_eq!(result.len(), 2);
@@ -2810,7 +2777,8 @@ fn oversized_local_batches_are_rejected_before_evaluation() {
                 subject_access: &subject_access,
                 resource_access: &resource_access,
             },
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+            EvaluationPurpose::Action,
+            Timestamp::from_second(1_000).expect("timestamp"),
         )
         .expect_err("oversized batches must be bounded");
 
@@ -2820,7 +2788,7 @@ fn oversized_local_batches_are_rejected_before_evaluation() {
 #[test]
 fn token_expiry_given_reused_subject_snapshot_then_never_reuses_prior_allow_decision() {
     let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
-    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let now = Timestamp::from_second(1_000).expect("timestamp");
     let input = |expires_at| LocalEvaluationInput {
         tenant_id: "tenant_1".to_string(),
         request: EvaluationRequest {
@@ -2881,7 +2849,7 @@ fn token_expiry_given_reused_subject_snapshot_then_never_reuses_prior_allow_deci
 #[test]
 fn token_expiry_at_exact_evaluation_second_is_denied() {
     let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
-    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let now = Timestamp::from_second(1_000).expect("timestamp");
     let result = evaluator
         .evaluate_at(
             LocalEvaluationInput {
@@ -2939,7 +2907,7 @@ fn token_expiry_at_exact_evaluation_second_is_denied() {
 #[test]
 fn token_variants_given_reused_subject_snapshot_then_each_decision_uses_current_token_context() {
     let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
-    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let now = Timestamp::from_second(1_000).expect("timestamp");
     let subject_access = SubjectAccessSnapshot {
         tenant_id: "tenant_1".to_string(),
         subject: Subject::user("user_1"),
@@ -3043,7 +3011,7 @@ fn token_variants_given_reused_subject_snapshot_then_each_decision_uses_current_
 #[test]
 fn given_token_owned_by_another_subject_when_evaluating_then_request_is_denied() {
     let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
-    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let now = Timestamp::from_second(1_000).expect("timestamp");
     let result = evaluator
         .evaluate_at(
             LocalEvaluationInput {
@@ -3147,7 +3115,7 @@ fn given_non_user_subject_when_bound_token_owner_matches_then_denies() {
                     fetched_at_ms: 1,
                 },
             },
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+            Timestamp::from_second(1_000).expect("timestamp"),
         )
         .expect("matching owner id is still a deny response");
 
@@ -3205,7 +3173,7 @@ fn fine_grained_token_must_cover_the_permission_action_resource_type() {
     });
     let mut user_permissions = crate::PermissionBits::default();
     user_permissions.set(0);
-    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let now = Timestamp::from_second(1_000).expect("timestamp");
 
     let alpha_bucket = TokenContext {
         token_id: "token-alpha".into(),
@@ -3308,7 +3276,7 @@ fn given_selected_id_shared_by_two_resource_types_when_token_is_untyped_then_den
     let result = evaluator
         .evaluate_at(
             input(vec!["shared-id".to_string()]),
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+            Timestamp::from_second(1_000).expect("timestamp"),
         )
         .expect("evaluation");
 
@@ -3324,7 +3292,7 @@ fn given_selected_id_shared_by_two_resource_types_when_token_is_untyped_then_den
     let typed_result = evaluator
         .evaluate_at(
             input(vec!["project:shared-id".to_string()]),
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+            Timestamp::from_second(1_000).expect("timestamp"),
         )
         .expect("typed selection evaluation");
     assert!(
@@ -3391,10 +3359,7 @@ fn given_org_permission_for_another_org_when_evaluating_then_token_ceiling_denie
     };
 
     let result = evaluator
-        .evaluate_at(
-            input,
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
-        )
+        .evaluate_at(input, Timestamp::from_second(1_000).expect("timestamp"))
         .expect("evaluation");
 
     assert!(
@@ -3464,7 +3429,7 @@ fn given_org_permission_for_target_org_when_evaluating_then_token_ceiling_allows
                     fetched_at_ms: 1,
                 },
             },
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+            Timestamp::from_second(1_000).expect("timestamp"),
         )
         .expect("evaluation");
 
@@ -3477,7 +3442,7 @@ fn given_org_permission_for_target_org_when_evaluating_then_token_ceiling_allows
 #[test]
 fn borrowed_and_owned_local_inputs_have_identical_decisions() {
     let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
-    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let now = Timestamp::from_second(1_000).expect("timestamp");
     let request = EvaluationRequest {
         subject: Subject::user("user_1"),
         resource: Resource::new("document", "doc_1"),
@@ -3559,10 +3524,7 @@ fn borrowed_local_input_avoids_snapshot_clones_profile() {
         subject_parents: (0..64)
             .map(|index| parent("role", &format!("reader_{index}")))
             .collect(),
-        resource_scopes: HashMap::from([(
-            "document".to_string(),
-            (0..64).map(|index| format!("doc_{index}")).collect(),
-        )]),
+        resource_scopes: HashMap::new(),
         fetched_at_ms: 1,
     };
     let resource_access = ResourceAccessSnapshot {
@@ -3677,7 +3639,7 @@ fn typed_internal_context_avoids_json_round_trip_profile() {
     const ITERATIONS: usize = 2_000;
 
     let runtime = runtime_with_read_role();
-    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let now = Timestamp::from_second(1_000).expect("timestamp");
     let request = EvaluationRequest {
         subject: Subject::user("user_1").with_properties(json!({
             "department": "engineering"
@@ -4038,7 +4000,7 @@ fn given_reader_snapshot_when_evaluating_via_convenience_api_then_allows_and_rep
 
     // When the public convenience API evaluates the request.
     let response = evaluator
-        .evaluate(reader_input("read", Utc::now().timestamp_millis()))
+        .evaluate(reader_input("read", Timestamp::now().as_millisecond()))
         .expect("trusted snapshots should evaluate");
 
     // Then the reader is allowed and the effective permission is identified.
@@ -4182,7 +4144,7 @@ fn given_same_subject_id_with_different_types_when_resolving_permissions_then_de
 fn given_declared_read_and_unknown_delete_when_evaluating_then_only_read_is_allowed() {
     // Given a reader runtime and deterministic snapshots.
     let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role());
-    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let now = Timestamp::from_second(1_000).expect("timestamp");
 
     // When the declared action and an unknown action are evaluated through the
     // runtime boundary.
@@ -4216,7 +4178,7 @@ fn given_unknown_role_assignment_when_evaluating_then_known_role_still_grants() 
         assignment("unknown_role", Some("tenant"), None),
         assignment("reader", Some("tenant"), None),
     ];
-    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let now = Timestamp::from_second(1_000).expect("timestamp");
 
     // When the public local evaluator resolves the assignment snapshot.
     let response = evaluator.evaluate_at(input, now).expect("evaluation");
@@ -4246,10 +4208,7 @@ fn given_tenant_assignment_without_principal_when_evaluating_then_grants_to_requ
 
     // When the public local evaluator resolves this assignment.
     let response = evaluator
-        .evaluate_at(
-            input,
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
-        )
+        .evaluate_at(input, Timestamp::from_second(1_000).expect("timestamp"))
         .expect("shared assignment evaluation");
 
     // Then a principal-less tenant assignment remains grant-capable.
@@ -4339,10 +4298,7 @@ fn given_trusted_jwt_role_scopes_when_evaluating_then_only_applicable_scopes_gra
         input.trusted_context = trusted_context;
 
         let response = evaluator
-            .evaluate_at(
-                input,
-                Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
-            )
+            .evaluate_at(input, Timestamp::from_second(1_000).expect("timestamp"))
             .unwrap_or_else(|_| panic!("{label} evaluation failed"));
 
         // Then only the role scope that covers this resource can grant.
@@ -4364,10 +4320,7 @@ fn given_unknown_resource_type_when_evaluating_public_read_then_denies() {
 
     // When the local evaluator handles the undeclared public-read request.
     let response = evaluator
-        .evaluate_at(
-            input,
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
-        )
+        .evaluate_at(input, Timestamp::from_second(1_000).expect("timestamp"))
         .expect("unknown resource is a normal denial");
 
     // Then absence from the catalog fails closed even for a read action.
@@ -4398,7 +4351,8 @@ fn given_mixed_batch_with_unknown_action_when_evaluating_then_preliminary_denial
                 subject_access: input.subject_access,
                 resource_access: input.resource_access,
             },
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+            EvaluationPurpose::Action,
+            Timestamp::from_second(1_000).expect("timestamp"),
         )
         .expect("mixed batch evaluation");
 
@@ -4424,7 +4378,7 @@ fn given_read_permission_requiring_mfa_when_evaluating_without_session_then_chal
     let response = evaluator
         .evaluate_at(
             reader_input("read", 1),
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+            Timestamp::from_second(1_000).expect("timestamp"),
         )
         .expect("step-up is a normal response");
 
@@ -4455,10 +4409,7 @@ fn given_resource_scoped_assignment_when_evaluating_then_only_matching_snapshot_
         input.subject_access.subject_parents = vec![parent("role", "reader")];
 
         evaluator
-            .evaluate_at(
-                input,
-                Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
-            )
+            .evaluate_at(input, Timestamp::from_second(1_000).expect("timestamp"))
             .expect("resource-scoped evaluation")
     };
 
@@ -4532,10 +4483,7 @@ fn given_subject_token_owner_has_target_org_assignment_when_evaluating_then_allo
 
     // When evaluating at the supplied clock.
     let response = evaluator
-        .evaluate_at(
-            input,
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
-        )
+        .evaluate_at(input, Timestamp::from_second(1_000).expect("timestamp"))
         .expect("matching token owner org is a normal evaluation");
 
     // Then the owner-org check and token ceiling both permit the grant.
@@ -4548,7 +4496,7 @@ fn given_delegated_org_token_when_target_org_matches_then_allows_without_owner_a
     // and has no corresponding organization assignment in the subject snapshot.
     let evaluator = LocalAuthzEvaluator::new(runtime_with_org_manage_role());
     let subject = Subject::user("user_1");
-    let now = Utc.timestamp_opt(1_000, 0).single().expect("timestamp");
+    let now = Timestamp::from_second(1_000).expect("timestamp");
     let evaluate_for_org = |org_id: &str| {
         evaluator
             .evaluate_at(
@@ -4634,7 +4582,7 @@ fn given_role_not_action_for_read_when_evaluating_then_denies_before_cedar() {
     let response = evaluator
         .evaluate_at(
             reader_input("read", 1),
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+            Timestamp::from_second(1_000).expect("timestamp"),
         )
         .expect("role denial is a normal response");
 
@@ -4799,9 +4747,419 @@ fn evaluate_direct_reader(
         token,
     );
     evaluator
-        .evaluate_at(
+        .evaluate_at(input, Timestamp::from_second(1_000).expect("timestamp"))
+        .expect("evaluation")
+}
+
+fn runtime_with_document_roles(roles: &[(&str, &str, Scope)]) -> EvaluationRuntime {
+    let permission = |action: &str| authz_types::Permission {
+        id: format!("document:{action}"),
+        name: format!("Document {action}"),
+        description: None,
+        actions: vec![PermissionActionRef {
+            resource_type: "document".into(),
+            action_name: action.into(),
+        }],
+        not_actions: vec![],
+    };
+    let mfa_rule = StepUpRule {
+        applies_to_api_keys: false,
+        ..StepUpRule::require_acr("mfa", "Require MFA", AcrLevel::MultiFactor)
+    };
+    build_runtime(ConfigurationModel {
+        version: 1,
+        resource_types: vec![authz_types::ResourceType {
+            id: "document".into(),
+            name: "Document".into(),
+            description: None,
+            actions: ["read", "delete"]
+                .into_iter()
+                .map(|name| authz_types::ActionDefinition {
+                    name: name.into(),
+                    description: None,
+                })
+                .collect(),
+            context_schema: None,
+        }],
+        permissions: vec![permission("read"), permission("delete")],
+        roles: roles
+            .iter()
+            .map(|(role_id, action, scope)| authz_types::Role {
+                id: (*role_id).into(),
+                name: (*role_id).into(),
+                description: None,
+                permissions: vec![authz_types::RolePermission {
+                    permission_id: PermissionId::new(format!("document:{action}"))
+                        .expect("permission id"),
+                    scopes: vec![scope.clone()],
+                }],
+                actions: vec![],
+                not_actions: vec![],
+                assignment_policy: permanent_assignment_policy(),
+            })
+            .collect(),
+        scope_mappings: vec![],
+        authn_providers: vec![],
+        step_up_rules: vec![mfa_rule],
+        step_up_config: HashMap::from([(
+            "document".to_string(),
+            StepUpConfig {
+                default_rule: None,
+                action_rules: HashMap::from([("delete".to_string(), "mfa".to_string())]),
+            },
+        )]),
+        default_step_up_rule: None,
+        description: None,
+    })
+}
+
+struct DocumentRequest<'a> {
+    action: &'a str,
+    resource_id: &'a str,
+    resource_properties: serde_json::Value,
+    assignments: Vec<EffectiveRoleAssignment>,
+    subject_parents: Vec<ParentRef>,
+    trusted_context: TrustedAuthorizationContext,
+}
+
+impl DocumentRequest<'_> {
+    fn evaluate(self, runtime: EvaluationRuntime) -> authz_types::EvaluationResponse {
+        let request = EvaluationRequest {
+            subject: Subject::user("user_1"),
+            resource: Resource::new("document", self.resource_id),
+            action: Action::new(self.action),
+            context: None,
+            jwt_context: None,
+            session_context: None,
+            token_context: None,
+        };
+        // Mirror an AuxFn-built snapshot, which lists a role parent for every
+        // assignment wherever it applies, plus resource-scope facts.
+        let template = build_subject_parent_template(&self.assignments, &[], "tenant_1");
+        let mut subject_parents = self.subject_parents;
+        subject_parents.extend(template.parents);
+        subject_parents.extend(
+            self.assignments
+                .iter()
+                .map(|assignment| parent("role", &assignment.role_id)),
+        );
+        LocalAuthzEvaluator::new(runtime)
+            .evaluate_at(
+                LocalEvaluationInput {
+                    tenant_id: "tenant_1".to_string(),
+                    subject_access: SubjectAccessSnapshot {
+                        tenant_id: "tenant_1".to_string(),
+                        subject: request.subject.clone(),
+                        assignments: self.assignments,
+                        subject_parents,
+                        resource_scopes: HashMap::new(),
+                        fetched_at_ms: 1,
+                    },
+                    resource_access: ResourceAccessSnapshot {
+                        tenant_id: "tenant_1".to_string(),
+                        resource_type: "document".to_string(),
+                        resource_id: self.resource_id.to_string(),
+                        properties: self.resource_properties,
+                        resource_parents: vec![],
+                        fetched_at_ms: 1,
+                    },
+                    request,
+                    trusted_context: self.trusted_context,
+                },
+                Timestamp::from_second(1_000).expect("timestamp"),
+            )
+            .expect("evaluation")
+    }
+}
+
+fn read_document(resource_id: &str, resource_properties: serde_json::Value) -> DocumentRequest<'_> {
+    DocumentRequest {
+        action: "read",
+        resource_id,
+        resource_properties,
+        assignments: Vec::new(),
+        subject_parents: Vec::new(),
+        trusted_context: TrustedAuthorizationContext::default(),
+    }
+}
+
+#[test]
+fn given_own_scope_role_covering_and_tenant_role_assigned_elsewhere_when_reading_then_denies() {
+    // Given `owner_reader` (Own) tenant-wide and `reader` (Tenant) assigned
+    // only on doc_2, with both roles also present as snapshot role parents.
+    let runtime = runtime_with_document_roles(&[
+        ("owner_reader", "read", Scope::Own),
+        ("reader", "read", Scope::Tenant),
+    ]);
+    let mut request = read_document("doc_1", json!({"owner_id": "someone_else"}));
+    request.assignments = vec![
+        assignment("owner_reader", None, None),
+        assignment("reader", Some("resource:document"), Some("doc_2")),
+    ];
+
+    // When reading doc_1, which the subject does not own.
+    let response = request.evaluate(runtime);
+
+    // Then `owner_reader` passes the bit gate but fails its Own guard, and
+    // `reader` cannot lend its Tenant scope because it does not cover doc_1.
+    assert!(!response.decision, "roles must not mix: {response:?}");
+}
+
+#[test]
+fn given_org_admin_for_org_a_and_tenant_own_role_when_reading_org_b_document_then_denies() {
+    // Given `admin` (Tenant scope) assigned for org_a and a tenant-wide
+    // `owner_reader` (Own) that also grants read.
+    let runtime = runtime_with_document_roles(&[
+        ("owner_reader", "read", Scope::Own),
+        ("admin", "read", Scope::Tenant),
+    ]);
+    let assignments = vec![
+        assignment("owner_reader", None, None),
+        assignment("admin", Some("org"), Some("org_a")),
+    ];
+    let org_b = {
+        let mut request = read_document("doc_b", json!({"org_id": "org_b", "owner_id": "x"}));
+        request.assignments = assignments.clone();
+        request
+    };
+    let org_a = {
+        let mut request = read_document("doc_a", json!({"org_id": "org_a", "owner_id": "x"}));
+        request.assignments = assignments;
+        request
+    };
+
+    // When reading a document in each org.
+    let org_b_response = org_b.evaluate(runtime_with_document_roles(&[
+        ("owner_reader", "read", Scope::Own),
+        ("admin", "read", Scope::Tenant),
+    ]));
+    let org_a_response = org_a.evaluate(runtime);
+
+    // Then the org_a admin grant does not extend to org_b, but still applies
+    // in org_a.
+    assert!(
+        !org_b_response.decision,
+        "admin for org_a must not cover org_b"
+    );
+    assert!(org_a_response.decision, "admin for org_a covers org_a");
+}
+
+#[test]
+fn given_role_parent_without_assignment_when_reading_then_denies() {
+    // Given a tenant-wide `owner_reader` (Own) and relationship-derived role
+    // parents for `reader` in every spelling Cedar canonicalizes to Role.
+    for role_type in ["role", "Role", "_role"] {
+        let runtime = runtime_with_document_roles(&[
+            ("owner_reader", "read", Scope::Own),
+            ("reader", "read", Scope::Tenant),
+        ]);
+        let mut request = read_document("doc_1", json!({"owner_id": "someone_else"}));
+        request.assignments = vec![assignment("owner_reader", None, None)];
+        request.subject_parents = vec![parent(role_type, "reader")];
+
+        // When reading a document the subject does not own.
+        let response = request.evaluate(runtime);
+
+        // Then a role parent without a covering assignment grants nothing.
+        assert!(!response.decision, "{role_type} parent must not grant");
+    }
+}
+
+#[test]
+fn given_resource_grant_with_org_scope_when_reading_then_only_that_role_gets_org_scope() {
+    // Given `collaborator` (Org) assigned on doc_1 and a tenant-wide
+    // `org_writer` (Org) for delete, with no org membership.
+    let runtime = || {
+        runtime_with_document_roles(&[
+            ("collaborator", "read", Scope::Org),
+            ("org_writer", "delete", Scope::Org),
+        ])
+    };
+    let request = |action| {
+        let mut request = read_document("doc_1", json!({"org_id": "org_1"}));
+        request.action = action;
+        request.assignments = vec![
+            assignment("collaborator", Some("resource:document"), Some("doc_1")),
+            assignment("org_writer", None, None),
+        ];
+        request.trusted_context = TrustedAuthorizationContext::from_validated_parts(
+            &Subject::user("user_1"),
+            None,
+            Some(SessionContext::with_mfa(990, 995, "otp")),
+            None,
+        );
+        request
+    };
+
+    // When reading and deleting doc_1.
+    let read = request("read").evaluate(runtime());
+    let delete = request("delete").evaluate(runtime());
+
+    // Then the resource grant satisfies the collaborator's own org scope, but
+    // does not make the subject an org member for `org_writer`.
+    assert!(read.decision, "resource grant satisfies its own org scope");
+    assert!(
+        !delete.decision,
+        "resource grant must not lend org membership"
+    );
+}
+
+#[test]
+fn given_delegated_service_token_when_step_up_exempts_api_keys_then_subject_session_is_challenged()
+{
+    // Given delete requires MFA except for API keys, and the subject holds a
+    // role granting delete with only a password session.
+    let subject = Subject::user("user_1");
+    let request = |token: TokenContext| {
+        let mut request = read_document("doc_1", json!({}));
+        request.action = "delete";
+        request.assignments = vec![assignment("deleter", None, None)];
+        request.trusted_context = TrustedAuthorizationContext::from_validated_parts(
+            &subject,
+            None,
+            Some(SessionContext::password_only(990)),
+            Some(token),
+        );
+        request
+    };
+    let runtime = || runtime_with_document_roles(&[("deleter", "delete", Scope::Tenant)]);
+
+    // When a delegated service token evaluates for the subject, and when the
+    // subject's own API key is used.
+    let delegated = request(TokenContext::delegated(
+        "svc".into(),
+        "creator".into(),
+        TokenScopeConfig::full_access(),
+    ))
+    .evaluate(runtime());
+    let subject_key = request(TokenContext::new(
+        "key".into(),
+        "user_1".into(),
+        TokenScopeConfig::full_access(),
+    ))
+    .evaluate(runtime());
+
+    // Then only the subject-bound API key is exempt from step-up.
+    assert!(!delegated.decision);
+    assert_eq!(
+        delegated.context.and_then(|context| context.reason),
+        Some("step_up:mfa".to_string())
+    );
+    assert!(subject_key.decision, "subject API key stays exempt");
+}
+
+#[test]
+fn given_incomplete_jwt_resource_role_when_reading_then_resource_scope_is_not_granted() {
+    // Given `editor` (Resource scope) assigned on doc_2, a tenant-wide
+    // `owner_reader` (Own), and an incomplete JWT naming editor on doc_9.
+    let runtime = runtime_with_document_roles(&[
+        ("owner_reader", "read", Scope::Own),
+        ("editor", "read", Scope::resource("document")),
+    ]);
+    let subject = Subject::user("user_1");
+    let mut request = read_document("doc_9", json!({"owner_id": "someone_else"}));
+    request.assignments = vec![
+        assignment("owner_reader", None, None),
+        assignment("editor", Some("resource:document"), Some("doc_2")),
+    ];
+    request.trusted_context = TrustedAuthorizationContext::from_validated_parts(
+        &subject,
+        Some(JwtContext {
+            roles: vec![RoleAssignment {
+                role_id: "editor".to_string(),
+                scope: RoleScope::Resource {
+                    resource_type: "document".to_string(),
+                    resource_id: "doc_9".to_string(),
+                },
+            }],
+            ..JwtContext::default()
+        }),
+        None,
+        None,
+    );
+
+    // When reading doc_9.
+    let response = request.evaluate(runtime);
+
+    // Then the incomplete JWT contributes no resource scope.
+    assert!(
+        !response.decision,
+        "incomplete JWT must not grant: {response:?}"
+    );
+}
+
+#[test]
+fn capacity_accounting_skips_step_up_rule() {
+    // Given read requires MFA, and a delegated service token meters a read
+    // for the reader with no session.
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role_requiring_mfa());
+
+    // When the reservation evaluates for capacity accounting, for the reader
+    // and for a subject without the reader role.
+    let reader = evaluate_delegated_reader(&evaluator, EvaluationPurpose::CapacityAccounting, true);
+    let unassigned =
+        evaluate_delegated_reader(&evaluator, EvaluationPurpose::CapacityAccounting, false);
+
+    // Then the step-up rule does not hold the reservation, and the permission
+    // and token ceiling still decide it.
+    assert!(reader.decision, "{:?}", reader.context);
+    assert!(reader.challenge.is_none());
+    assert!(!unassigned.decision);
+    assert_eq!(
+        unassigned.context.and_then(|context| context.reason),
+        Some("token_permission_ceiling".to_string())
+    );
+}
+
+#[test]
+fn action_purpose_still_challenges_without_session() {
+    // Given read requires MFA, and a delegated service token evaluates a read
+    // for the reader with no session.
+    let evaluator = LocalAuthzEvaluator::new(runtime_with_read_role_requiring_mfa());
+
+    // When the evaluation is for the action itself.
+    let response = evaluate_delegated_reader(&evaluator, EvaluationPurpose::Action, true);
+
+    // Then the customer's step-up rule still challenges it.
+    assert!(!response.decision);
+    assert_eq!(
+        response.context.and_then(|context| context.reason),
+        Some("step_up:mfa".to_string())
+    );
+    assert_eq!(
+        response
+            .challenge
+            .as_ref()
+            .map(|challenge| challenge.triggered_by_rule.as_str()),
+        Some("require_mfa")
+    );
+}
+
+fn evaluate_delegated_reader(
+    evaluator: &LocalAuthzEvaluator,
+    purpose: EvaluationPurpose,
+    assigned: bool,
+) -> authz_types::EvaluationResponse {
+    let mut input = reader_input("read", 1);
+    if !assigned {
+        input.subject_access.assignments.clear();
+        input.subject_access.subject_parents.clear();
+    }
+    input.trusted_context = TrustedAuthorizationContext::from_validated_parts(
+        &input.request.subject,
+        None,
+        None,
+        Some(TokenContext::delegated(
+            "runtime_token".into(),
+            "runtime_owner".into(),
+            TokenScopeConfig::full_access(),
+        )),
+    );
+    evaluator
+        .evaluate_for_purpose_at(
             input,
-            Utc.timestamp_opt(1_000, 0).single().expect("timestamp"),
+            purpose,
+            Timestamp::from_second(1_000).expect("timestamp"),
         )
         .expect("evaluation")
 }

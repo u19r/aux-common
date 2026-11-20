@@ -18,9 +18,9 @@ test-support = []
 
 [dependencies]
 bytes = { workspace = true }
-chrono = { workspace = true }
-cron = { workspace = true }
 getrandom = { workspace = true, features = ["wasm_js"] }
+jiff = { workspace = true }
+jiff-cron = { workspace = true }
 metrics-facade = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }

@@ -64,6 +64,7 @@ const DIAGNOSTIC_ITERATIONS: usize = 10_000;
 fn default_typed_internal_context() -> CedarInternalContext {
     CedarInternalContext {
         token_present: false,
+        token_is_subject_credential: false,
         token_valid: true,
         token_resource_filter_enabled: false,
         token_resource_filter: Vec::new(),
@@ -79,6 +80,7 @@ fn default_typed_internal_context() -> CedarInternalContext {
         session_auth_age_seconds: 0,
         session_mfa_age_present: false,
         session_mfa_age_seconds: 0,
+        capacity_accounting: false,
     }
 }
 
@@ -553,6 +555,7 @@ fn typed_internal_context_from_test_context(
 
     CedarInternalContext {
         token_present: bool_field("token_present"),
+        token_is_subject_credential: bool_field("token_is_subject_credential"),
         token_valid: bool_field("token_valid"),
         token_resource_filter_enabled: bool_field("token_resource_filter_enabled"),
         token_resource_filter: entity_list("token_resource_filter"),
@@ -568,6 +571,7 @@ fn typed_internal_context_from_test_context(
         session_auth_age_seconds: integer_field("session_auth_age_seconds"),
         session_mfa_age_present: bool_field("session_mfa_age_present"),
         session_mfa_age_seconds: integer_field("session_mfa_age_seconds"),
+        capacity_accounting: bool_field("capacity_accounting"),
     }
 }
 
@@ -1368,6 +1372,7 @@ fn given_mutated_role_membership_when_evaluating_trusted_path_then_role_oracle_h
     // satisfy the generated token guards.
     let internal = |token_present: bool| CedarInternalContext {
         token_present,
+        token_is_subject_credential: false,
         token_valid: true,
         token_resource_filter_enabled: false,
         token_resource_filter: Vec::new(),
@@ -1383,6 +1388,7 @@ fn given_mutated_role_membership_when_evaluating_trusted_path_then_role_oracle_h
         session_auth_age_seconds: 0,
         session_mfa_age_present: false,
         session_mfa_age_seconds: 0,
+        capacity_accounting: false,
     };
     let decide_with_token = |subject: Subject,
                              resource: Resource,
@@ -2594,7 +2600,8 @@ fn evaluator_allows_when_required_amr_present() {
 }
 
 #[test]
-fn evaluator_allows_step_up_with_token_when_api_keys_exempt() {
+fn given_api_key_exempt_step_up_when_token_is_subject_key_or_delegated_then_only_subject_key_skips_session()
+ {
     let mut step_up_config = HashMap::new();
     step_up_config.insert(
         "document".to_string(),
@@ -2645,32 +2652,37 @@ fn evaluator_allows_step_up_with_token_when_api_keys_exempt() {
     .expect("valid config");
 
     let bundle = compile_policy_bundle(&config, 1).expect("bundle");
-    let internal = internal_context_with(serde_json::json!({
-        "token_present": true,
-        "token_valid": true,
-        "allowed_actions": ["document:read"],
-        "session_present": false
-    }));
-    let req = authz_types::EvaluationRequest {
-        subject: Subject::user("u1"),
-        resource: Resource::new("document", "doc1"),
-        action: Action::new("read"),
-        context: Some(context_with_internal(
-            serde_json::json!({
-                "subject_parents": [ { "type": "role", "id": "reader" } ]
-            }),
-            internal,
-        )),
-        jwt_context: None,
-        session_context: None,
-        token_context: None,
-    };
+    // A subject-bound API key is exempt; a delegated service token acting for
+    // the subject is not, so the missing session must deny.
+    for (token_is_subject_credential, expected) in [(true, true), (false, false)] {
+        let internal = internal_context_with(serde_json::json!({
+            "token_present": true,
+            "token_is_subject_credential": token_is_subject_credential,
+            "token_valid": true,
+            "allowed_actions": ["document:read"],
+            "session_present": false
+        }));
+        let req = authz_types::EvaluationRequest {
+            subject: Subject::user("u1"),
+            resource: Resource::new("document", "doc1"),
+            action: Action::new("read"),
+            context: Some(context_with_internal(
+                serde_json::json!({
+                    "subject_parents": [ { "type": "role", "id": "reader" } ]
+                }),
+                internal,
+            )),
+            jwt_context: None,
+            session_context: None,
+            token_context: None,
+        };
 
-    let res = evaluate_with_test_trust(&bundle, &req).expect("evaluation");
-    assert!(
-        res.decision,
-        "step-up should allow token when api keys are exempt"
-    );
+        let res = evaluate_with_test_trust(&bundle, &req).expect("evaluation");
+        assert_eq!(
+            res.decision, expected,
+            "subject credential {token_is_subject_credential}: step-up exemption mismatch"
+        );
+    }
 }
 
 #[test]

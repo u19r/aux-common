@@ -179,7 +179,6 @@ pub(crate) fn classify_counter(previous: u32, current: u32) -> SignCountStatus {
         (previous, current) if current > previous => {
             SignCountStatus::Increased { previous, current }
         }
-        (previous, current) if current == previous => SignCountStatus::Unchanged { value: current },
-        (previous, current) => SignCountStatus::Regression { previous, current },
+        (previous, current) => SignCountStatus::NotIncreased { previous, current },
     }
 }

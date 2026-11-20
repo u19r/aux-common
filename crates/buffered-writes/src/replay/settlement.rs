@@ -66,7 +66,7 @@ impl<T: Send + Sync + 'static> ReplayWorker<T> {
         deadline: Deadline,
         report: &mut ReplayReport,
     ) -> Result<(), QueueError> {
-        let bytes = quarantine.encode()?;
+        let bytes = quarantine.encode(self.queue.limits().max_envelope_bytes())?;
         self.complete_queue_operation(deadline, || {
             self.queue.quarantine(
                 &quarantine.envelope.receipt_handle,

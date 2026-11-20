@@ -1,0 +1,83 @@
+{
+  "schema": 1,
+  "tools": {
+    "rust": {
+      "version": "1.99.1",
+      "purpose": "Selected release",
+      "downloads": {}
+    },
+    "mold": {
+      "version": "3.0.0",
+      "purpose": "Selected release",
+      "downloads": {
+        "x86_64": {
+          "repository": "rui314/mold",
+          "tag": "v{version}",
+          "asset": "mold-{version}-x86_64-linux.tar.gz"
+        },
+        "aarch64": {
+          "repository": "rui314/mold",
+          "tag": "v{version}",
+          "asset": "mold-{version}-aarch64-linux.tar.gz"
+        }
+      }
+    },
+    "rustfmt": {
+      "version": "nightly",
+      "purpose": "Moving upstream channel resolved during AMI provisioning",
+      "downloads": {}
+    },
+    "wasi_sdk": {
+      "version": "24",
+      "purpose": "QuickJS WASI SDK compatibility release",
+      "downloads": {
+        "arm64": {
+          "repository": "WebAssembly/wasi-sdk",
+          "tag": "wasi-sdk-{version}",
+          "asset": "wasi-sdk-{version}.0-arm64-linux.tar.gz"
+        }
+      }
+    },
+    "wasi_clang": {
+      "version": "18.1.2",
+      "purpose": "Clang compatibility check paired with the QuickJS WASI SDK release",
+      "downloads": {}
+    }
+  },
+  "images": {
+    "rust_builder": {
+      "repository": "docker.io/library/rust",
+      "tag": "{{tools.rust.version}}-bookworm"
+    },
+    "debian_runtime": {
+      "repository": "docker.io/library/debian",
+      "tag": "bookworm-slim"
+    }
+  },
+  "actions": {
+    "actions_checkout": {
+      "repository": "actions/checkout",
+      "version": "v7.0.1"
+    },
+    "actions_cache": {
+      "repository": "actions/cache",
+      "version": "v6.1.0"
+    }
+  },
+  "cache_images": [],
+  "repositories": [
+    "aux-common"
+  ],
+  "repository": "aux-common",
+  "packages": {
+    "rust": {
+      "manager": "cargo",
+      "manifest": "Cargo.toml",
+      "sections": [
+        "dependencies",
+        "dev-dependencies",
+        "build-dependencies"
+      ]
+    }
+  }
+}

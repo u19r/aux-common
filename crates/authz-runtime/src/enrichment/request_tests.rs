@@ -5,7 +5,7 @@ use authz_types::{
     EvaluationRequest, JwtContext, PermissionActionRef, PermissionId, Resource, RoleAssignment,
     RoleScope, Scope, ScopeMappingEntry, Subject,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use super::{
@@ -82,10 +82,8 @@ fn assignment(
     }
 }
 
-fn timestamp(milliseconds: i64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(milliseconds)
-        .single()
-        .expect("test timestamp must be representable")
+fn timestamp(milliseconds: i64) -> Timestamp {
+    Timestamp::from_millisecond(milliseconds).expect("test timestamp must be representable")
 }
 
 fn enriched_at(
@@ -93,7 +91,7 @@ fn enriched_at(
     trusted_context: &TrustedAuthorizationContext,
     subject_access: &SubjectAccessSnapshot,
     resource_access: &ResourceAccessSnapshot,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<EnrichedCedarRequest, AuthzRuntimeError> {
     enrich_request_with_snapshots_at(
         TENANT_ID,
@@ -187,22 +185,9 @@ fn given_group_and_malformed_scopes_when_building_parent_template_then_skips_unu
     // When converting assignments to Cedar parent and scope data.
     let template = build_subject_parent_template(&assignments, &[], TENANT_ID);
 
-    // Then only the supported group relationship and role identities survive;
-    // malformed scope records fail closed without inventing a resource scope.
-    assert!(template.parents.contains(&parent("group", "group_1")));
-    assert!(template.parents.contains(&parent("role", "group_reader")));
-    assert!(
-        template
-            .parents
-            .contains(&parent("role", "resource_without_id"))
-    );
-    assert!(
-        template
-            .parents
-            .contains(&parent("role", "resource_without_type"))
-    );
-    assert!(template.parents.contains(&parent("role", "unknown_scope")));
-    assert_eq!(template.resource_scopes, HashMap::new());
+    // Then only the supported group relationship survives; role membership
+    // is never a parent fact, and malformed scope records fail closed.
+    assert_eq!(template.parents, vec![parent("group", "group_1")]);
 }
 
 #[test]
@@ -234,7 +219,7 @@ fn given_fresh_snapshots_and_wire_properties_when_using_wall_clock_wrapper_then_
         None,
         None,
     );
-    let fetched_at_ms = Utc::now().timestamp_millis();
+    let fetched_at_ms = Timestamp::now().as_millisecond();
     let subject_access = subject_snapshot(subject, fetched_at_ms);
     let resource_access = resource_snapshot(
         json!({"org_id": "org_1", "is_public": false}),
@@ -270,9 +255,10 @@ fn given_fresh_snapshots_and_wire_properties_when_using_wall_clock_wrapper_then_
     );
     assert_eq!(enriched.request.jwt_context, Some(trusted_jwt));
     assert!(
-        enriched
+        !enriched
             .subject_parents
-            .contains(&parent("role", "global_reader"))
+            .iter()
+            .any(|parent| parent.ref_type == "role")
     );
     assert!(
         enriched
@@ -390,7 +376,7 @@ fn given_mismatched_trusted_subject_when_enriching_then_rejects_before_snapshot_
 }
 
 #[test]
-fn given_trusted_jwt_with_mixed_scopes_when_enriching_then_adds_only_applicable_roles() {
+fn given_trusted_jwt_with_mixed_scopes_when_enriching_then_adds_only_applicable_scope_parents() {
     // Given trusted roles for the current organization/resource plus off-scope
     // organization, resource, and group roles.
     let subject = Subject::user(SUBJECT_ID);
@@ -451,14 +437,15 @@ fn given_trusted_jwt_with_mixed_scopes_when_enriching_then_adds_only_applicable_
     )
     .expect("trusted role scopes should be filtered");
 
-    // Then only global, matching organization, and matching resource roles are
-    // represented as Cedar parents.
-    for role_id in ["global_reader", "org_reader", "resource_reader"] {
-        assert!(enriched.subject_parents.contains(&parent("role", role_id)));
-    }
-    for role_id in ["other_org_reader", "other_resource_reader", "group_reader"] {
-        assert!(!enriched.subject_parents.contains(&parent("role", role_id)));
-    }
+    // Then only the global and matching organization scopes become parents;
+    // role membership comes from the evaluator's covering-role set instead.
+    assert!(
+        !enriched
+            .subject_parents
+            .iter()
+            .any(|parent| parent.ref_type == "role")
+    );
+    assert!(!enriched.subject_parents.contains(&parent("org", "org_2")));
     assert!(enriched.subject_parents.contains(&parent("org", "org_1")));
     assert!(
         enriched

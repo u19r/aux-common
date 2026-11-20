@@ -2,10 +2,10 @@ use std::fmt;
 
 use sha2::{Digest as _, Sha256};
 
-use crate::SigningError;
+use crate::{SigningError, constants::UNSIGNED_PAYLOAD};
 
-/// Payload input for header signing and presigning. Payload bytes never appear
-/// in Debug output.
+/// Payload input for header signing. Presigned URLs always sign
+/// `UNSIGNED-PAYLOAD`. Payload bytes never appear in Debug output.
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum SignableBody<'a> {
@@ -25,7 +25,7 @@ impl SignableBody<'_> {
     pub(crate) fn payload_hash(&self) -> Result<String, SigningError> {
         match self {
             Self::Bytes(bytes) => Ok(data_encoding::HEXLOWER.encode(&Sha256::digest(bytes))),
-            Self::UnsignedPayload => Ok("UNSIGNED-PAYLOAD".to_owned()),
+            Self::UnsignedPayload => Ok(UNSIGNED_PAYLOAD.to_owned()),
             Self::StreamingUnsignedPayloadTrailer => {
                 Ok("STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_owned())
             }

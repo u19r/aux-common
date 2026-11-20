@@ -44,7 +44,8 @@ async fn extension(
         .unwrap();
     let server = LambdaExtensionServer::bind(
         writer,
-        LambdaIpcConfig::try_new("127.0.0.1:0".parse().unwrap(), "deadline-token").unwrap(),
+        LambdaIpcConfig::try_new("127.0.0.1:0".parse().unwrap(), "deadline-token-0123456789")
+            .unwrap(),
     )
     .await
     .unwrap();
@@ -56,7 +57,8 @@ async fn extension(
         async move { server.serve().await }
     });
     let client = LambdaExtensionClient::new(
-        LambdaIpcConfig::try_new(server.local_addr().unwrap(), "deadline-token").unwrap(),
+        LambdaIpcConfig::try_new(server.local_addr().unwrap(), "deadline-token-0123456789")
+            .unwrap(),
     );
     (server, client, delivered, serving)
 }

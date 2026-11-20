@@ -63,11 +63,15 @@ impl EmbeddedEs256Key {
         &self.thumbprint
     }
 
+    /// Verifies a fixed-width 64-byte `r || s` ES256 signature.
+    ///
+    /// ES256 signatures are malleable: when `(r, s)` verifies, the distinct
+    /// encoding `(r, n - s)` verifies for the same input and key. Never key
+    /// proof replay or deduplication on signature or proof bytes; key it on
+    /// signed claims such as the key thumbprint and `jti`.
     pub fn verify(&self, signing_input: &[u8], signature: &[u8]) -> Result<(), JoseError> {
-        let normalized =
-            crate::constants::normalize_low_s(signature).ok_or(JoseError::InvalidSignature)?;
         let signature =
-            Signature::from_slice(&normalized).map_err(|_| JoseError::InvalidSignature)?;
+            Signature::from_slice(signature).map_err(|_| JoseError::InvalidSignature)?;
         self.verifier
             .verify(signing_input, &signature)
             .map_err(|_| JoseError::InvalidSignature)

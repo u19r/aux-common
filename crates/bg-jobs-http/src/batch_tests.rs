@@ -171,6 +171,7 @@ fn given_unknown_or_duplicate_item_response_when_built_then_batch_invariant_is_n
 fn given_policy_compatible_batch_inputs_when_registered_then_policy_remains_single_owner() {
     let policy = HttpPolicy::builder(HttpPolicyId::try_new("batch").expect("policy ID"))
         .endpoint(ApprovedEndpoint::exact("api.example.com").expect("endpoint"))
+        .route(Method::POST, "/")
         .try_build()
         .expect("policy");
     assert_eq!(policy.id().as_str(), "batch");

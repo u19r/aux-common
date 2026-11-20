@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    batch::{PreparationLimits, RecordCodec, WriteBatch},
+    batch::{EnvelopeKey, PreparationLimits, RecordCodec, WriteBatch},
     buffer::{BufferSnapshot, WriteBuffer},
     configuration::{
         BufferCapacity, DeliveryPolicy, FlushPolicy, Namespace, SinkLimits, TenantScope,
@@ -62,6 +62,12 @@ impl PolicyState {
 pub(crate) type ScopeExtractor<T> =
     Arc<dyn Fn(&T) -> Result<TenantScope, crate::WriteError> + Send + Sync>;
 
+/// The outage queue and the key that seals every batch published to it.
+pub(crate) struct FallbackQueue {
+    pub queue: Arc<dyn WriteQueue>,
+    pub key: EnvelopeKey,
+}
+
 pub(crate) struct EngineConfig<T> {
     pub scope_extractor: Option<ScopeExtractor<T>>,
     pub namespace: Namespace,
@@ -69,7 +75,7 @@ pub(crate) struct EngineConfig<T> {
     pub batch_strategy: Arc<dyn WriteBatch<T>>,
     pub buffer: Arc<dyn WriteBuffer>,
     pub sink: Arc<dyn WriteSink<T>>,
-    pub queue: Option<Arc<dyn WriteQueue>>,
+    pub queue: Option<FallbackQueue>,
     pub flush_policy: Arc<dyn FlushPolicy>,
     pub capacity: BufferCapacity,
     pub delivery_policy: DeliveryPolicy,

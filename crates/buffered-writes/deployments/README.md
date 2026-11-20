@@ -44,7 +44,7 @@ docker compose -f crates/buffered-writes/deployments/compose.yaml down
 ```
 
 The Dockerfile builds a Linux executable; do not copy a macOS Cargo binary into a Linux image.
-`RUST_IMAGE` is an overridable build argument and must provide Rust 1.99.1 or newer. Compose allows
+`RUST_IMAGE` is an overridable build argument and must provide Rust 1.100.0 or newer. Compose allows
 20 seconds while the application requests at most 10 seconds. The exec-form entrypoint receives
 TERM directly as PID 1. A real service must withdraw readiness, stop new producers and allow
 admitted request bodies to finish before closing write admission.

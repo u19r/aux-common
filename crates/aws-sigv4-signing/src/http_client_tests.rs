@@ -212,6 +212,32 @@ async fn signed_client_rejects_paths_that_escape_the_configured_authority() {
 }
 
 #[tokio::test]
+async fn given_dot_segment_paths_when_sending_then_reject_before_signing() {
+    // Given a signed client bound to an endpoint path prefix.
+    let client = HttpClient::builder().build().expect("http client");
+    let signed = AwsSigv4HttpClient::new(
+        client,
+        "https://service.test/prefix",
+        "us-east-1",
+        static_credentials(),
+        "execute-api",
+    )
+    .expect("signed client");
+
+    for path in ["/../x", "/a/%2e%2e/x", "/a/.%2E/x", "/./x", "/a/%2E"] {
+        // When a path with a literal or percent-encoded dot segment is sent.
+        let error = signed
+            .send(Method::GET, path, None, HeaderMap::new(), None)
+            .await
+            .err()
+            .expect("dot-segment paths must be rejected");
+
+        // Then it is rejected before signing or dispatch.
+        assert!(matches!(error, SigningError::InvalidUrl), "{path}");
+    }
+}
+
+#[tokio::test]
 async fn signed_client_rejects_caller_supplied_host_headers() {
     let client = HttpClient::builder().build().expect("http client");
     let signed = AwsSigv4HttpClient::new(

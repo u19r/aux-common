@@ -8,7 +8,7 @@ use authz_types::{
     MAX_PERMISSIONS, MAX_ROLES, TokenContext, TokenScopeConfig, TokenScopeType,
     ValidatedConfigurationModel,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use super::constants::{PERMISSION_BITS_WORDS, ROLE_BITS_WORDS};
 use crate::{AuthzRuntimeError, AuthzRuntimeResult};
@@ -425,14 +425,14 @@ impl EvaluationRuntime {
         user_permissions: &PermissionBits,
         token_ctx: &TokenContext,
     ) -> ResolvedPermissionBits {
-        self.resolve_token_permissions_at(user_permissions, token_ctx, Utc::now())
+        self.resolve_token_permissions_at(user_permissions, token_ctx, Timestamp::now())
     }
 
     pub fn resolve_token_permissions_at(
         &self,
         user_permissions: &PermissionBits,
         token_ctx: &TokenContext,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> ResolvedPermissionBits {
         self.resolve_token_permissions_for_resource_at(user_permissions, token_ctx, None, now)
     }
@@ -445,7 +445,7 @@ impl EvaluationRuntime {
         user_permissions: &PermissionBits,
         token_ctx: &TokenContext,
         target_org_id: Option<&str>,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> ResolvedPermissionBits {
         if token_is_expired_at(token_ctx, now) {
             return ResolvedPermissionBits::invalid("token_expired");
@@ -603,8 +603,8 @@ fn permission_allowed_for_resource(allowed_permissions: &[String], permission_id
         .any(|allowed| allowed == "*" || allowed == permission_id)
 }
 
-fn token_is_expired_at(token_ctx: &TokenContext, now: DateTime<Utc>) -> bool {
+fn token_is_expired_at(token_ctx: &TokenContext, now: Timestamp) -> bool {
     token_ctx
         .expires_at
-        .is_some_and(|expires_at| now.timestamp() >= expires_at)
+        .is_some_and(|expires_at| super::epoch_seconds(now) >= expires_at)
 }

@@ -1,7 +1,7 @@
 use std::{fmt, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use bg_jobs::{MAX_INLINE_PAYLOAD_BYTES, ValidationError};
-use http::HeaderName;
+use http::{HeaderName, Method};
 use url::Url;
 
 use crate::{
@@ -193,10 +193,75 @@ fn is_ip_host(host: &str) -> bool {
         })
 }
 
+/// A registration-approved method and path prefix.
+///
+/// Signed or credentialed requests act with registration-owned authority, so a
+/// job payload may choose only paths below an approved prefix with an approved
+/// method, never the operation itself.
+#[derive(Clone, Eq, PartialEq)]
+struct ApprovedRoute {
+    method: Method,
+    path_prefix: String,
+}
+
+impl fmt::Debug for ApprovedRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovedRoute")
+            .field("method", &self.method.as_str())
+            .field("path_prefix_bytes", &self.path_prefix.len())
+            .finish()
+    }
+}
+
+impl ApprovedRoute {
+    fn try_new(method: Method, path_prefix: String) -> Result<Self, ValidationError> {
+        let is_valid = path_prefix.starts_with('/')
+            && !path_prefix.contains("//")
+            && !path_prefix
+                .bytes()
+                .any(|byte| matches!(byte, b'?' | b'#' | b'%' | b'\\') || !byte.is_ascii_graphic())
+            && !path_prefix
+                .split('/')
+                .any(|segment| segment == "." || segment == "..");
+        if !is_valid {
+            return Err(ValidationError::InvalidText {
+                field: "approved route path prefix",
+            });
+        }
+        Ok(Self {
+            method,
+            path_prefix,
+        })
+    }
+
+    fn matches(&self, method: &Method, url: &Url) -> bool {
+        let path = url.path();
+        // `Url` already removed literal and `%2e` dot segments; encoded
+        // separators would let the destination re-split a segment after the
+        // prefix check.
+        if *method != self.method || has_encoded_separator(path) {
+            return false;
+        }
+        path.strip_prefix(self.path_prefix.as_str())
+            .is_some_and(|rest| {
+                self.path_prefix.ends_with('/') || rest.is_empty() || rest.starts_with('/')
+            })
+    }
+}
+
+fn has_encoded_separator(path: &str) -> bool {
+    path.as_bytes().windows(3).any(|window| {
+        window[0] == b'%'
+            && (window[1..].eq_ignore_ascii_case(b"2f") || window[1..].eq_ignore_ascii_case(b"5c"))
+    })
+}
+
 /// Immutable transport and classification policy compiled at registration.
 pub struct HttpPolicy {
     id: HttpPolicyId,
     endpoints: Vec<ApprovedEndpoint>,
+    routes: Vec<ApprovedRoute>,
     connect_timeout: Duration,
     request_timeout: Duration,
     max_request_bytes: NonZeroUsize,
@@ -214,6 +279,7 @@ impl fmt::Debug for HttpPolicy {
             .debug_struct("HttpPolicy")
             .field("id", &self.id)
             .field("endpoints", &self.endpoints)
+            .field("routes", &self.routes)
             .field("connect_timeout", &self.connect_timeout)
             .field("request_timeout", &self.request_timeout)
             .field("max_request_bytes", &self.max_request_bytes)
@@ -276,8 +342,10 @@ impl HttpPolicy {
         self.authorizer.as_ref()
     }
 
-    pub(crate) fn approves(&self, url: &Url) -> bool {
-        is_safe_url(url) && self.endpoints.iter().any(|endpoint| endpoint.matches(url))
+    pub(crate) fn approves(&self, method: &Method, url: &Url) -> bool {
+        is_safe_url(url)
+            && self.endpoints.iter().any(|endpoint| endpoint.matches(url))
+            && self.routes.iter().any(|route| route.matches(method, url))
     }
 }
 
@@ -285,6 +353,7 @@ impl HttpPolicy {
 pub struct HttpPolicyBuilder {
     id: HttpPolicyId,
     endpoints: Vec<ApprovedEndpoint>,
+    routes: Vec<(Method, String)>,
     connect_timeout: Duration,
     request_timeout: Duration,
     max_request_bytes: usize,
@@ -312,6 +381,7 @@ impl HttpPolicyBuilder {
         Self {
             id,
             endpoints: Vec::new(),
+            routes: Vec::new(),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_request_bytes: MAX_INLINE_PAYLOAD_BYTES,
@@ -326,6 +396,13 @@ impl HttpPolicyBuilder {
 
     pub fn endpoint(mut self, endpoint: ApprovedEndpoint) -> Self {
         self.endpoints.push(endpoint);
+        self
+    }
+
+    /// Approves `method` for request paths equal to `path_prefix` or below it.
+    /// A policy needs at least one route.
+    pub fn route(mut self, method: Method, path_prefix: impl Into<String>) -> Self {
+        self.routes.push((method, path_prefix.into()));
         self
     }
 
@@ -375,16 +452,22 @@ impl HttpPolicyBuilder {
     }
 
     pub fn try_build(self) -> Result<HttpPolicy, HttpJobError> {
-        if self.endpoints.is_empty() {
+        if self.endpoints.is_empty() || self.routes.is_empty() {
             return Err(HttpJobError::EndpointNotApproved);
         }
         let (max_request_bytes, max_response_bytes) = validate_limits(&self)?;
         validate_builder_options(&self)?;
         let retry_after_fallback = self.retry_after_fallback.min(self.retry_after_max);
         let connect_timeout = self.connect_timeout.min(self.request_timeout);
+        let routes = self
+            .routes
+            .into_iter()
+            .map(|(method, path_prefix)| ApprovedRoute::try_new(method, path_prefix))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(HttpPolicy {
             id: self.id,
             endpoints: self.endpoints,
+            routes,
             connect_timeout,
             request_timeout: self.request_timeout,
             max_request_bytes,

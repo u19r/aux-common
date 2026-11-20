@@ -38,9 +38,9 @@ mod writer;
 
 pub use batch::{
     AdmissionFingerprint, AdmittedRecord, BatchItems, ClosureWriteBatch, DefaultItemGrouping,
-    PersistedRecord, PreparationLayout, PreparedOperation, PreparedPayload, PreparedWrites,
-    RawBytesCodec, RecordCodec, ScopedWrite, SealedBatch, SealedBatchInput, SerdeJsonCodec,
-    WriteBatch, WriteItem,
+    EnvelopeKey, PersistedRecord, PreparationLayout, PreparedOperation, PreparedPayload,
+    PreparedWrites, QueueEnvelope, RawBytesCodec, RecordCodec, ScopedWrite, SealedBatch,
+    SealedBatchInput, SerdeJsonCodec, WriteBatch, WriteItem,
 };
 pub use buffer::{
     AdmissionReceipt, BufferAppendRequest, BufferAppendResult, BufferClaimRequest,

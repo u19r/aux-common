@@ -1,6 +1,5 @@
 use std::{sync::Arc, time::Duration};
 
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use super::{envelope::BatchEnvelope, preparation::PreparedPayload, record::PersistedRecord};
@@ -26,6 +25,9 @@ pub struct SealedBatchInput {
 ///
 /// Construction and deserialization validate membership, versions, age, and
 /// digest. Callers can inspect the sealed contents but cannot change them.
+/// The unkeyed digest detects corruption only: anyone who can write buffer
+/// storage can write a self-consistent batch for any scope. The outage queue
+/// therefore carries batches sealed with an [`super::EnvelopeKey`].
 ///
 /// ```compile_fail
 /// fn change_digest(batch: &mut buffered_writes::SealedBatch) {
@@ -140,15 +142,5 @@ impl SealedBatch {
 
     pub(crate) fn age_at_utc_ms(&self, now_ms: i64) -> Duration {
         super::age::conservative_age(self.first_item_time_ms, now_ms)
-    }
-
-    pub fn to_envelope_bytes(&self) -> Result<Bytes, EncodeError> {
-        serde_json::to_vec(self)
-            .map(Bytes::from)
-            .map_err(|_| EncodeError::SerializationFailed)
-    }
-
-    pub fn from_envelope_bytes(bytes: &[u8]) -> Result<Self, EncodeError> {
-        serde_json::from_slice(bytes).map_err(|_| EncodeError::DeserializationFailed)
     }
 }

@@ -143,7 +143,7 @@ fn schema_generation_rejects_canonical_resource_name_collisions() {
         version: 1,
         resource_types: vec![
             authz_types::ResourceType {
-                id: "billing-doc".into(),
+                id: "billing__doc".into(),
                 name: "Billing doc".into(),
                 description: None,
                 actions: vec![],
@@ -172,7 +172,7 @@ fn schema_generation_rejects_canonical_resource_name_collisions() {
     let error = generate_schema(&config).expect_err("canonical collision must fail");
 
     assert!(error.to_string().contains("BillingDoc"));
-    assert!(error.to_string().contains("billing-doc"));
+    assert!(error.to_string().contains("billing__doc"));
     assert!(error.to_string().contains("billing_doc"));
 }
 

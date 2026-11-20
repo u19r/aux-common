@@ -1,8 +1,17 @@
 use std::sync::{Arc, Mutex};
 
 use buffered_writes::{
-    AtomicSink, BufferedWrites, SealedBatch, SinkError, SinkLimits, WriteAttempt,
+    AtomicSink, BufferedWrites, EnvelopeKey, SealedBatch, SinkError, SinkLimits, WriteAttempt,
 };
+
+fn envelope_key() -> EnvelopeKey {
+    EnvelopeKey::try_new([7; 32]).unwrap()
+}
+
+fn round_trip(batch: &SealedBatch) -> SealedBatch {
+    let key = envelope_key();
+    key.open(key.seal(batch.clone()).unwrap().bytes()).unwrap()
+}
 
 async fn envelope() -> serde_json::Value {
     let captured = Arc::new(Mutex::new(None));
@@ -27,21 +36,21 @@ async fn envelope() -> serde_json::Value {
 async fn given_sealed_envelope_when_batch_identity_changes_then_reject_digest() {
     let mut value = envelope().await;
     value["batch_id"] = serde_json::json!(uuid::Uuid::now_v7());
-    assert!(SealedBatch::from_envelope_bytes(&serde_json::to_vec(&value).unwrap()).is_err());
+    assert!(serde_json::from_slice::<SealedBatch>(&serde_json::to_vec(&value).unwrap()).is_err());
 }
 
 #[tokio::test]
 async fn given_sealed_envelope_when_replay_age_changes_then_reject_digest() {
     let mut value = envelope().await;
     value["first_item_time_ms"] = serde_json::json!(0);
-    assert!(SealedBatch::from_envelope_bytes(&serde_json::to_vec(&value).unwrap()).is_err());
+    assert!(serde_json::from_slice::<SealedBatch>(&serde_json::to_vec(&value).unwrap()).is_err());
 }
 
 #[tokio::test]
 async fn given_sealed_envelope_when_record_time_changes_then_reject_digest() {
     let mut value = envelope().await;
     value["records"][0]["admitted_at_utc_ms"] = serde_json::json!(0);
-    assert!(SealedBatch::from_envelope_bytes(&serde_json::to_vec(&value).unwrap()).is_err());
+    assert!(serde_json::from_slice::<SealedBatch>(&serde_json::to_vec(&value).unwrap()).is_err());
 }
 
 #[tokio::test]
@@ -70,8 +79,7 @@ fn given_invalid_identifiers_when_deserialized_then_preserve_constructor_validat
 #[tokio::test]
 async fn given_valid_envelope_when_round_tripped_then_preserve_identity_and_digest() {
     let original: SealedBatch = serde_json::from_value(envelope().await).unwrap();
-    let restored =
-        SealedBatch::from_envelope_bytes(&original.to_envelope_bytes().unwrap()).unwrap();
+    let restored = round_trip(&original);
     assert_eq!(original, restored);
     assert!(restored.verify_digest());
     assert_eq!(restored.batch_id().as_uuid().get_version_num(), 7);
@@ -142,8 +150,33 @@ async fn given_identical_operations_when_representation_changes_then_digest_chan
     );
     let custom = SealedBatch::try_new(input).unwrap();
     assert_ne!(shared.digest(), custom.digest());
-    assert_eq!(
-        custom,
-        SealedBatch::from_envelope_bytes(&custom.to_envelope_bytes().unwrap()).unwrap()
+    assert_eq!(custom, round_trip(&custom));
+}
+
+#[tokio::test]
+async fn given_large_byte_payload_when_batch_is_decoded_then_allocation_stays_near_its_size() {
+    use buffered_writes::SealedBatchInput;
+    let mut input: SealedBatchInput = serde_json::from_value(envelope().await).unwrap();
+    let mut records = input.records.to_vec();
+    records[0].payload = bytes::Bytes::from(vec![0; 300_000]);
+    input.records = records.into();
+    let encoded = serde_json::to_vec(&SealedBatch::try_new(input).unwrap()).unwrap();
+
+    let guard = alloc_counter::AllocationGuard::start(
+        module_path!(),
+        "sealed_batch_decode",
+        file!(),
+        line!(),
+        None,
+    );
+    let decoded = serde_json::from_slice::<SealedBatch>(&encoded);
+    let report = guard.finish();
+
+    assert!(decoded.is_ok());
+    assert!(
+        report.allocated_bytes < 4 * encoded.len() as u64,
+        "decoding {} bytes allocated {} bytes",
+        encoded.len(),
+        report.allocated_bytes
     );
 }

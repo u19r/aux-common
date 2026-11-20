@@ -9,14 +9,14 @@ use buffered_writes::{
     InjectedSpotSource, LifecycleEvents, LifecycleTrigger, SpotActionKind, SpotInstanceAction,
     SpotLifecycle,
 };
-use chrono::Utc;
+use jiff::Timestamp;
 
 #[tokio::test]
 async fn given_expired_or_unknown_spot_deadline_when_forwarded_then_no_fresh_shutdown_window() {
     for time in [
         None,
         Some("invalid timestamp".into()),
-        Some((Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
+        Some((Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_string()),
     ] {
         for action in [SpotActionKind::Terminate, SpotActionKind::Stop] {
             let lifecycle = SpotLifecycle::new(InjectedSpotSource::new());
@@ -40,7 +40,7 @@ async fn given_hibernation_notice_when_forwarded_then_no_invented_grace_period()
     let source = InjectedSpotSource::new();
     source.inject_notice(SpotInstanceAction {
         action: SpotActionKind::Hibernate,
-        time: Some((Utc::now() + chrono::Duration::minutes(2)).to_rfc3339()),
+        time: Some((Timestamp::now() + jiff::SignedDuration::from_secs(120)).to_string()),
     });
     let lifecycle = SpotLifecycle::new(source);
     let Some(LifecycleTrigger::Shutdown { deadline }) = lifecycle.next_event().await else {
@@ -56,7 +56,7 @@ async fn given_delayed_notice_when_polled_then_remaining_budget_is_capped_by_act
         let source = InjectedSpotSource::new();
         source.inject_notice(SpotInstanceAction {
             action: SpotActionKind::Terminate,
-            time: Some((Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339()),
+            time: Some((Timestamp::now() + jiff::SignedDuration::from_secs(seconds)).to_string()),
         });
         let lifecycle = SpotLifecycle::new(source).with_terminate_grace(Duration::from_secs(30));
         let Some(LifecycleTrigger::Shutdown { deadline }) = lifecycle.next_event().await else {
@@ -150,7 +150,9 @@ impl buffered_writes::SpotActionSource for CountedSource {
                 release.notified().await;
                 Ok(Some(SpotInstanceAction {
                     action: SpotActionKind::Stop,
-                    time: Some((Utc::now() + chrono::Duration::seconds(60)).to_rfc3339()),
+                    time: Some(
+                        (Timestamp::now() + jiff::SignedDuration::from_secs(60)).to_string(),
+                    ),
                 }))
             } else {
                 Ok(None)

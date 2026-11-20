@@ -432,7 +432,9 @@ impl From<NonZeroU16> for FairnessPolicy {
     }
 }
 
-/// Optional enqueue deduplication retention request.
+/// Optional enqueue deduplication retention request. The key is unique per job
+/// kind and fairness primary within a namespace, so a hit never returns another
+/// kind's or fairness scope's job.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Deduplication {
     key: crate::ids::DeduplicationKey,

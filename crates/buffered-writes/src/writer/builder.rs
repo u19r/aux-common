@@ -13,7 +13,7 @@ use crate::{
         BufferCapacity, BufferConfig, DeliveryPolicy, FlushPolicy, FlushThresholds, Namespace,
         SinkLimits, TenantScope,
     },
-    engine::{Engine, EngineConfig, ScopeExtractor},
+    engine::{Engine, EngineConfig, FallbackQueue, ScopeExtractor},
     error::{ConfigurationError, PrepareError, WriteError},
     memory_buffer::MemoryBuffer,
     observer::{Clock, NoopWriteObserver, ProductionClock, WriteObserver},
@@ -182,6 +182,12 @@ impl<T: Send + Sync + 'static> WritesBuilder<T> {
         let effective_limits = self.compute_effective_limits(queue.as_deref())?;
         let preparation =
             PreparationLimits::new(strategy.layout(), &self.capacity, &effective_limits);
+        let queue = queue
+            .zip(self.queue_config.as_ref())
+            .map(|(queue, config)| FallbackQueue {
+                queue,
+                key: config.key.clone(),
+            });
         let engine = Arc::new(Engine::new(EngineConfig {
             namespace,
             scope_extractor: self.scope_extractor,

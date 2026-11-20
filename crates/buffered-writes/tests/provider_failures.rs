@@ -14,6 +14,10 @@ use buffered_writes::{
 };
 use futures_util::future::BoxFuture;
 
+fn envelope_key() -> buffered_writes::EnvelopeKey {
+    buffered_writes::EnvelopeKey::try_new([7; 32]).unwrap()
+}
+
 #[derive(Clone)]
 struct InspectFault {
     inner: MemoryBuffer,
@@ -767,7 +771,10 @@ async fn given_confirmed_queue_publish_when_buffer_settlement_ack_is_lost_then_n
     let writer = BufferedWrites::builder("provider-errors/v1", sink)
         .with_buffer_provider(buffer.clone())
         .with_clock(clock.clone())
-        .fallback(buffered_writes::QueueConfig::custom(queue.clone()))
+        .fallback(buffered_writes::QueueConfig::custom(
+            queue.clone(),
+            envelope_key(),
+        ))
         .build()
         .unwrap();
     writer.add_write_item(1).await.unwrap();

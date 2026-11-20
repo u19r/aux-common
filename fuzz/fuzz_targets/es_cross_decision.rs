@@ -15,6 +15,10 @@ use p256::ecdsa::{SigningKey, signature::Signer as _};
 // tokens jwt_decode rejects for missing gates, and a bug in either stack is
 // visible as a disagreement.
 //
+// ES256 is malleable: the `(r, n - s)` mirror of the seed signature is a
+// distinct token that both stacks must accept, so neither stack may claim a
+// canonical signature and callers key replay on signed claims, not bytes.
+//
 // Mutated SPKIs and JWKS documents never panic; the JWKS path still accepts
 // the pure byte-identical seed.
 const ISSUER: &str = "https://issuer.example";
@@ -75,6 +79,17 @@ fn seed_token() -> String {
         serde_json::to_vec(&header).unwrap().as_slice(),
         serde_json::to_vec(&claims).unwrap().as_slice(),
     )
+}
+
+/// The seed with its signature replaced by the `(r, n - s)` mirror.
+fn mirrored_token(token: &str) -> String {
+    let (message, signature) = token.rsplit_once('.').expect("compact token");
+    let signature = URL_SAFE_NO_PAD.decode(signature).expect("seed signature");
+    let signature =
+        p256::ecdsa::Signature::from_slice(&signature).expect("fixed-width seed signature");
+    let mirrored = p256::ecdsa::Signature::from_scalars(signature.r(), -signature.s())
+        .expect("mirrored signature");
+    format!("{message}.{}", URL_SAFE_NO_PAD.encode(mirrored.to_bytes()))
 }
 
 fn seed_jwks() -> String {
@@ -219,6 +234,16 @@ fuzz_target!(|data: &[u8]| {
     if let Err(error) = verifier.verify_static_json_claims_only(&seed, &policy) {
         panic!("seed must verify in jwt_decode: {error:?}");
     }
+    let mirrored = mirrored_token(&seed);
+    assert_ne!(mirrored, seed, "the mirror is a distinct token");
+    assert!(
+        jose_core_verifies(&mirrored, &jose_verifier),
+        "mirrored seed must verify in jose_core"
+    );
+    assert!(
+        jwt_decode_verifies(&mirrored, &verifier, &policy),
+        "mirrored seed must verify in jwt_decode"
+    );
 
     let mut token = seed.clone();
     let mut cursor = 0;
@@ -229,7 +254,7 @@ fuzz_target!(|data: &[u8]| {
         cursor += 4;
         edits += 1;
     }
-    if token != seed {
+    if token != seed && token != mirrored {
         assert!(
             !jose_core_verifies(&token, &jose_verifier),
             "jose_core bypass: mutated token verified"

@@ -11,6 +11,10 @@ use buffered_writes::{
     SinkError, SinkLimits, WriteAttempt,
 };
 
+fn envelope_key() -> buffered_writes::EnvelopeKey {
+    buffered_writes::EnvelopeKey::try_new([7; 32]).unwrap()
+}
+
 async fn batch(packed: bool) -> SealedBatch {
     let captured = Arc::new(Mutex::new(None));
     let observed = captured.clone();
@@ -32,7 +36,7 @@ async fn batch(packed: bool) -> SealedBatch {
 
 async fn replay(batch: SealedBatch, limits: SinkLimits) -> (buffered_writes::ReplayReport, usize) {
     let queue = InMemoryQueue::default();
-    queue.inject_raw_envelope(batch.to_envelope_bytes().unwrap());
+    queue.inject_raw_envelope(envelope_key().seal(batch.clone()).unwrap().bytes().clone());
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = calls.clone();
     let sink = AtomicSink::try_new(limits, move |_: WriteAttempt<u32>| {
@@ -40,7 +44,7 @@ async fn replay(batch: SealedBatch, limits: SinkLimits) -> (buffered_writes::Rep
         async { Ok::<(), SinkError>(()) }
     })
     .unwrap();
-    let worker = ReplayWorker::builder("quotas/v1", queue, sink)
+    let worker = ReplayWorker::builder("quotas/v1", queue, envelope_key(), sink)
         .strategy_version(batch.strategy_version())
         .build()
         .unwrap();

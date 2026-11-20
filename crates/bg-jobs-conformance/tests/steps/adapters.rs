@@ -111,6 +111,7 @@ fn response(status: StatusCode, body: &[u8]) -> Result<HttpResponse, HttpRequest
 fn policy(id: &str) -> Result<HttpPolicy, String> {
     HttpPolicy::builder(HttpPolicyId::try_new(id).map_err(|error| error.to_string())?)
         .endpoint(ApprovedEndpoint::exact("api.example.com").map_err(|error| error.to_string())?)
+        .route(Method::POST, "/")
         .try_build()
         .map_err(|error| error.to_string())
 }
@@ -296,6 +297,7 @@ async fn when_sigv4_request_executes(world: &mut BddWorld) -> Result<(), String>
             .endpoint(
                 ApprovedEndpoint::exact("api.example.com").map_err(|error| error.to_string())?,
             )
+            .route(Method::POST, "/")
             .authorizer(authorizer)
             .try_build()
             .map_err(|error| error.to_string())?;

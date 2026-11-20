@@ -11,12 +11,13 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use chrono::DateTime;
 use futures_util::{StreamExt, future::BoxFuture};
+use jiff::Timestamp;
 use lru_ttl_cache::{CacheConfig, KeyedSingleflight, KeyedSingleflightGuard, LruTtlCache};
 use reqwest::header::AUTHORIZATION as REQWEST_AUTHORIZATION;
 use serde::Deserialize;
 use url::Url;
+use zeroize::Zeroizing;
 
 use crate::{
     constants::{
@@ -27,16 +28,14 @@ use crate::{
         AWS_EC2_METADATA_DISABLED, AWS_PROFILE, AWS_SECRET_ACCESS_KEY, AWS_SECRET_KEY,
         AWS_SESSION_TOKEN, AWS_SHARED_CREDENTIALS_FILE, CREDENTIAL_CACHE_CAPACITY,
         CREDENTIAL_CACHE_STATIC_TTL, CREDENTIAL_REFRESH_FALLBACK, CREDENTIAL_REFRESH_SKEW,
-        DEFAULT_CREDENTIAL_CACHE_KEY, ECS_RELATIVE_CREDENTIALS_BASE, HOME, IMDS_ROLE_LIST_URL,
-        IMDS_TOKEN_HEADER, IMDS_TOKEN_TTL_HEADER, IMDS_TOKEN_TTL_SECONDS, IMDS_TOKEN_URL,
-        LOCALHOST, MAX_AUTHORIZATION_TOKEN_BYTES, MAX_AWS_CLI_OUTPUT_BYTES,
+        DEFAULT_CREDENTIAL_CACHE_KEY, ECS_RELATIVE_CREDENTIALS_BASE, HOME, IMDS_BASE_URL,
+        IMDS_ROLE_LIST_PATH, IMDS_TOKEN_HEADER, IMDS_TOKEN_PATH, IMDS_TOKEN_TTL_HEADER,
+        IMDS_TOKEN_TTL_SECONDS, LOCALHOST, MAX_AUTHORIZATION_TOKEN_BYTES, MAX_AWS_CLI_OUTPUT_BYTES,
         MAX_METADATA_RESPONSE_BYTES, METADATA_CONNECT_TIMEOUT, METADATA_REQUEST_TIMEOUT,
     },
     credential_provider::ProvideCredentials,
     credentials::{AwsResolvedCredentials, AwsStaticCredentials, Credentials},
-    error::{
-        CredentialProviderErrorKind, CredentialProviderSource, CredentialsError, MetadataEndpoint,
-    },
+    error::{CredentialProviderErrorKind, CredentialsError, MetadataEndpoint},
 };
 
 pub(crate) type CredentialProviderError = CredentialsError;
@@ -47,12 +46,17 @@ pub fn resolve_default_chain_credentials() -> CredentialProviderResult<AwsStatic
     Ok(resolve_default_chain_credentials_with_expiry()?.credentials)
 }
 
+/// Blocking form of [`DefaultChainCredentialsProvider`] resolution, with the
+/// same provider order and fail-closed rule.
 pub fn resolve_default_chain_credentials_with_expiry()
 -> CredentialProviderResult<AwsResolvedCredentials> {
     let resolved = resolve_default_chain_blocking()?;
     Ok(resolved.into_public(SystemTime::now()))
 }
 
+/// Resolves environment, AWS CLI profile, ECS task metadata, then EC2 IMDS
+/// credentials. Only an unconfigured provider yields to the next one; a
+/// configured provider's failure is returned, as in the AWS SDK chain.
 #[derive(Clone)]
 pub struct DefaultChainCredentialsProvider {
     client: reqwest::Client,
@@ -103,9 +107,9 @@ impl fmt::Debug for DefaultChainCredentialsProvider {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct MetadataCredentialsResponse {
+pub(crate) struct MetadataCredentialsResponse {
     access_key_id: String,
     secret_access_key: String,
     #[serde(default)]
@@ -114,15 +118,61 @@ struct MetadataCredentialsResponse {
     expiration: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct AwsCliCredentialProcessOutput {
+pub(crate) struct AwsCliCredentialProcessOutput {
     access_key_id: String,
     secret_access_key: String,
     #[serde(default)]
     session_token: Option<String>,
     #[serde(default)]
     expiration: Option<String>,
+}
+
+impl fmt::Debug for MetadataCredentialsResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetadataCredentialsResponse")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"[REDACTED]")
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("expiration", &self.expiration)
+            .finish()
+    }
+}
+
+impl fmt::Debug for AwsCliCredentialProcessOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AwsCliCredentialProcessOutput")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"[REDACTED]")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("expiration", &self.expiration)
+            .finish()
+    }
+}
+
+/// Test builds may point IMDS at a local listener, so chain tests run with
+/// IMDS enabled and observe any fall-through to the instance role.
+#[cfg(test)]
+pub(crate) static IMDS_BASE_URL_OVERRIDE: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(not(test))]
+fn imds_url(path: &str) -> String {
+    format!("{IMDS_BASE_URL}{path}")
+}
+
+#[cfg(test)]
+fn imds_url(path: &str) -> String {
+    let base_url = IMDS_BASE_URL_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    format!("{}{path}", base_url.as_deref().unwrap_or(IMDS_BASE_URL))
 }
 
 impl DefaultChainCredentialsProvider {
@@ -184,6 +234,10 @@ impl DefaultChainCredentialsProvider {
         );
     }
 
+    /// Each provider returns `Ok(None)` only when it is not configured. A
+    /// configured provider's error ends the chain: continuing would silently
+    /// select another principal, such as the EC2 instance role during an ECS
+    /// task-role outage.
     async fn resolve_default_chain(
         &self,
         refresh_ownership: &RefreshOwnership,
@@ -191,38 +245,17 @@ impl DefaultChainCredentialsProvider {
         if let Some(credentials) = resolve_environment_credentials()? {
             return Ok(credentials);
         }
-
-        let mut provider_errors = Vec::new();
-
-        match resolve_profile_credentials_async(Arc::clone(refresh_ownership)).await {
-            Ok(Some(credentials)) => return Ok(credentials),
-            Ok(None) => {}
-            Err(_) => provider_errors.push(CredentialProviderSource::AwsCliProfile),
+        if let Some(credentials) =
+            resolve_profile_credentials_async(Arc::clone(refresh_ownership)).await?
+        {
+            return Ok(credentials);
         }
-
-        match self.resolve_ecs_task_credentials().await {
-            Ok(Some(credentials)) => return Ok(credentials),
-            Ok(None) => {}
-            Err(_) => provider_errors.push(CredentialProviderSource::EcsTaskMetadata),
+        if let Some(credentials) = self.resolve_ecs_task_credentials().await? {
+            return Ok(credentials);
         }
-
-        match self.resolve_imds_credentials().await {
-            Ok(Some(credentials)) => return Ok(credentials),
-            Ok(None) => {}
-            Err(_) => {
-                provider_errors.push(CredentialProviderSource::Imds);
-            }
-        }
-
-        if provider_errors.is_empty() {
-            return Err(not_loaded_error(
-                CredentialProviderErrorKind::NoDefaultCredentials,
-            ));
-        }
-
-        Err(not_loaded_error(
-            CredentialProviderErrorKind::DefaultChainFailures(provider_errors),
-        ))
+        self.resolve_imds_credentials()
+            .await?
+            .ok_or_else(|| not_loaded_error(CredentialProviderErrorKind::NoDefaultCredentials))
     }
 
     async fn resolve_ecs_task_credentials(
@@ -267,7 +300,7 @@ impl DefaultChainCredentialsProvider {
 
         let token_response = self
             .client
-            .put(IMDS_TOKEN_URL)
+            .put(imds_url(IMDS_TOKEN_PATH))
             .header(IMDS_TOKEN_TTL_HEADER, IMDS_TOKEN_TTL_SECONDS)
             .send()
             .await
@@ -284,12 +317,16 @@ impl DefaultChainCredentialsProvider {
         let token_body = bounded_response_body(token_response).await.map_err(|_| {
             provider_error_message(CredentialProviderErrorKind::MetadataResponseInvalid)
         })?;
-        let token = std::str::from_utf8(&token_body)
-            .map_err(|_| {
-                provider_error_message(CredentialProviderErrorKind::MetadataCredentialsTextInvalid)
-            })?
-            .trim()
-            .to_owned();
+        let token = Zeroizing::new(
+            std::str::from_utf8(&token_body)
+                .map_err(|_| {
+                    provider_error_message(
+                        CredentialProviderErrorKind::MetadataCredentialsTextInvalid,
+                    )
+                })?
+                .trim()
+                .to_owned(),
+        );
         if token.is_empty() {
             return Err(provider_error_message(
                 CredentialProviderErrorKind::EmptyImdsToken,
@@ -298,7 +335,7 @@ impl DefaultChainCredentialsProvider {
 
         let role_response = self
             .client
-            .get(IMDS_ROLE_LIST_URL)
+            .get(imds_url(IMDS_ROLE_LIST_PATH))
             .header(IMDS_TOKEN_HEADER, token.as_str())
             .send()
             .await
@@ -327,11 +364,11 @@ impl DefaultChainCredentialsProvider {
             })?
             .to_owned();
 
-        let role_credentials_url = format!("{IMDS_ROLE_LIST_URL}{role_name}");
+        let role_credentials_url = format!("{}{role_name}", imds_url(IMDS_ROLE_LIST_PATH));
         let credentials_response = self
             .client
             .get(role_credentials_url)
-            .header(IMDS_TOKEN_HEADER, token)
+            .header(IMDS_TOKEN_HEADER, token.as_str())
             .send()
             .await
             .map_err(|_| metadata_request_error())?;
@@ -368,40 +405,15 @@ fn resolve_default_chain_blocking() -> CredentialProviderResult<ResolvedCredenti
     if let Some(credentials) = resolve_environment_credentials()? {
         return Ok(credentials);
     }
-
-    let mut provider_errors = Vec::new();
-
-    match resolve_profile_credentials() {
-        Ok(Some(credentials)) => return Ok(credentials),
-        Ok(None) => {}
-        Err(_) => provider_errors.push(CredentialProviderSource::AwsCliProfile),
+    if let Some(credentials) = resolve_profile_credentials()? {
+        return Ok(credentials);
     }
-
     let client = blocking_metadata_http_client()?;
-
-    match resolve_ecs_task_credentials_with_blocking_client(&client) {
-        Ok(Some(credentials)) => return Ok(credentials),
-        Ok(None) => {}
-        Err(_) => provider_errors.push(CredentialProviderSource::EcsTaskMetadata),
+    if let Some(credentials) = resolve_ecs_task_credentials_with_blocking_client(&client)? {
+        return Ok(credentials);
     }
-
-    match resolve_imds_credentials_with_blocking_client(&client) {
-        Ok(Some(credentials)) => return Ok(credentials),
-        Ok(None) => {}
-        Err(_) => {
-            provider_errors.push(CredentialProviderSource::Imds);
-        }
-    }
-
-    if provider_errors.is_empty() {
-        return Err(not_loaded_error(
-            CredentialProviderErrorKind::NoDefaultCredentials,
-        ));
-    }
-
-    Err(provider_error_message(
-        CredentialProviderErrorKind::BlockingDefaultChainFailures(provider_errors),
-    ))
+    resolve_imds_credentials_with_blocking_client(&client)?
+        .ok_or_else(|| not_loaded_error(CredentialProviderErrorKind::NoDefaultCredentials))
 }
 
 async fn resolve_profile_credentials_async(
@@ -449,8 +461,8 @@ fn resolve_environment_credentials() -> CredentialProviderResult<Option<Resolved
 
 pub(crate) struct BoundedCommandOutput {
     pub(crate) status: ExitStatus,
-    pub(crate) stdout: Vec<u8>,
-    pub(crate) stderr: Vec<u8>,
+    pub(crate) stdout: Zeroizing<Vec<u8>>,
+    pub(crate) stderr: Zeroizing<Vec<u8>>,
     pub(crate) timed_out: bool,
 }
 
@@ -471,9 +483,11 @@ pub(crate) fn run_bounded_command(
     supervisor.finish(status, timed_out)
 }
 
+type CommandReader = thread::JoinHandle<io::Result<Zeroizing<Vec<u8>>>>;
+
 struct CommandSupervisor {
     child: Option<Child>,
-    readers: [Option<thread::JoinHandle<io::Result<Vec<u8>>>>; 2],
+    readers: [Option<CommandReader>; 2],
 }
 
 impl CommandSupervisor {
@@ -549,7 +563,7 @@ impl Drop for CommandSupervisor {
 fn spawn_command_reader<R>(
     reader: R,
     output_too_large: Arc<AtomicBool>,
-) -> io::Result<thread::JoinHandle<io::Result<Vec<u8>>>>
+) -> io::Result<CommandReader>
 where
     R: Read + Send + 'static,
 {
@@ -558,9 +572,7 @@ where
         .spawn(move || read_capped(reader, MAX_AWS_CLI_OUTPUT_BYTES, output_too_large.as_ref()))
 }
 
-fn join_command_reader(
-    reader: Option<thread::JoinHandle<io::Result<Vec<u8>>>>,
-) -> io::Result<Vec<u8>> {
+fn join_command_reader(reader: Option<CommandReader>) -> io::Result<Zeroizing<Vec<u8>>> {
     let reader = reader.ok_or_else(|| io::Error::other("aws cli output reader missing"))?;
     reader
         .join()
@@ -630,8 +642,9 @@ fn read_capped<R: Read>(
     mut reader: R,
     limit: usize,
     output_too_large: &AtomicBool,
-) -> io::Result<Vec<u8>> {
-    let mut output = Vec::with_capacity(limit.saturating_add(1));
+) -> io::Result<Zeroizing<Vec<u8>>> {
+    // Preallocated to the cap so growth never leaves unzeroized copies.
+    let mut output = Zeroizing::new(Vec::with_capacity(limit.saturating_add(1)));
     let mut buffer = [0_u8; 8 * 1024];
     loop {
         let read = reader.read(&mut buffer)?;
@@ -769,7 +782,7 @@ fn resolve_imds_credentials_with_blocking_client(
     }
 
     let token_response = client
-        .put(IMDS_TOKEN_URL)
+        .put(imds_url(IMDS_TOKEN_PATH))
         .header(IMDS_TOKEN_TTL_HEADER, IMDS_TOKEN_TTL_SECONDS)
         .send()
         .map_err(|_| metadata_request_error())?;
@@ -785,11 +798,13 @@ fn resolve_imds_credentials_with_blocking_client(
     let token_body = bounded_blocking_response_body(token_response).map_err(|_| {
         provider_error_message(CredentialProviderErrorKind::MetadataResponseInvalid)
     })?;
-    let token = std::str::from_utf8(&token_body)
-        .map_err(|_| {
-            provider_error_message(CredentialProviderErrorKind::MetadataCredentialsTextInvalid)
-        })?
-        .to_owned();
+    let token = Zeroizing::new(
+        std::str::from_utf8(&token_body)
+            .map_err(|_| {
+                provider_error_message(CredentialProviderErrorKind::MetadataCredentialsTextInvalid)
+            })?
+            .to_owned(),
+    );
     if token.trim().is_empty() {
         return Err(provider_error_message(
             CredentialProviderErrorKind::EmptyImdsToken,
@@ -797,7 +812,7 @@ fn resolve_imds_credentials_with_blocking_client(
     }
 
     let role_list_response = client
-        .get(IMDS_ROLE_LIST_URL)
+        .get(imds_url(IMDS_ROLE_LIST_PATH))
         .header(IMDS_TOKEN_HEADER, token.as_str())
         .send()
         .map_err(|_| metadata_request_error())?;
@@ -824,8 +839,8 @@ fn resolve_imds_credentials_with_blocking_client(
         .to_owned();
 
     let credentials_response = client
-        .get(format!("{IMDS_ROLE_LIST_URL}{role_name}"))
-        .header(IMDS_TOKEN_HEADER, token)
+        .get(format!("{}{role_name}", imds_url(IMDS_ROLE_LIST_PATH)))
+        .header(IMDS_TOKEN_HEADER, token.as_str())
         .send()
         .map_err(|_| metadata_request_error())?;
     if !credentials_response.status().is_success() {
@@ -851,7 +866,7 @@ fn requested_profile_name() -> Option<String> {
     non_empty_env_var(AWS_PROFILE).or_else(|| non_empty_env_var(AWS_DEFAULT_PROFILE))
 }
 
-async fn bounded_response_body(response: reqwest::Response) -> io::Result<Vec<u8>> {
+async fn bounded_response_body(response: reqwest::Response) -> io::Result<Zeroizing<Vec<u8>>> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_METADATA_RESPONSE_BYTES as u64)
@@ -861,8 +876,10 @@ async fn bounded_response_body(response: reqwest::Response) -> io::Result<Vec<u8
         ));
     }
 
+    let mut body = Zeroizing::new(Vec::with_capacity(metadata_body_capacity(
+        response.content_length(),
+    )));
     let mut stream = response.bytes_stream();
-    let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(io::Error::other)?;
         if body.len().saturating_add(chunk.len()) > MAX_METADATA_RESPONSE_BYTES {
@@ -877,7 +894,7 @@ async fn bounded_response_body(response: reqwest::Response) -> io::Result<Vec<u8
 
 pub(crate) fn bounded_blocking_response_body(
     response: reqwest::blocking::Response,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<Zeroizing<Vec<u8>>> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_METADATA_RESPONSE_BYTES as u64)
@@ -887,11 +904,9 @@ pub(crate) fn bounded_blocking_response_body(
         ));
     }
 
-    let mut body = Vec::with_capacity(response.content_length().map_or(0, |length| {
-        usize::try_from(length)
-            .unwrap_or(MAX_METADATA_RESPONSE_BYTES)
-            .min(MAX_METADATA_RESPONSE_BYTES)
-    }));
+    let mut body = Zeroizing::new(Vec::with_capacity(metadata_body_capacity(
+        response.content_length(),
+    )));
     response
         .take(MAX_METADATA_RESPONSE_BYTES as u64 + 1)
         .read_to_end(&mut body)?;
@@ -901,6 +916,16 @@ pub(crate) fn bounded_blocking_response_body(
         ));
     }
     Ok(body)
+}
+
+/// Reserves a declared body up front, so reading it does not reallocate and
+/// leave unzeroized copies of credential material behind.
+fn metadata_body_capacity(content_length: Option<u64>) -> usize {
+    content_length.map_or(0, |length| {
+        usize::try_from(length)
+            .unwrap_or(MAX_METADATA_RESPONSE_BYTES)
+            .min(MAX_METADATA_RESPONSE_BYTES)
+    })
 }
 
 fn should_try_profile_credentials(profile: Option<&str>) -> bool {
@@ -1071,8 +1096,45 @@ pub fn half_life_refresh_after(
 }
 
 fn parse_expiration_datetime(value: &str) -> Option<SystemTime> {
-    let parsed = DateTime::parse_from_rfc3339(value).ok()?;
+    if !is_rfc3339_datetime(value) {
+        return None;
+    }
+    let parsed = value.parse::<Timestamp>().ok()?;
     Some(parsed.into())
+}
+
+// Keep the RFC 3339 wire format: Jiff also accepts calendar annotations and
+// abbreviated times, which these protocol inputs have never accepted.
+fn is_rfc3339_datetime(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || !matches!(bytes.get(10), Some(b'T' | b't' | b' '))
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return false;
+    }
+    let mut suffix = &bytes[19..];
+    if suffix.first() == Some(&b'.') {
+        suffix = &suffix[1..];
+        let digits = suffix
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits == 0 {
+            return false;
+        }
+        suffix = &suffix[digits..];
+    }
+    matches!(suffix, [b'Z' | b'z'])
+        || (suffix.len() == 6
+            && matches!(suffix[0], b'+' | b'-')
+            && suffix[3] == b':'
+            && [suffix[1], suffix[2], suffix[4], suffix[5]]
+                .iter()
+                .all(u8::is_ascii_digit))
 }
 
 pub(crate) fn metadata_refresh_after(

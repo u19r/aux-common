@@ -12,7 +12,7 @@ use crate::{
     codec::{KeyCodec, KeyTag},
     engine::JobSystem,
     error::{JobResult, JobSystemError, StoreDataError},
-    ids::{DeduplicationKey, Namespace},
+    ids::Namespace,
     keys,
     model::JobRecordV1,
     store::{
@@ -36,8 +36,9 @@ impl DedupeAdmission {
         let Some(dedupe) = &job.deduplication else {
             return Ok(None);
         };
-        let key = keys::dedupe_key(namespace, dedupe.key())?;
-        let expiry = keys::dedupe_expiry_key(namespace, dedupe.key(), dedupe.retain_until())?;
+        let identity = keys::DedupeIdentity::new(&job.kind, &job.fairness, dedupe.key());
+        let key = keys::dedupe_key(namespace, identity)?;
+        let expiry = keys::dedupe_expiry_key(namespace, identity, dedupe.retain_until())?;
         let value = keys::dedupe_value(&job.job_id, dedupe.retain_until())?;
         let mut mutations = vec![
             Mutation::Put(key.clone(), value.clone()),
@@ -46,8 +47,7 @@ impl DedupeAdmission {
         let check = match expected {
             Some(value) => {
                 let (_, previous_until) = keys::decode_dedupe_value(&value)?;
-                let previous_expiry =
-                    keys::dedupe_expiry_key(namespace, dedupe.key(), previous_until)?;
+                let previous_expiry = keys::dedupe_expiry_key(namespace, identity, previous_until)?;
                 if previous_expiry != expiry {
                     mutations.push(Mutation::Delete(previous_expiry));
                 }
@@ -163,17 +163,14 @@ impl<S: JobStore> JobSystem<S> {
         entry: &RangeEntry,
     ) -> JobResult<(crate::store::StoreKey, Timestamp), S::Error> {
         let decoded = KeyCodec::decode_borrowed(self.namespace(), &entry.key)?;
-        let [_, identity] = decoded.components.as_slice() else {
-            return Err(JobSystemError::PayloadCorrupt);
-        };
-        let key =
-            DeduplicationKey::try_new(identity).map_err(|_| JobSystemError::PayloadCorrupt)?;
+        let identity = keys::DedupeIdentity::from_expiry_components(&decoded.components)
+            .map_err(|_| JobSystemError::PayloadCorrupt)?;
         let (_, until) = keys::decode_dedupe_value(&entry.value)?;
         if decoded.tag != KeyTag::DedupeExpiry
-            || entry.key != keys::dedupe_expiry_key(self.namespace(), &key, until)?
+            || entry.key != keys::dedupe_expiry_key(self.namespace(), identity, until)?
         {
             return Err(JobSystemError::PayloadCorrupt);
         }
-        Ok((keys::dedupe_key(self.namespace(), &key)?, until))
+        Ok((keys::dedupe_key(self.namespace(), identity)?, until))
     }
 }

@@ -3,7 +3,9 @@ use http::Uri;
 use crate::{DpopError, constants::MAX_URI_BYTES};
 
 /// Validated ASCII HTTPS target with RFC 3986 path normalization and no
-/// query/fragment.
+/// query/fragment. Parsing normalizes a client `htu`; request targets built
+/// with [`Self::join_path`] or [`Self::resolve_request_uri`] reject dot
+/// segments instead.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DpopTargetUri {
     encoded: String,
@@ -60,33 +62,44 @@ impl DpopTargetUri {
 
     /// Resolve a listener request beneath its explicit public base.
     /// Absolute-form requests must already be within that base and retain
-    /// their original normalized path.
+    /// their original path. Requests with dot segments are rejected; see
+    /// [`Self::join_path`].
     pub fn resolve_request_uri(&self, uri: &http::Uri) -> Result<Self, DpopError> {
         if uri.scheme().is_none() {
             return self.join_path(uri.path());
         }
-        let target = Self::try_from(uri.to_string().as_str())?;
-        let prefix = self.encoded.strip_suffix('/').unwrap_or(&self.encoded);
-        if target.authority != self.authority
-            || !(target.as_str() == prefix || target.as_str().starts_with(&format!("{prefix}/")))
-        {
+        reject_dot_segments(uri.path())?;
+        self.require_beneath_base(Self::try_from(uri.to_string().as_str())?)
+    }
+
+    /// Join an origin-form request path beneath this base.
+    ///
+    /// Routers dispatch on the raw request path, so the server-side target
+    /// must be the routed path rather than an RFC 3986 normalized alias of it.
+    /// A `.` or `..` segment, raw or percent-encoded, is rejected instead of
+    /// removed: removal would bind a proof minted for one resource to a
+    /// differently routed request, or resolve outside the base. The `htu`
+    /// claim is still normalized when it is parsed.
+    pub fn join_path(&self, path: &str) -> Result<Self, DpopError> {
+        let relative = path.strip_prefix('/').ok_or(DpopError::InvalidTarget)?;
+        reject_dot_segments(path)?;
+        let target = Self::try_from(format!("{}/{relative}", self.base_prefix()).as_str())?;
+        self.require_beneath_base(target)
+    }
+
+    fn base_prefix(&self) -> &str {
+        self.encoded.strip_suffix('/').unwrap_or(&self.encoded)
+    }
+
+    fn require_beneath_base(&self, target: Self) -> Result<Self, DpopError> {
+        let is_beneath = target
+            .as_str()
+            .strip_prefix(self.base_prefix())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+        if target.authority != self.authority || !is_beneath {
             return Err(DpopError::InvalidTarget);
         }
         Ok(target)
-    }
-
-    pub fn join_path(&self, path: &str) -> Result<Self, DpopError> {
-        if !path.starts_with('/') {
-            return Err(DpopError::InvalidTarget);
-        }
-        Self::try_from(
-            format!(
-                "{}/{}",
-                self.encoded.strip_suffix('/').unwrap_or(&self.encoded),
-                path.strip_prefix('/').ok_or(DpopError::InvalidTarget)?
-            )
-            .as_str(),
-        )
     }
 }
 
@@ -124,6 +137,16 @@ fn normalize_path(path: &str) -> Result<String, DpopError> {
     } else {
         normalized
     })
+}
+
+fn reject_dot_segments(path: &str) -> Result<(), DpopError> {
+    if normalize_percent(path)?
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return Err(DpopError::InvalidTarget);
+    }
+    Ok(())
 }
 
 fn normalize_percent(path: &str) -> Result<String, DpopError> {

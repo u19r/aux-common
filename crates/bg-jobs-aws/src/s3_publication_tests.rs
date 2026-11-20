@@ -204,3 +204,12 @@ async fn given_a_missing_object_when_conditional_publication_succeeds_then_one_s
         .unwrap();
     assert_eq!(transport.requests.lock().unwrap().len(), 2);
 }
+
+#[test]
+fn given_http_object_url_when_publication_is_built_then_it_is_an_invalid_object() {
+    let result = S3ObjectPublication::try_from(S3ObjectInput {
+        url: Url::parse("http://bucket.s3.amazonaws.com/k").unwrap(),
+        ..input()
+    });
+    assert!(matches!(result, Err(S3PublicationError::InvalidObject)));
+}

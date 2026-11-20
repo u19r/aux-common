@@ -14,6 +14,8 @@ use crate::{
     constants::{NS_DS, NS_XINCLUDE, NS_XML, NS_XMLENC, NS_XMLNS, SAML_PROTOCOL_NS},
 };
 
+const MAX_SUPPORTED_DEPTH: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XmlLimits {
     max_bytes: usize,
@@ -99,6 +101,15 @@ impl XmlLimits {
         {
             return Err(XmlSecurityError::Shape {
                 message: "XML limits must be non-zero, including cardinality limits".to_string(),
+            });
+        }
+        // Tree construction, canonicalisation, signature selection, and drop
+        // all recurse once per nesting level. Above this depth a crafted
+        // document of `<a>` tags could overflow a 2 MiB async worker stack and
+        // abort the process instead of returning an error.
+        if self.max_depth > MAX_SUPPORTED_DEPTH {
+            return Err(XmlSecurityError::Shape {
+                message: format!("XML depth limit must not exceed {MAX_SUPPORTED_DEPTH}"),
             });
         }
         Ok(self)
@@ -371,6 +382,17 @@ pub(crate) fn parse_with_limits(xml: &str, limits: XmlLimits) -> Result<Element,
             message: "XML exceeds configured byte limit".to_string(),
         });
     }
+    // The `xml` crate expands parameter entities inside an internal DTD subset
+    // without a size limit and emits `XmlEvent::Doctype` only after the subset
+    // closes, so a few hundred bytes can allocate gigabytes before the event
+    // arm below runs. Reject the markup before the parser sees it. A literal
+    // `<!DOCTYPE` inside CDATA is also rejected; the SAML profile has no use
+    // for it.
+    if xml.contains("<!DOCTYPE") {
+        return Err(XmlSecurityError::Unsupported {
+            message: "DOCTYPE is not supported".to_string(),
+        });
+    }
     validate_namespace_resource_limits(xml, limits)?;
     let mut config = ParserConfig::new();
     config.whitespace_to_characters = true;
@@ -469,7 +491,7 @@ pub(crate) fn parse_with_limits(xml: &str, limits: XmlLimits) -> Result<Element,
                     );
                     if !seen.insert(expanded_key) {
                         return Err(XmlSecurityError::Shape {
-                            message: format!("duplicate attribute: {lexical_key}"),
+                            message: "duplicate attribute".to_string(),
                         });
                     }
                     parsed_attributes.push((lexical_key, attribute.value));
@@ -479,12 +501,10 @@ pub(crate) fn parse_with_limits(xml: &str, limits: XmlLimits) -> Result<Element,
                     .iter()
                     .map(|(prefix, uri)| (prefix.to_string(), uri.to_string()))
                     .collect();
-                for (prefix, uri) in &namespace_context {
+                for uri in namespace_context.values() {
                     if !uri.is_empty() && !is_absolute_namespace_uri(uri) {
                         return Err(XmlSecurityError::Shape {
-                            message: format!(
-                                "namespace URI for prefix {prefix:?} must be absolute"
-                            ),
+                            message: "namespace URI must be absolute".to_string(),
                         });
                     }
                 }
@@ -709,10 +729,7 @@ fn parse_namespace_declarations(
         if is_namespace_declaration(name) {
             if !declarations.insert(name) {
                 return Err(XmlSecurityError::Shape {
-                    message: format!(
-                        "duplicate namespace declaration: {}",
-                        String::from_utf8_lossy(name)
-                    ),
+                    message: "duplicate namespace declaration".to_string(),
                 });
             }
             let uri_bytes = cursor - value_start;
@@ -887,22 +904,20 @@ fn validate_inclusive_prefixes(
         } else {
             if !is_namespace_prefix(prefix) {
                 return Err(XmlSecurityError::NamespaceMismatch {
-                    message: format!("invalid inclusive namespace prefix: {prefix}"),
+                    message: "invalid inclusive namespace prefix".to_string(),
                 });
             }
             (*prefix).to_string()
         };
         if !normalized_prefixes.insert(normalized.clone()) {
             return Err(XmlSecurityError::NamespaceMismatch {
-                message: format!("duplicate inclusive namespace prefix: {prefix}"),
+                message: "duplicate inclusive namespace prefix".to_string(),
             });
         }
         let declared_uri = element.namespace_context.get(&normalized);
         if declared_uri.is_none() || declared_uri.is_some_and(String::is_empty) {
             return Err(XmlSecurityError::NamespaceMismatch {
-                message: format!(
-                    "inclusive prefix is not declared on the canonical root: {prefix}"
-                ),
+                message: "inclusive prefix is not declared on the canonical root".to_string(),
             });
         }
     }

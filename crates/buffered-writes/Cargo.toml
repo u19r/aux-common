@@ -15,7 +15,14 @@ license.workspace = true
 default = ["tokio"]
 disk = ["tokio"]
 ec2 = ["tokio", "dep:http", "dep:http-request", "dep:url"]
-lambda = ["tokio", "dep:http", "dep:http-request", "dep:url", "dep:rustix"]
+lambda = [
+    "tokio",
+    "dep:http",
+    "dep:http-request",
+    "dep:subtle",
+    "dep:url",
+    "dep:rustix",
+]
 sqs = [
     "tokio",
     "dep:aws-credentials",
@@ -32,16 +39,17 @@ aws-credentials = { workspace = true, optional = true }
 aws-sigv4-signing = { workspace = true, optional = true }
 base64 = { workspace = true }
 bytes = { workspace = true, features = ["serde"] }
-chrono = { workspace = true }
 futures-timer = { workspace = true }
 futures-util = { workspace = true }
+hmac = { workspace = true }
 http = { workspace = true, optional = true }
 http-request = { workspace = true, optional = true }
-rand = { workspace = true }
+jiff = { workspace = true }
 redis = { workspace = true, optional = true }
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+subtle = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, optional = true }
 url = { workspace = true, optional = true }

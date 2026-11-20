@@ -293,7 +293,9 @@ fn internal_context_schema(resource_entity: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "Record",
         "attributes": {
+            "capacity_accounting": required(cedar_type("Boolean")),
             "token_present": required(cedar_type("Boolean")),
+            "token_is_subject_credential": required(cedar_type("Boolean")),
             "token_valid": required(cedar_type("Boolean")),
             "token_resource_filter_enabled": required(cedar_type("Boolean")),
             "token_resource_filter": required(serde_json::json!({

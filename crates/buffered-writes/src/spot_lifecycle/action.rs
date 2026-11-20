@@ -30,8 +30,10 @@ impl SpotInstanceAction {
             SpotActionKind::Terminate | SpotActionKind::Stop => self
                 .time
                 .as_deref()
-                .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
-                .and_then(|time| time.signed_duration_since(chrono::Utc::now()).to_std().ok())
+                .and_then(|time| time.parse::<jiff::Timestamp>().ok())
+                .and_then(|time| {
+                    Duration::try_from(time.duration_since(jiff::Timestamp::now())).ok()
+                })
                 .unwrap_or(Duration::ZERO)
                 .min(maximum),
         };

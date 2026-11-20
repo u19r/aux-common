@@ -291,14 +291,33 @@ fn given_counter_pairs_when_classifying_then_return_documented_status() {
         }
     );
     assert_eq!(
-        super::classify_counter(4, 4),
-        crate::SignCountStatus::Unchanged { value: 4 }
-    );
-    assert_eq!(
         super::classify_counter(5, 4),
-        crate::SignCountStatus::Regression {
+        crate::SignCountStatus::NotIncreased {
             previous: 5,
             current: 4,
+        }
+    );
+    assert_eq!(
+        super::classify_counter(4, 0),
+        crate::SignCountStatus::NotIncreased {
+            previous: 4,
+            current: 0,
+        }
+    );
+}
+
+#[test]
+fn given_equal_non_zero_counters_when_classifying_then_report_clone_signal() {
+    // Given a stored counter of 5 and authenticator data reporting 5.
+    // When the counter is classified.
+    let status = super::classify_counter(5, 5);
+
+    // Then it is the WebAuthn clone signal, not a benign status.
+    assert_eq!(
+        status,
+        crate::SignCountStatus::NotIncreased {
+            previous: 5,
+            current: 5,
         }
     );
 }

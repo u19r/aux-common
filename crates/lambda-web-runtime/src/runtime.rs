@@ -5,6 +5,9 @@ impl LambdaWebEnvironment {
     pub async fn notify_ready(&self) -> Result<(), LambdaWebRuntimeError> {
         let client = reqwest::Client::builder()
             .timeout(READY_TIMEOUT)
+            // The runtime API is loopback-only; ambient HTTP_PROXY/ALL_PROXY
+            // must not route or observe the readiness call.
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| LambdaWebRuntimeError::ReadyUnavailable)?;

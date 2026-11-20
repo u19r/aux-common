@@ -56,6 +56,8 @@ impl AwsRequestSigner {
         }
     }
 
+    /// Signs a POST request. See [`Self::sign_request`] for the transport
+    /// requirement.
     pub async fn sign(
         &self,
         uri: &Uri,
@@ -66,6 +68,11 @@ impl AwsRequestSigner {
             .await
     }
 
+    /// Returns signed headers for the caller to send. The caller's HTTP client
+    /// must not follow redirects: cross-host redirect handling strips
+    /// `Authorization` but forwards `x-amz-security-token` and the other
+    /// signed headers to the redirect target. [`crate::AwsSigv4HttpClient`]
+    /// enforces this; other callers must configure it themselves.
     pub async fn sign_request(
         &self,
         method: &str,
@@ -97,23 +104,18 @@ impl AwsRequestSigner {
         })
     }
 
+    /// Returns a presigned URI whose payload is always `UNSIGNED-PAYLOAD`. The
+    /// URI is a bearer credential until it expires. A caller that dispatches
+    /// it must not follow redirects, as for [`Self::sign_request`].
     pub async fn presign_request(
         &self,
         method: &str,
         uri: &Uri,
         base_headers: &HeaderMap,
-        body: SignableBody<'_>,
         expires_in: Duration,
     ) -> Result<Uri, SigningError> {
-        self.presign_request_at(
-            method,
-            uri,
-            base_headers,
-            body,
-            expires_in,
-            SystemTime::now(),
-        )
-        .await
+        self.presign_request_at(method, uri, base_headers, expires_in, SystemTime::now())
+            .await
     }
 
     pub(crate) async fn presign_request_at(
@@ -121,7 +123,6 @@ impl AwsRequestSigner {
         method: &str,
         uri: &Uri,
         base_headers: &HeaderMap,
-        body: SignableBody<'_>,
         expires_in: Duration,
         signing_time: SystemTime,
     ) -> Result<Uri, SigningError> {
@@ -130,15 +131,7 @@ impl AwsRequestSigner {
         let credentials = self.credentials.provide_credentials().await?;
         let context =
             SigningContext::try_new(&self.region, &self.service_name, credentials, signing_time)?;
-        context.presign(
-            &SigningRequest {
-                method,
-                uri,
-                headers: base_headers,
-                body,
-            },
-            expires_in,
-        )
+        context.presign(method, uri, base_headers, expires_in)
     }
 }
 

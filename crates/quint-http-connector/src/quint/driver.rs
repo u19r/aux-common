@@ -316,6 +316,7 @@ impl<C: ConnectorConfig> ConnectorDriver<C> {
     ) -> Result<HttpExecutor> {
         let policy = HttpPolicy::builder(policy_id.clone())
             .endpoint(ApprovedEndpoint::exact("api.example.com")?)
+            .route(Method::POST, "/")
             .authorizer(ObservedAuthorizer::new(authorizer, observation))
             .request_timeout(Duration::from_secs(5))
             .connect_timeout(Duration::from_secs(1))

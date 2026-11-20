@@ -10,7 +10,7 @@ use reqwest::{
     Method, Request, RequestBuilder, StatusCode, Url,
     dns::{Addrs, Name, Resolve, Resolving},
 };
-use tokio::net::lookup_host;
+use tokio::{net::lookup_host, time::Instant};
 
 use crate::{
     client::HttpClient,
@@ -20,10 +20,11 @@ use crate::{
         DEFAULT_MAX_RESPONSE_LENGTH_BYTES, DEFAULT_TENANT_CONNECT_TIMEOUT,
         DEFAULT_TENANT_REQUEST_TIMEOUT, REDIRECT_BLOCKED_HOST_MISMATCH,
         REDIRECT_BLOCKED_METHOD_CHANGE, REDIRECT_BLOCKED_SCHEME_CHANGE, REDIRECT_BLOCKED_TOO_MANY,
-        RESERVED_IP_RANGES, SSRF_BLOCKED_DNS_EMPTY, SSRF_BLOCKED_DNS_FAILURE,
-        SSRF_BLOCKED_DNS_TIMEOUT, SSRF_BLOCKED_DOMAIN_NOT_ALLOWLISTED, SSRF_BLOCKED_FRAGMENT,
-        SSRF_BLOCKED_HOST_HEADER, SSRF_BLOCKED_IP_LITERAL, SSRF_BLOCKED_MISSING_HOST,
-        SSRF_BLOCKED_PORT, SSRF_BLOCKED_RESERVED_IP, SSRF_BLOCKED_SCHEME, SSRF_BLOCKED_USERINFO,
+        RESERVED_IP_RANGES, SSRF_BLOCKED_ALLOWED_DOMAIN_INVALID, SSRF_BLOCKED_DNS_EMPTY,
+        SSRF_BLOCKED_DNS_FAILURE, SSRF_BLOCKED_DNS_TIMEOUT, SSRF_BLOCKED_DOMAIN_NOT_ALLOWLISTED,
+        SSRF_BLOCKED_FRAGMENT, SSRF_BLOCKED_HOST_HEADER, SSRF_BLOCKED_IP_LITERAL,
+        SSRF_BLOCKED_MISSING_HOST, SSRF_BLOCKED_PORT, SSRF_BLOCKED_RESERVED_IP,
+        SSRF_BLOCKED_SCHEME, SSRF_BLOCKED_USERINFO,
     },
     error::{HttpRequestError, Result},
     observer::HttpRequestObserver,
@@ -31,6 +32,10 @@ use crate::{
     retry::RetryConfig,
 };
 
+/// One allowlist rule. `TenantHttpClientBuilder::build` accepts only the host
+/// form that a parsed `https` URL reports: a lowercase ASCII (punycode)
+/// domain without empty labels or a trailing dot, or a loopback literal
+/// (`127.0.0.1`, `[::1]`) when loopback destinations are enabled.
 #[derive(Clone)]
 pub struct AllowedDomain {
     pub host: String,
@@ -74,6 +79,8 @@ pub struct TenantHttpRequestConfig {
     pub allowed_domains: Vec<AllowedDomain>,
     pub max_content_length: usize,
     pub max_response_length: usize,
+    /// Total budget for one operation: every hop's DNS preflight, every
+    /// attempt, retry waits, and redirect hops.
     pub timeout: Duration,
     pub connect_timeout: Duration,
     pub max_redirects: usize,
@@ -158,6 +165,8 @@ impl TenantHttpClientBuilder {
         self
     }
 
+    /// Set the total budget for one operation, including DNS preflight,
+    /// retries, and redirect hops.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.config.timeout = timeout;
@@ -243,17 +252,27 @@ impl TenantHttpClientBuilder {
                 reason: SSRF_BLOCKED_DOMAIN_NOT_ALLOWLISTED,
             });
         }
+        if !self
+            .config
+            .allowed_domains
+            .iter()
+            .all(|domain| is_canonical_allowed_host(&domain.host, self.config.allow_loopback_ips))
+        {
+            return Err(HttpRequestError::SsrfBlocked {
+                reason: SSRF_BLOCKED_ALLOWED_DOMAIN_INVALID,
+            });
+        }
 
         let ssrf_config = SsrfProtectionConfig {
             allowed_schemes: self.config.allowed_schemes.clone(),
             allowed_ports: self.config.allowed_ports.clone(),
             max_dns_addresses: self.config.max_dns_addresses,
             allow_loopback_ips: self.config.allow_loopback_ips,
-            dns_timeout: self.config.timeout,
         };
         let ssrf = Arc::new(SsrfProtector::with_resolver(ssrf_config, self.resolver));
+        // No client-wide total timeout: `TenantHttpClient::execute` gives each
+        // attempt the time left in its operation deadline.
         let client = reqwest::Client::builder()
-            .timeout(self.config.timeout)
             .connect_timeout(self.config.connect_timeout)
             // Keep proxy resolution outside the tenant SSRF trust boundary.
             .no_proxy()
@@ -324,6 +343,9 @@ impl TenantHttpClient {
         self.execute(request).await
     }
 
+    /// Send `request` under the tenant destination policy. One deadline,
+    /// `timeout` or a shorter request timeout, bounds the whole operation:
+    /// every hop's DNS preflight, attempts, retry waits, and redirect hops.
     pub async fn execute(&self, request: Request) -> Result<HttpResponse> {
         if request.headers().contains_key(reqwest::header::HOST) {
             return Err(HttpRequestError::SsrfBlocked {
@@ -331,29 +353,50 @@ impl TenantHttpClient {
             });
         }
         validate_request_size(&request, self.config.max_content_length)?;
+        let budget = request.timeout().map_or(self.config.timeout, |timeout| {
+            (*timeout).min(self.config.timeout)
+        });
+        let deadline = deadline_after(budget);
+        let mut dispatched = false;
+        let result = self
+            .follow_redirects(request, deadline, &mut dispatched)
+            .await;
+        if dispatched {
+            result.map_err(HttpRequestError::after_dispatch)
+        } else {
+            result
+        }
+    }
+
+    /// Send each same-origin hop. Sets `dispatched` once a hop reaches the
+    /// destination, because a later failure can no longer prove that the
+    /// operation was not applied.
+    async fn follow_redirects(
+        &self,
+        request: Request,
+        deadline: Instant,
+        dispatched: &mut bool,
+    ) -> Result<HttpResponse> {
         let mut current = request;
         let mut redirects = 0usize;
 
         loop {
             let url = current.url().clone();
-            self.validate_url(&url).await?;
+            self.validate_url(&url, deadline).await?;
 
-            let current_clone = current.try_clone();
-            if current_clone.is_none() {
-                let response = self.http.execute(current).await?;
+            let Some(attempt) = current.try_clone() else {
+                let response = self.http.execute_attempts(current, Some(deadline)).await?;
                 if response.status().is_redirection() {
                     return Err(HttpRequestError::RequestNotCloneable);
                 }
                 return Ok(response.with_max_body_size(Some(self.config.max_response_length)));
-            }
+            };
 
-            let response = self
-                .http
-                .execute(current_clone.ok_or(HttpRequestError::RequestNotCloneable)?)
-                .await?;
+            let response = self.http.execute_attempts(attempt, Some(deadline)).await?;
             if !response.status().is_redirection() {
                 return Ok(response.with_max_body_size(Some(self.config.max_response_length)));
             }
+            *dispatched = true;
 
             if redirects >= self.config.max_redirects {
                 return Err(HttpRequestError::RedirectBlocked {
@@ -400,7 +443,7 @@ impl TenantHttpClient {
         }
     }
 
-    async fn validate_url(&self, url: &Url) -> Result<()> {
+    async fn validate_url(&self, url: &Url, deadline: Instant) -> Result<()> {
         let host = url.host_str().ok_or(HttpRequestError::SsrfBlocked {
             reason: SSRF_BLOCKED_MISSING_HOST,
         })?;
@@ -426,7 +469,7 @@ impl TenantHttpClient {
             });
         }
 
-        self.ssrf.resolve_and_validate(url).await?;
+        self.ssrf.resolve_and_validate(url, deadline).await?;
         Ok(())
     }
 }
@@ -499,6 +542,7 @@ impl TenantRequestBuilder {
         self
     }
 
+    /// Shorten this operation's total budget below the client's `timeout`.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.inner = self.inner.timeout(timeout);
@@ -516,7 +560,6 @@ pub(crate) struct SsrfProtectionConfig {
     pub(crate) allowed_ports: Vec<u16>,
     pub(crate) max_dns_addresses: usize,
     pub(crate) allow_loopback_ips: bool,
-    pub(crate) dns_timeout: Duration,
 }
 
 #[derive(Clone, Copy)]
@@ -596,17 +639,17 @@ impl SsrfProtector {
         Ok(())
     }
 
-    pub(crate) async fn resolve_and_validate(&self, url: &Url) -> Result<()> {
+    pub(crate) async fn resolve_and_validate(&self, url: &Url, deadline: Instant) -> Result<()> {
         self.validate_url_syntax(url)?;
         let host = url.host_str().ok_or(HttpRequestError::SsrfBlocked {
             reason: SSRF_BLOCKED_MISSING_HOST,
         })?;
 
-        // Tokio's zero-duration timeout is allowed to poll an immediately
-        // ready future once before observing the deadline.  Treat a zero DNS
-        // budget as an explicit fail-closed configuration so a local cache or
-        // resolver cannot bypass the caller's safety boundary.
-        if self.config.dns_timeout.is_zero() {
+        // Tokio's elapsed timeout is allowed to poll an immediately ready
+        // future once before observing the deadline. Treat an exhausted
+        // operation budget as fail-closed so a local cache or resolver cannot
+        // bypass the caller's safety boundary.
+        if deadline <= Instant::now() {
             return Err(HttpRequestError::SsrfBlocked {
                 reason: SSRF_BLOCKED_DNS_TIMEOUT,
             });
@@ -619,7 +662,7 @@ impl SsrfProtector {
             })?;
         // `resolve_capped` materializes only the bounded, validated result;
         // preflight only needs to consume that proof, not copy it again.
-        let _ = tokio::time::timeout(self.config.dns_timeout, self.resolve_capped(name))
+        let _ = tokio::time::timeout_at(deadline, self.resolve_capped(name))
             .await
             .map_err(|_| HttpRequestError::SsrfBlocked {
                 reason: SSRF_BLOCKED_DNS_TIMEOUT,
@@ -708,21 +751,32 @@ pub(crate) fn request_body_len(request: &Request) -> Option<usize> {
     None
 }
 
-pub(crate) fn is_blocked_ip(ip: IpAddr, allow_loopback_ips: bool) -> bool {
+/// Reports whether the tenant SSRF policy refuses to connect to `ip`.
+///
+/// An address is blocked when a reserved IPv4 or IPv6 range contains it, or
+/// when any IPv4 address embedded in an IPv6 address (mapped, compatible,
+/// ISATAP, or well-known NAT64) is blocked. Decoding an embedded address only
+/// adds blocking reasons; it never exempts a reserved IPv6 range.
+/// `allow_loopback_ips` exempts only loopback destinations.
+#[must_use]
+pub fn is_blocked_ip(ip: IpAddr, allow_loopback_ips: bool) -> bool {
     if allow_loopback_ips && ip.is_loopback() {
         return false;
     }
-    if let IpAddr::V6(ipv6) = ip {
-        // Normalize IPv4-compatible and mapped forms before applying the
-        // shared IPv4 reserved-range policy.
-        if let Some(ipv4) = ipv6.to_ipv4().or_else(|| isatap_ipv4(ipv6)) {
-            return is_blocked_ip(IpAddr::V4(ipv4), allow_loopback_ips);
-        }
-        if let Some(ipv4) = well_known_nat64_ipv4(ipv6) {
-            return is_blocked_ip(IpAddr::V4(ipv4), allow_loopback_ips);
-        }
+    if reserved_ip_ranges().iter().any(|range| range.contains(&ip)) {
+        return true;
     }
-    reserved_ip_ranges().iter().any(|range| range.contains(&ip))
+    let IpAddr::V6(ipv6) = ip else {
+        return false;
+    };
+    [
+        ipv6.to_ipv4(),
+        isatap_ipv4(ipv6),
+        well_known_nat64_ipv4(ipv6),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|ipv4| is_blocked_ip(IpAddr::V4(ipv4), allow_loopback_ips))
 }
 
 fn isatap_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
@@ -749,13 +803,14 @@ pub(crate) fn match_allowlisted_domain<'a>(
     let host = host.to_ascii_lowercase();
     let mut best: Option<&AllowedDomain> = None;
 
+    // `build` admits only canonical lowercase entries, so they compare as-is.
     for domain in domains {
-        let candidate = domain.host.to_ascii_lowercase();
-        let matches = if domain.allow_subdomains {
-            host == candidate || host.ends_with(&format!(".{candidate}"))
-        } else {
-            host == candidate
-        };
+        let candidate = domain.host.as_str();
+        let matches = host == candidate
+            || (domain.allow_subdomains
+                && host
+                    .strip_suffix(candidate)
+                    .is_some_and(|prefix| prefix.ends_with('.')));
         if !matches {
             continue;
         }
@@ -772,6 +827,29 @@ pub(crate) fn match_allowlisted_domain<'a>(
     }
 
     best
+}
+
+/// Accept only the host form that `Url::host_str` reports for a special
+/// scheme, so an entry matches exactly the hosts it names. Empty, dot-only,
+/// trailing-dot, uppercase, percent-encoded, and Unicode entries never equal
+/// a parsed host; IP literals are allowed only as loopback test destinations.
+fn is_canonical_allowed_host(entry: &str, allow_loopback_ips: bool) -> bool {
+    match url::Host::parse(entry) {
+        Ok(url::Host::Domain(domain)) => domain == entry && !domain.split('.').any(str::is_empty),
+        Ok(url::Host::Ipv4(ip)) => {
+            allow_loopback_ips && ip.is_loopback() && ip.to_string() == entry
+        }
+        Ok(url::Host::Ipv6(ip)) => allow_loopback_ips && ip.is_loopback() && entry == "[::1]",
+        Err(_) => false,
+    }
+}
+
+/// Saturate like `tokio::time::sleep`: an unrepresentable budget is
+/// effectively unbounded rather than a panic.
+fn deadline_after(budget: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(budget)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30))
 }
 
 fn same_host_and_port(left: &Url, right: &Url) -> bool {

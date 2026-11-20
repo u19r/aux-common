@@ -133,14 +133,14 @@ async fn given_overflowing_invocation_budget_when_beginning_then_reject_without_
 async fn bind(writer: BufferedWrites<u32>) -> LambdaExtensionServer<u32> {
     LambdaExtensionServer::bind(
         writer,
-        LambdaIpcConfig::try_new("127.0.0.1:0".parse().unwrap(), "test-token").unwrap(),
+        LambdaIpcConfig::try_new("127.0.0.1:0".parse().unwrap(), "test-token-0123456789").unwrap(),
     )
     .await
     .unwrap()
 }
 fn runtime(server: &LambdaExtensionServer<u32>) -> LambdaExtensionClient<u32> {
     LambdaExtensionClient::new(
-        LambdaIpcConfig::try_new(server.local_addr().unwrap(), "test-token").unwrap(),
+        LambdaIpcConfig::try_new(server.local_addr().unwrap(), "test-token-0123456789").unwrap(),
     )
 }
 async fn client(server: &LambdaExtensionServer<u32>, id: &str) -> LambdaInvocation<u32> {
@@ -177,7 +177,7 @@ async fn given_wrong_authority_or_stale_invocation_when_submitting_then_reject_w
         .unwrap();
     let serving = serve(&server);
     let mut wrong = LambdaExtensionClient::<u32>::new(
-        LambdaIpcConfig::try_new(server.local_addr().unwrap(), "wrong-token").unwrap(),
+        LambdaIpcConfig::try_new(server.local_addr().unwrap(), "wrong-token-0123456789").unwrap(),
     );
     assert!(matches!(
         wrong.begin_invocation("invoke-1", "attempt-1").await,
@@ -317,11 +317,12 @@ async fn given_accepted_admission_with_lost_ipc_ack_when_retried_then_reuse_oper
             "real server acknowledged before the proxy drops the reply"
         );
     });
-    let faulty =
-        LambdaExtensionClient::new(LambdaIpcConfig::try_new(proxy_address, "test-token").unwrap())
-            .begin_invocation("invoke-1", "attempt-invoke-1")
-            .await
-            .unwrap();
+    let faulty = LambdaExtensionClient::new(
+        LambdaIpcConfig::try_new(proxy_address, "test-token-0123456789").unwrap(),
+    )
+    .begin_invocation("invoke-1", "attempt-invoke-1")
+    .await
+    .unwrap();
     let operation_id = match faulty.add_write_item(7u32).await.unwrap_err() {
         WriteError::Ambiguous { operation_id } => operation_id,
         other => panic!("lost post-dispatch reply must be ambiguous: {other:?}"),
@@ -375,7 +376,7 @@ async fn given_oversized_or_stalled_frame_when_server_recovers_then_next_admissi
         .with_clock(TestClock::new())
         .build()
         .unwrap();
-    let config = LambdaIpcConfig::try_new("127.0.0.1:0".parse().unwrap(), "test-token")
+    let config = LambdaIpcConfig::try_new("127.0.0.1:0".parse().unwrap(), "test-token-0123456789")
         .unwrap()
         .try_with_timeout(Duration::from_millis(100))
         .unwrap();
@@ -424,15 +425,17 @@ async fn given_invalid_configuration_or_oversized_encoding_when_client_runs_then
     assert!(LambdaIpcConfig::try_new("10.0.0.1:1234".parse().unwrap(), "token").is_err());
     assert!(LambdaIpcConfig::try_new("127.0.0.1:1234".parse().unwrap(), "").is_err());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let config = LambdaIpcConfig::try_new(listener.local_addr().unwrap(), "private-token").unwrap();
-    assert!(!format!("{config:?}").contains("private-token"));
+    let config =
+        LambdaIpcConfig::try_new(listener.local_addr().unwrap(), "private-token-0123456789")
+            .unwrap();
+    assert!(!format!("{config:?}").contains("private-token-0123456789"));
     assert!(config.clone().try_with_timeout(Duration::ZERO).is_err());
     assert!(config.clone().try_with_timeout(Duration::MAX).is_err());
     let binding = tokio::spawn({
         let address = listener.local_addr().unwrap();
         async move {
             LambdaExtensionClient::<String>::new(
-                LambdaIpcConfig::try_new(address, "private-token").unwrap(),
+                LambdaIpcConfig::try_new(address, "private-token-0123456789").unwrap(),
             )
             .begin_invocation("invoke-1", "attempt-1")
             .await
@@ -470,7 +473,9 @@ async fn given_persistent_driver_or_periodic_policy_when_binding_extension_then_
             builder.build().unwrap()
         }
     }
-    let config = || LambdaIpcConfig::try_new("127.0.0.1:0".parse().unwrap(), "test-token").unwrap();
+    let config = || {
+        LambdaIpcConfig::try_new("127.0.0.1:0".parse().unwrap(), "test-token-0123456789").unwrap()
+    };
     let persistent = writer(false);
     let guard = persistent
         .start(buffered_writes::Lifecycle::tokio())
@@ -524,7 +529,8 @@ async fn given_busy_endpoint_when_extension_bind_fails_then_writer_driver_slot_r
         .build()
         .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let config = LambdaIpcConfig::try_new(listener.local_addr().unwrap(), "test-token").unwrap();
+    let config =
+        LambdaIpcConfig::try_new(listener.local_addr().unwrap(), "test-token-0123456789").unwrap();
     assert!(
         LambdaExtensionServer::bind(writer.clone(), config)
             .await
@@ -647,11 +653,12 @@ async fn given_mismatched_admission_receipt_when_client_receives_it_then_preserv
         stream.write_u32(reply.len() as u32).await.unwrap();
         stream.write_all(reply.as_bytes()).await.unwrap();
     });
-    let client =
-        LambdaExtensionClient::new(LambdaIpcConfig::try_new(address, "test-token").unwrap())
-            .begin_invocation("invoke-1", "attempt-1")
-            .await
-            .unwrap();
+    let client = LambdaExtensionClient::new(
+        LambdaIpcConfig::try_new(address, "test-token-0123456789").unwrap(),
+    )
+    .begin_invocation("invoke-1", "attempt-1")
+    .await
+    .unwrap();
     let operation_id = OperationId::generate_v7();
     assert_eq!(
         client
@@ -719,9 +726,11 @@ async fn given_bind_ack_is_lost_when_runtime_rebinds_then_recover_same_phase_and
         );
     });
     let binding = tokio::spawn(async move {
-        LambdaExtensionClient::<u32>::new(LambdaIpcConfig::try_new(address, "test-token").unwrap())
-            .begin_invocation("same-request", "attempt-1")
-            .await
+        LambdaExtensionClient::<u32>::new(
+            LambdaIpcConfig::try_new(address, "test-token-0123456789").unwrap(),
+        )
+        .begin_invocation("same-request", "attempt-1")
+        .await
     });
     tokio::task::yield_now().await;
     assert!(
@@ -779,4 +788,51 @@ async fn given_bind_ack_is_lost_when_runtime_rebinds_then_recover_same_phase_and
         2
     );
     serving.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn given_idle_local_peer_when_function_submits_then_listener_frees_after_short_read_deadline()
+{
+    let sink = AtomicSink::try_new(SinkLimits::default(), |_: WriteAttempt<u32>| async {
+        Ok::<(), SinkError>(())
+    })
+    .unwrap();
+    let writer = BufferedWrites::builder("lambda-idle-peer/v1", sink)
+        .with_clock(TestClock::new())
+        .build()
+        .unwrap();
+    let config = LambdaIpcConfig::try_new("127.0.0.1:0".parse().unwrap(), "test-token-0123456789")
+        .unwrap()
+        .try_with_timeout(Duration::from_secs(10))
+        .unwrap();
+    let server = LambdaExtensionServer::bind(writer, config).await.unwrap();
+    server
+        .begin_invocation("event-invoke-1", "invoke-1", Duration::from_secs(20))
+        .unwrap();
+    let serving = serve(&server);
+    let _idle = tokio::net::TcpStream::connect(server.local_addr().unwrap())
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+
+    client(&server, "invoke-1")
+        .await
+        .add_write_item(1)
+        .await
+        .unwrap();
+
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "an idle peer held the listener for the exchange timeout"
+    );
+    server.shutdown(Duration::from_secs(1)).await.unwrap();
+    serving.await.unwrap().unwrap();
+}
+
+#[test]
+fn given_guessable_capability_token_when_configuring_then_rejected() {
+    let address = "127.0.0.1:1234".parse().unwrap();
+    assert!(LambdaIpcConfig::try_new(address, "x").is_err());
+    assert!(LambdaIpcConfig::try_new(address, "0123456789abcde").is_err());
+    assert!(LambdaIpcConfig::try_new(address, "0123456789abcdef").is_ok());
 }

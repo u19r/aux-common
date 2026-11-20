@@ -46,5 +46,5 @@ pub use response::HttpResponse;
 pub use retry::RetryConfig;
 pub use tenant::{
     AllowedDomain, TenantHttpClient, TenantHttpClientBuilder, TenantHttpRequestConfig,
-    TenantRequestBuilder,
+    TenantRequestBuilder, is_blocked_ip,
 };

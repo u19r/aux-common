@@ -5,7 +5,9 @@ mod deduplication;
 mod keyspace;
 
 pub(crate) use constants::MAX_DURABLE_PERMIT_SLOTS;
-pub(crate) use deduplication::{decode_dedupe_value, dedupe_expiry_key, dedupe_key, dedupe_value};
+pub(crate) use deduplication::{
+    DedupeIdentity, decode_dedupe_value, dedupe_expiry_key, dedupe_key, dedupe_value,
+};
 pub(crate) use keyspace::{
     cancellation_key, cancellation_value, dead_letter_key, dead_letter_value,
     decode_active_operation, decode_due_key, decode_operation_authority, decode_timestamp_value,

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    Clock, Deadline, DeliveryPolicy, Namespace, QueueError, RecordCodec, ReplayQueue,
+    Clock, Deadline, DeliveryPolicy, EnvelopeKey, Namespace, QueueError, RecordCodec, ReplayQueue,
     WriteObserver, WriteSink,
 };
 
@@ -13,6 +13,9 @@ pub struct ReplayReport {
     pub batches_retained: usize,
     pub batches_quarantined: usize,
     pub partial_operations_completed: usize,
+    /// Envelopes whose queue operation failed; they stay on the queue for a
+    /// later pass and do not stop this one.
+    pub envelopes_failed: usize,
 }
 
 /// Replay worker that drains a [`ReplayQueue`] into a [`WriteSink`] with
@@ -22,6 +25,7 @@ pub struct ReplayWorker<T> {
     pub(super) namespace: Namespace,
     pub(super) strategy_version: String,
     pub(super) queue: Arc<dyn ReplayQueue>,
+    pub(super) key: EnvelopeKey,
     pub(super) sink: Arc<dyn WriteSink<T>>,
     pub(super) codec: Arc<dyn RecordCodec<T>>,
     pub(super) policy: DeliveryPolicy,
@@ -30,15 +34,17 @@ pub struct ReplayWorker<T> {
 }
 
 impl<T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static> ReplayWorker<T> {
-    /// Configure replay with the same namespace, codec, and strategy as the
-    /// producer.
+    /// Configure replay with the same namespace, envelope key, codec, and
+    /// strategy as the producer. Envelopes that do not authenticate under
+    /// `key` are quarantined as poison.
     #[must_use]
     pub fn builder(
         namespace: impl Into<String>,
         queue: impl ReplayQueue,
+        key: EnvelopeKey,
         sink: impl WriteSink<T>,
     ) -> super::builder::ReplayBuilder<T> {
-        super::builder::ReplayBuilder::new(namespace.into(), queue, sink)
+        super::builder::ReplayBuilder::new(namespace.into(), queue, key, sink)
     }
 }
 
@@ -57,8 +63,13 @@ impl<T: Send + Sync + 'static> ReplayWorker<T> {
             ..ReplayReport::default()
         };
         for envelope in envelopes {
-            self.deliver_envelope(envelope, deadline, &mut report)
-                .await?;
+            if self
+                .deliver_envelope(envelope, deadline, &mut report)
+                .await
+                .is_err()
+            {
+                report.envelopes_failed = report.envelopes_failed.saturating_add(1);
+            }
         }
         Ok(report)
     }

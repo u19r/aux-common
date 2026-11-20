@@ -174,24 +174,28 @@ A `FlushReport` can contain `buffer_error` independently of a sink error.
 For replay, use the producer's namespace, codec, strategy version, and destination receipt contract:
 
 ```rust
-use buffered_writes::{AtomicSink, ConfigurationError, ReplayQueue, ReplayWorker};
+use buffered_writes::{AtomicSink, ConfigurationError, EnvelopeKey, ReplayQueue, ReplayWorker};
 
 fn configure_replay(
     queue: impl ReplayQueue,
+    key: EnvelopeKey,
     sink: AtomicSink<u64>,
 ) -> Result<ReplayWorker<u64>, ConfigurationError> {
-    ReplayWorker::builder("example/totals/v1", queue, sink).build()
+    ReplayWorker::builder("example/totals/v1", queue, key, sink).build()
 }
 ```
 
 Replay renews visibility before a bounded attempt. It acknowledges only complete delivery.
 Unknown outcomes and incomplete partial responses retain the original envelope for retry.
+Writers and replay workers of one namespace share an `EnvelopeKey` of at least 32 secret bytes.
+Each queued batch carries an HMAC-SHA256 tag over its digest; the digest alone detects corruption
+only. Replay quarantines envelopes it cannot authenticate and requires a quarantine target.
 The queue adapter must preserve the versioned JSON quarantine record before removing the source
-message. Format v1 contains `version`, `reason`, `envelope_base64` (the exact original bytes), and
-`completed_operation_ids`. Permanent partial replay preserves known progress without rewriting the
+message. Format v2 contains `version`, `reason`, `envelope_bytes`, `envelope_sha256`,
+`envelope_base64`, `truncated`, and `completed_operation_ids`. The record fits the queue body limit;
+when the whole envelope does not fit, `envelope_base64` holds a prefix and `truncated` is true. Permanent partial replay preserves known progress without rewriting the
 sealed batch or claiming rollback. `ReplayReport::partial_operations_completed` and `PartialProgress`
-expose that progress. Quarantine bodies are larger than source envelopes because of base64 and
-metadata; configure destination quotas accordingly. A failed quarantine publication retains the source;
+expose that progress. A failed quarantine publication retains the source;
 replaying it still requires the sink's declared idempotency guarantees.
 Repeated delivery is safe only when the sink implements its declared atomic or independently idempotent receipt contract.
 
@@ -330,12 +334,11 @@ service strongly consistent; see the [WAITAOF contract](https://valkey.io/comman
 
 Enable `sqs` for the SDK-free SQS outage spool. The production path uses common-owned credentials,
 SigV4 and HTTP implementations; official AWS and Smithy libraries are permitted only in tests.
-Use `QueueConfig::sqs(url).with_quarantine_url(other_url)` on the writer builder, or construct
+Use `QueueConfig::sqs(url, key).with_quarantine_url(other_url)` on the writer builder, or construct
 `SqsQueue::try_new(config)` for a standalone replay worker. The default body ceiling is 1 MiB;
 `with_max_envelope_bytes(bytes)` selects a smaller operator limit for both source and quarantine.
 The measured body includes the complete sealed envelope with canonical and prepared representations.
-JSON request escaping is transport overhead, not part of the SQS message-body quota. Expanded poison
-records may exceed the queue limit; rejection preserves the source message for operator recovery.
+JSON request escaping is transport overhead, not part of the SQS message-body quota. Quarantine rejection preserves the source message for operator recovery.
 See [SQS message quotas](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/quotas-messages.html).
 
 AWS JSON requests use the service-root URI and preserve QueueUrl in the body. Endpoint overrides

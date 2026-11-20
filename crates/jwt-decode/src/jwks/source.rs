@@ -249,7 +249,8 @@ impl LocalSymmetricKey {
         if key_id.is_empty() || secret.len() < MIN_HMAC_KEY_BYTES {
             return Err(JwtDecodeError::new(JwtDecodeErrorKind::InvalidKey));
         }
-        let decoding_key = DecodingKey::from_secret(&secret);
+        let decoding_key = DecodingKey::from_secret(&secret)
+            .map_err(|_| JwtDecodeError::new(JwtDecodeErrorKind::InvalidKey))?;
         Ok(Self {
             key_id,
             decoding_key,
@@ -361,6 +362,7 @@ impl Default for JwksCachePolicy {
 #[cfg(not(target_arch = "wasm32"))]
 pub struct RemoteJwksSource {
     url: JwksUrl,
+    http_client: HttpClient,
     cache: FetchingLruTtlCache<JwksCacheKey, Arc<JwksDocument>, JwtDecodeError>,
     policy: JwksCachePolicy,
     unknown_kid_refreshes: Arc<Mutex<HashMap<String, Instant>>>,
@@ -390,8 +392,9 @@ impl RemoteJwksSource {
     pub fn new(url: JwksUrl, policy: JwksCachePolicy, http_client: HttpClient) -> Self {
         let fetch_url = url.clone();
         let fetch_policy = policy.clone();
+        let fetch_client = http_client.clone();
         let fetch = arc_fetch_fn(move |key: JwksCacheKey| {
-            let client = http_client.clone();
+            let client = fetch_client.clone();
             let url = fetch_url.clone();
             let policy = fetch_policy.clone();
             async move {
@@ -408,6 +411,7 @@ impl RemoteJwksSource {
         );
         Self {
             url,
+            http_client,
             cache,
             policy,
             unknown_kid_refreshes: Arc::new(Mutex::new(HashMap::new())),
@@ -427,16 +431,21 @@ impl RemoteJwksSource {
         value.ok_or_else(|| JwtDecodeError::new(JwtDecodeErrorKind::JwksCache))
     }
 
+    /// Forces one refetch for an unknown `kid`. The current document stays
+    /// cached until a replacement fetches and parses successfully, so an
+    /// unknown-`kid` token sent during an endpoint outage cannot evict the last
+    /// good document. The key is captured before the fetch: an invalidation
+    /// that lands mid-fetch moves readers to a new generation, and this result
+    /// cannot repopulate it.
     async fn refresh_document_for_issuer(&self, issuer: &str) -> Result<Arc<JwksDocument>> {
         if !self.allow_unknown_kid_refresh(issuer) {
             return self.document_for_issuer(issuer).await;
         }
         let key = self.cache_key(issuer);
-        self.cache.remove(&key);
-        self.cache
-            .get_or_fetch(&key)
-            .await?
-            .ok_or_else(|| JwtDecodeError::new(JwtDecodeErrorKind::JwksCache))
+        let document = fetch_remote_jwks(&self.http_client, &self.url, &self.policy).await?;
+        let document = Arc::new(document);
+        self.cache.insert(key, Arc::clone(&document));
+        Ok(document)
     }
 
     pub fn invalidate_issuer(&self, issuer: &str) {

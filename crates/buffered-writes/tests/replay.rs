@@ -5,12 +5,25 @@ use std::{
 };
 
 use buffered_writes::{
-    AtomicSink, BufferedWrites, Deadline, InMemoryQueue, OperationStatus, PartialSink, QueueError,
-    QueueLimits, QueueReceipt, ReceivedEnvelope, ReplayQueue, ReplayWorker, SealedBatch, SinkError,
-    SinkLimits, WriteAttempt, WriteOutcome, WriteQueue,
+    AtomicSink, BufferedWrites, Deadline, EnvelopeKey, InMemoryQueue, OperationStatus, PartialSink,
+    QueueEnvelope, QueueError, QueueLimits, QueueReceipt, ReceivedEnvelope, ReplayQueue,
+    ReplayWorker, SealedBatch, SinkError, SinkLimits, WriteAttempt, WriteOutcome, WriteQueue,
 };
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
+
+fn envelope_key() -> EnvelopeKey {
+    EnvelopeKey::try_new([7; 32]).unwrap()
+}
+
+fn seal(batch: &SealedBatch) -> Bytes {
+    envelope_key().seal(batch.clone()).unwrap().bytes().clone()
+}
+
+fn batch_input(envelope: &[u8]) -> buffered_writes::SealedBatchInput {
+    let value: serde_json::Value = serde_json::from_slice(envelope).unwrap();
+    serde_json::from_value(value["batch"].clone()).unwrap()
+}
 
 async fn envelope() -> Bytes {
     let captured = Arc::new(Mutex::new(None));
@@ -24,13 +37,7 @@ async fn envelope() -> Bytes {
     writer.add_write_item(1).await.unwrap();
     writer.add_write_item(2).await.unwrap();
     writer.flush_writes().await;
-    captured
-        .lock()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .to_envelope_bytes()
-        .unwrap()
+    seal(captured.lock().unwrap().as_ref().unwrap())
 }
 
 #[derive(Clone)]
@@ -47,13 +54,16 @@ impl WriteQueue for HungQueue {
     }
     fn publish(
         &self,
-        batch: SealedBatch,
+        envelope: QueueEnvelope,
         deadline: Deadline,
     ) -> BoxFuture<'static, Result<QueueReceipt, QueueError>> {
-        self.inner.publish(batch, deadline)
+        self.inner.publish(envelope, deadline)
     }
 }
 impl ReplayQueue for HungQueue {
+    fn has_quarantine_target(&self) -> bool {
+        self.inner.has_quarantine_target()
+    }
     fn receive(
         &self,
         max: usize,
@@ -98,6 +108,13 @@ impl ReplayQueue for HungQueue {
         if self.stage == 4 {
             return Box::pin(std::future::pending());
         }
+        if self.stage == 6 {
+            return Box::pin(async {
+                Err(QueueError::Permanent {
+                    reason: "quarantine destination rejected the record",
+                })
+            });
+        }
         self.inner.quarantine(receipt, bytes, reason, deadline)
     }
 }
@@ -130,6 +147,7 @@ async fn given_hung_replay_boundary_when_deadline_expires_then_return_without_ac
                 quarantines: Arc::default(),
                 receives: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             },
+            envelope_key(),
             sink,
         )
         .build()
@@ -162,7 +180,7 @@ async fn given_incomplete_partial_result_when_replayed_then_keep_message_for_ret
         },
     )
     .unwrap();
-    let worker = ReplayWorker::builder("replay/v1", queue.clone(), sink)
+    let worker = ReplayWorker::builder("replay/v1", queue.clone(), envelope_key(), sink)
         .build()
         .unwrap();
     let report = worker
@@ -199,7 +217,7 @@ async fn given_partial_outcome_when_expected_identities_match_then_acknowledge_o
             },
         )
         .unwrap();
-        let worker = ReplayWorker::builder("replay/v1", queue.clone(), sink)
+        let worker = ReplayWorker::builder("replay/v1", queue.clone(), envelope_key(), sink)
             .build()
             .unwrap();
         let report = worker
@@ -215,7 +233,7 @@ async fn given_partial_outcome_when_expected_identities_match_then_acknowledge_o
 #[tokio::test]
 async fn given_incompatible_replay_when_validated_then_quarantine_before_sink_effects() {
     let bytes = envelope().await;
-    let batch = SealedBatch::from_envelope_bytes(&bytes).unwrap();
+    let batch = envelope_key().open(&bytes).unwrap();
     for incompatible_strategy in [false, true] {
         let queue = InMemoryQueue::default();
         queue.inject_raw_envelope(bytes.clone());
@@ -228,7 +246,7 @@ async fn given_incompatible_replay_when_validated_then_quarantine_before_sink_ef
         .unwrap();
         let clock =
             buffered_writes::TestClock::with_utc_millis(batch.first_item_time_ms() + 31_000);
-        let mut builder = ReplayWorker::builder("replay/v1", queue.clone(), sink)
+        let mut builder = ReplayWorker::builder("replay/v1", queue.clone(), envelope_key(), sink)
             .with_clock(clock)
             .delivery_policy(buffered_writes::DeliveryPolicy {
                 max_replay_age: Some(Duration::from_secs(30)),
@@ -275,7 +293,7 @@ async fn given_unknown_commit_when_original_envelope_replays_then_keep_identity_
         }
     })
     .unwrap();
-    let worker = ReplayWorker::builder("replay/v1", queue.clone(), sink)
+    let worker = ReplayWorker::builder("replay/v1", queue.clone(), envelope_key(), sink)
         .build()
         .unwrap();
     let first = worker
@@ -307,7 +325,7 @@ async fn given_expired_replay_deadline_when_called_then_never_invoke_queue_trans
         Ok::<(), SinkError>(())
     })
     .unwrap();
-    let worker = ReplayWorker::builder("replay/v1", queue, sink)
+    let worker = ReplayWorker::builder("replay/v1", queue, envelope_key(), sink)
         .build()
         .unwrap();
     let result = worker
@@ -319,15 +337,14 @@ async fn given_expired_replay_deadline_when_called_then_never_invoke_queue_trans
 
 #[tokio::test]
 async fn given_extreme_persisted_age_when_replayed_then_expire_without_sink_effects() {
-    let mut input: buffered_writes::SealedBatchInput =
-        serde_json::from_slice(&envelope().await).unwrap();
+    let mut input = batch_input(&envelope().await);
     input.first_item_time_ms = i64::MIN;
     for record in Arc::make_mut(&mut input.records) {
         record.admitted_at_utc_ms = i64::MIN;
     }
     let batch = SealedBatch::try_new(input).unwrap();
     let queue = InMemoryQueue::default();
-    queue.inject_raw_envelope(batch.to_envelope_bytes().unwrap());
+    queue.inject_raw_envelope(seal(&batch));
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed = calls.clone();
     let sink = AtomicSink::try_new(SinkLimits::default(), move |_: WriteAttempt<u32>| {
@@ -335,7 +352,7 @@ async fn given_extreme_persisted_age_when_replayed_then_expire_without_sink_effe
         async { Ok::<(), SinkError>(()) }
     })
     .unwrap();
-    let worker = ReplayWorker::builder("replay/v1", queue.clone(), sink)
+    let worker = ReplayWorker::builder("replay/v1", queue.clone(), envelope_key(), sink)
         .delivery_policy(buffered_writes::DeliveryPolicy {
             max_replay_age: Some(Duration::from_secs(30)),
             ..buffered_writes::DeliveryPolicy::default()
@@ -355,7 +372,7 @@ async fn given_extreme_persisted_age_when_replayed_then_expire_without_sink_effe
 async fn given_future_persisted_time_when_finite_replay_window_is_required_then_quarantine_before_sink_effects()
  {
     let bytes = envelope().await;
-    let batch = SealedBatch::from_envelope_bytes(&bytes).unwrap();
+    let batch = envelope_key().open(&bytes).unwrap();
     let queue = InMemoryQueue::default();
     queue.inject_raw_envelope(bytes);
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -366,7 +383,7 @@ async fn given_future_persisted_time_when_finite_replay_window_is_required_then_
     })
     .unwrap();
     let observer = buffered_writes::RecordingWriteObserver::default();
-    let worker = ReplayWorker::builder("replay/v1", queue.clone(), sink)
+    let worker = ReplayWorker::builder("replay/v1", queue.clone(), envelope_key(), sink)
         .with_observer(observer.clone())
         .with_clock(buffered_writes::TestClock::with_utc_millis(
             batch.first_item_time_ms() - 1_000,
@@ -397,7 +414,7 @@ async fn given_permanent_partial_replay_when_quarantined_then_preserve_original_
  {
     use base64::Engine as _;
     let bytes = envelope().await;
-    let batch = SealedBatch::from_envelope_bytes(&bytes).unwrap();
+    let batch = envelope_key().open(&bytes).unwrap();
     let completed = batch.operation_ids()[0].clone();
     let sink = PartialSink::try_new(
         SinkLimits::default(),
@@ -421,7 +438,7 @@ async fn given_permanent_partial_replay_when_quarantined_then_preserve_original_
     };
     queue.inner.inject_raw_envelope(bytes.clone());
     let observer = buffered_writes::RecordingWriteObserver::default();
-    let worker = ReplayWorker::builder("replay/v1", queue.clone(), sink)
+    let worker = ReplayWorker::builder("replay/v1", queue.clone(), envelope_key(), sink)
         .with_observer(observer.clone())
         .build()
         .unwrap();
@@ -435,8 +452,10 @@ async fn given_permanent_partial_replay_when_quarantined_then_preserve_original_
     assert_eq!(queue.inner.queued_len(), 0);
     let records = queue.quarantines.lock().unwrap();
     let record: serde_json::Value = serde_json::from_slice(&records[0]).unwrap();
-    assert_eq!(record["version"], 1);
+    assert_eq!(record["version"], 2);
     assert_eq!(record["reason"], "PermanentSinkFailure");
+    assert_eq!(record["truncated"], false);
+    assert_eq!(record["envelope_bytes"], bytes.len());
     let original = base64::engine::general_purpose::STANDARD
         .decode(record["envelope_base64"].as_str().unwrap())
         .unwrap();
@@ -453,4 +472,76 @@ async fn given_permanent_partial_replay_when_quarantined_then_preserve_original_
                 remaining: 1
             })
     );
+}
+
+#[tokio::test]
+async fn given_forged_envelope_with_recomputed_digest_for_another_scope_when_replayed_then_quarantine_without_sink_effects()
+ {
+    let bytes = envelope().await;
+    let original: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let mut input = batch_input(&bytes);
+    input.batch_id = buffered_writes::BatchId::generate_v7();
+    input.scope = buffered_writes::TenantScope::try_new("victim-tenant").unwrap();
+    let forged = SealedBatch::try_new(input).unwrap();
+    let queue = InMemoryQueue::default();
+    // A recomputed digest with the original tag, then a tag from another key.
+    queue.inject_raw_envelope(
+        serde_json::to_vec(&serde_json::json!({"mac": original["mac"], "batch": forged})).unwrap(),
+    );
+    queue.inject_raw_envelope(
+        EnvelopeKey::try_new([9; 32])
+            .unwrap()
+            .seal(forged)
+            .unwrap()
+            .bytes()
+            .clone(),
+    );
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = calls.clone();
+    let sink = AtomicSink::try_new(SinkLimits::default(), move |_: WriteAttempt<u32>| {
+        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        async { Ok::<(), SinkError>(()) }
+    })
+    .unwrap();
+    let worker = ReplayWorker::builder("replay/v1", queue.clone(), envelope_key(), sink)
+        .build()
+        .unwrap();
+
+    let report = worker
+        .replay_once(2, Deadline::after(Duration::from_secs(1)))
+        .await
+        .unwrap();
+
+    assert_eq!(report.batches_quarantined, 2);
+    assert_eq!(report.batches_delivered, 0);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn given_poison_envelope_whose_quarantine_fails_when_replayed_then_later_envelopes_are_still_delivered()
+ {
+    let queue = HungQueue {
+        inner: InMemoryQueue::default(),
+        stage: 6,
+        quarantines: Arc::default(),
+        receives: Arc::default(),
+    };
+    queue.inner.inject_raw_envelope(Bytes::from_static(b"{}"));
+    queue.inner.inject_raw_envelope(envelope().await);
+    let sink = AtomicSink::try_new(SinkLimits::default(), |_: WriteAttempt<u32>| async {
+        Ok::<(), SinkError>(())
+    })
+    .unwrap();
+    let worker = ReplayWorker::builder("replay/v1", queue.clone(), envelope_key(), sink)
+        .build()
+        .unwrap();
+
+    let report = worker
+        .replay_once(2, Deadline::after(Duration::from_secs(1)))
+        .await
+        .unwrap();
+
+    assert_eq!(report.envelopes_failed, 1);
+    assert_eq!(report.batches_delivered, 1);
+    assert_eq!(queue.inner.acknowledged_count(), 1);
 }

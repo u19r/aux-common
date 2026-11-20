@@ -1,6 +1,6 @@
 //! Session context carrying authentication state for step-up evaluation.
 
-use chrono::Utc;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -78,7 +78,7 @@ impl SessionContext {
     }
 
     pub fn is_auth_recent(&self, max_age_seconds: u64) -> bool {
-        self.is_auth_recent_at(Utc::now().timestamp(), max_age_seconds)
+        self.is_auth_recent_at(Timestamp::now().as_second(), max_age_seconds)
     }
 
     pub fn is_auth_recent_at(&self, now_seconds: i64, max_age_seconds: u64) -> bool {
@@ -88,7 +88,7 @@ impl SessionContext {
     }
 
     pub fn is_mfa_recent(&self, max_age_seconds: u64) -> bool {
-        self.is_mfa_recent_at(Utc::now().timestamp(), max_age_seconds)
+        self.is_mfa_recent_at(Timestamp::now().as_second(), max_age_seconds)
     }
 
     pub fn is_mfa_recent_at(&self, now_seconds: i64, max_age_seconds: u64) -> bool {

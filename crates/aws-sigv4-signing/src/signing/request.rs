@@ -7,7 +7,7 @@ use super::{
     context::SigningContext,
     encoding::canonical_query,
 };
-use crate::{SignableBody, SigningError};
+use crate::{SignableBody, SigningError, constants::UNSIGNED_PAYLOAD};
 
 pub(crate) struct SigningRequest<'a> {
     pub(crate) method: &'a str,
@@ -53,36 +53,32 @@ impl SigningContext<'_> {
     /// The signed canonical query binds the original request query plus the
     /// `SigV4` parameters, excluding the signature itself. The delivered
     /// URL keeps the original query text and appends the signature last, so
-    /// the recipient re-canonicalizes to exactly the signed set.
+    /// the recipient re-canonicalizes to exactly the signed set. The payload
+    /// is always `UNSIGNED-PAYLOAD`, which S3 query authentication uses when it
+    /// rebuilds the canonical request; a body hash would never verify.
     pub(crate) fn presign(
         &self,
-        request: &SigningRequest<'_>,
+        method: &str,
+        uri: &Uri,
+        headers: &HeaderMap,
         expiry: Duration,
     ) -> Result<Uri, SigningError> {
-        let headers = prepare_headers(request.uri, request.headers)?;
+        let headers = prepare_headers(uri, headers)?;
         let canonical_headers = CanonicalHeaders::try_from(&headers)?;
         let params = self.presign_parameters(&canonical_headers.names, expiry);
-        let hash = request.body.payload_hash()?;
-        let signed_query = canonical_query(request.uri.query(), &params);
+        let signed_query = canonical_query(uri.query(), &params);
         let canonical = canonical_headers.request(CanonicalRequest {
-            method: request.method,
-            uri: request.uri,
+            method,
+            uri,
             query: &signed_query,
-            payload_hash: &hash,
+            payload_hash: UNSIGNED_PAYLOAD,
             is_s3: self.is_s3(),
         });
         let signature = self.signature(&canonical)?;
-        let original = request
-            .uri
-            .path_and_query()
-            .map_or("/", |part| part.as_str());
-        let separator = if request.uri.query().is_some() {
-            '&'
-        } else {
-            '?'
-        };
+        let original = uri.path_and_query().map_or("/", |part| part.as_str());
+        let separator = if uri.query().is_some() { '&' } else { '?' };
         let params_query = canonical_query(None, &params);
-        let mut parts = request.uri.clone().into_parts();
+        let mut parts = uri.clone().into_parts();
         parts.path_and_query = Some(
             format!("{original}{separator}{params_query}&X-Amz-Signature={signature}")
                 .parse()

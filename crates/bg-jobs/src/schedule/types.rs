@@ -74,8 +74,9 @@ impl Default for ScheduleMaterializationBudget {
     }
 }
 
-/// Immutable job fields copied into every occurrence.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Immutable job fields copied into every occurrence. `Debug` reports the
+/// payload's length, never its bytes.
+#[derive(Clone, PartialEq, Eq)]
 pub struct JobTemplate {
     pub kind: crate::ids::JobKind,
     pub schema_version: NonZeroU16,
@@ -88,8 +89,9 @@ pub struct JobTemplate {
     pub deduplication: Option<Deduplication>,
 }
 
-/// Validated inputs for a recurring job template.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Validated inputs for a recurring job template. `Debug` reports the
+/// payload's length, never its bytes.
+#[derive(Clone, PartialEq, Eq)]
 pub struct JobTemplateInput {
     pub kind: crate::ids::JobKind,
     pub schema_version: NonZeroU16,
@@ -101,6 +103,30 @@ pub struct JobTemplateInput {
     pub retry_override: Option<RetrySelection>,
     pub deduplication: Option<Deduplication>,
 }
+
+macro_rules! debug_job_template {
+    ($type:ident) => {
+        impl std::fmt::Debug for $type {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter
+                    .debug_struct(stringify!($type))
+                    .field("kind", &self.kind)
+                    .field("schema_version", &self.schema_version)
+                    .field("payload_bytes", &self.payload.len())
+                    .field("fairness", &self.fairness)
+                    .field("ordering_key", &self.ordering_key)
+                    .field("priority", &self.priority)
+                    .field("expires_after", &self.expires_after)
+                    .field("retry_override", &self.retry_override)
+                    .field("deduplication", &self.deduplication)
+                    .finish()
+            }
+        }
+    };
+}
+
+debug_job_template!(JobTemplate);
+debug_job_template!(JobTemplateInput);
 
 impl JobTemplate {
     pub fn try_new(input: JobTemplateInput) -> Result<Self, ValidationError> {

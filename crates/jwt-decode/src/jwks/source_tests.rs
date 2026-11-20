@@ -172,7 +172,7 @@ async fn given_local_symmetric_source_when_kid_is_unknown_then_rejects_selection
     let token = jsonwebtoken::encode(
         &header,
         &valid_claims(),
-        &EncodingKey::from_secret(HMAC_SECRET),
+        &EncodingKey::from_secret(HMAC_SECRET).expect("valid HMAC test key"),
     )
     .expect("test token");
 
@@ -193,8 +193,8 @@ async fn given_local_symmetric_hs384_source_when_token_is_valid_then_accepts_sig
     let mut header = Header::new(Algorithm::HS384);
     header.kid = Some("hmac-384".to_owned());
     header.typ = Some("at+jwt".to_owned());
-    let token = jsonwebtoken::encode(&header, &valid_claims(), &EncodingKey::from_secret(&secret))
-        .expect("test token");
+    let key = EncodingKey::from_secret(&secret).expect("valid HMAC test key");
+    let token = jsonwebtoken::encode(&header, &valid_claims(), &key).expect("test token");
     let verifier = JwtVerifier::builder()
         .jwks_source(
             JwksSource::local_symmetric_key("hmac-384", secret.to_vec()).expect("strong local key"),
@@ -500,6 +500,54 @@ async fn given_default_remote_jwks_policy_when_refresh_fails_then_rejects_stale_
 }
 
 #[tokio::test]
+async fn given_cached_remote_jwks_when_unknown_kid_refresh_fails_then_cached_document_keeps_serving()
+ {
+    let claims = serde_json::to_vec(&valid_claims()).expect("claims");
+    let unknown = signed_raw_token(
+        br#"{"alg":"RS256","kid":"x-random","typ":"at+jwt"}"#,
+        &claims,
+    );
+    for stale_on_fetch_error in [false, true] {
+        // Given a cached document and an endpoint whose later fetches fail.
+        let transport = CountingTransport::from_results(vec![
+            Ok(mock_response(jwks())),
+            Err(HttpRequestError::Decode),
+            Err(HttpRequestError::Decode),
+        ]);
+        let attempts = Arc::clone(&transport.attempts);
+        let verifier = build_remote_verifier_with_policy(
+            transport,
+            JwksCachePolicy {
+                stale_on_fetch_error,
+                ..JwksCachePolicy::default()
+            },
+        );
+        verifier
+            .verify::<Claims>(&token(valid_claims()), &policy())
+            .await
+            .expect("initial JWKS fetch verifies");
+
+        // When an unknown-kid token forces a refresh that fails.
+        let error = verifier
+            .verify::<Claims>(&unknown, &policy())
+            .await
+            .expect_err("unknown key id must fail");
+        assert_eq!(error.kind(), &JwtDecodeErrorKind::JwksFetch);
+
+        // Then the last good document keeps serving the known key.
+        verifier
+            .verify::<Claims>(&token(valid_claims()), &policy())
+            .await
+            .expect("the cached document must survive a failed refresh");
+        assert_eq!(
+            2,
+            attempts.load(Ordering::SeqCst),
+            "stale_on_fetch_error: {stale_on_fetch_error}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn given_invalidation_during_a_jwks_fetch_when_fetch_completes_then_old_document_is_not_reused()
  {
     let transport = InvalidationRaceTransport {
@@ -647,8 +695,8 @@ async fn given_hs512_with_a_256_bit_local_secret_when_verifying_then_rejects_key
     let mut header = Header::new(Algorithm::HS512);
     header.kid = Some("hs512".to_owned());
     header.typ = Some("at+jwt".to_owned());
-    let token = jsonwebtoken::encode(&header, &valid_claims(), &EncodingKey::from_secret(&secret))
-        .expect("test token");
+    let key = EncodingKey::from_secret(&secret).expect("valid HMAC test key");
+    let token = jsonwebtoken::encode(&header, &valid_claims(), &key).expect("test token");
 
     let error = verifier
         .verify::<Claims>(&token, &policy())

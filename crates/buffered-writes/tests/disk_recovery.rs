@@ -52,7 +52,7 @@ async fn given_reserved_open_write_when_disk_reopens_then_keep_budget_and_seal_w
     let id = OperationId::generate_v7();
     let inspect = || BufferInspectRequest {
         operation_id: Some(id.clone()),
-        now_utc_ms: chrono::Utc::now().timestamp_millis(),
+        now_utc_ms: jiff::Timestamp::now().as_millisecond(),
         now_instant: std::time::Instant::now(),
         deadline: Deadline::after(Duration::from_secs(1)),
     };
@@ -626,7 +626,7 @@ async fn given_foreign_persisted_completion_when_disk_recovers_then_block_mutati
                 max_items: 25,
                 max_bytes: 64 * 1024,
                 lease_duration: Duration::from_secs(5),
-                now_utc_ms: chrono::Utc::now().timestamp_millis(),
+                now_utc_ms: jiff::Timestamp::now().as_millisecond(),
                 now_instant: std::time::Instant::now(),
                 deadline: Deadline::after(Duration::from_secs(1)),
             })

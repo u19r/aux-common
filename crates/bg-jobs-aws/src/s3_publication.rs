@@ -53,7 +53,7 @@ impl TryFrom<S3ObjectInput> for S3ObjectPublication {
     type Error = S3PublicationError;
 
     fn try_from(input: S3ObjectInput) -> Result<Self, Self::Error> {
-        if !matches!(input.url.scheme(), "http" | "https")
+        if input.url.scheme() != "https"
             || !input.url.username().is_empty()
             || input.url.password().is_some()
             || input.url.fragment().is_some()

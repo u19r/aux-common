@@ -1,19 +1,21 @@
 use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use serde::{Serialize, de::DeserializeOwned};
+use subtle::ConstantTimeEq;
 use tokio::net::{TcpListener, TcpStream};
 
 use super::{
     configuration::LambdaIpcConfig,
     coordination::{InvocationCoordination, InvocationPermission, ServiceGuard},
     framing,
-    protocol::{IpcCommand, IpcRequest, IpcResponse},
+    protocol::{IpcAuthority, IpcCommand, IpcRequest, IpcResponse},
 };
 use crate::{
     BufferedWrites, Deadline, FlushReportSummary, LifecycleError, WriteEvent, WriteObserver,
     WriteOptions,
     constants::{
-        LAMBDA_EXTERNAL_EXTENSION_MAX_SHUTDOWN, LAMBDA_IPC_VERSION, LAMBDA_SHUTDOWN_SAFETY_MARGIN,
+        LAMBDA_EXTERNAL_EXTENSION_MAX_SHUTDOWN, LAMBDA_IPC_REQUEST_READ_TIMEOUT,
+        LAMBDA_IPC_VERSION, LAMBDA_SHUTDOWN_SAFETY_MARGIN,
     },
 };
 
@@ -173,16 +175,25 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> LambdaExtensionSer
         stream: &mut TcpStream,
         deadline: Deadline,
     ) -> Result<(), LifecycleError> {
-        let bytes = framing::read_frame(stream).await?;
-        let request: IpcRequest<T> =
-            serde_json::from_slice(&bytes).map_err(|_| LifecycleError::IpcProtocolViolation {
-                reason: "Lambda IPC request is invalid",
-            })?;
-        let response = if request.version != LAMBDA_IPC_VERSION
-            || request.auth_token != self.inner.config.token
-        {
+        let read_budget =
+            LAMBDA_IPC_REQUEST_READ_TIMEOUT.min(deadline.remaining_at(Instant::now()));
+        let bytes = tokio::time::timeout(read_budget, framing::read_frame(stream))
+            .await
+            .map_err(|_| LifecycleError::DeadlineExceeded)??;
+        let invalid = |_| LifecycleError::IpcProtocolViolation {
+            reason: "Lambda IPC request is invalid",
+        };
+        let authority: IpcAuthority = serde_json::from_slice(&bytes).map_err(invalid)?;
+        let response = if authority.version != LAMBDA_IPC_VERSION
+            || !bool::from(
+                authority
+                    .auth_token
+                    .as_bytes()
+                    .ct_eq(self.inner.config.token.as_bytes()),
+            ) {
             IpcResponse::Rejected
         } else {
+            let request: IpcRequest<T> = serde_json::from_slice(&bytes).map_err(invalid)?;
             self.process(request, deadline).await?
         };
         let bytes =

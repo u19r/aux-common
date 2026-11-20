@@ -291,8 +291,11 @@ async fn given_lambda_ipc_when_25_items_arrive_then_deliver_only_after_completio
         .unwrap();
     let server = buffered_writes::LambdaExtensionServer::bind(
         writer.clone(),
-        buffered_writes::LambdaIpcConfig::try_new("127.0.0.1:0".parse().unwrap(), "test-token")
-            .unwrap(),
+        buffered_writes::LambdaIpcConfig::try_new(
+            "127.0.0.1:0".parse().unwrap(),
+            "test-token-0123456789",
+        )
+        .unwrap(),
     )
     .await
     .unwrap();
@@ -308,8 +311,11 @@ async fn given_lambda_ipc_when_25_items_arrive_then_deliver_only_after_completio
         async move { server.serve().await }
     });
     let mut runtime = buffered_writes::LambdaExtensionClient::new(
-        buffered_writes::LambdaIpcConfig::try_new(server.local_addr().unwrap(), "test-token")
-            .unwrap(),
+        buffered_writes::LambdaIpcConfig::try_new(
+            server.local_addr().unwrap(),
+            "test-token-0123456789",
+        )
+        .unwrap(),
     );
 
     let client = runtime

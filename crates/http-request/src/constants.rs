@@ -37,6 +37,7 @@ pub(crate) const REDIRECT_BLOCKED_SCHEME_CHANGE: &str = "redirect_scheme_change"
 pub(crate) const REDIRECT_BLOCKED_TOO_MANY: &str = "redirect_limit_exceeded";
 
 pub(crate) const SSRF_BLOCKED_DOMAIN_NOT_ALLOWLISTED: &str = "domain_not_allowlisted";
+pub(crate) const SSRF_BLOCKED_ALLOWED_DOMAIN_INVALID: &str = "allowed_domain_invalid";
 pub(crate) const SSRF_BLOCKED_RESERVED_IP: &str = "reserved_ip";
 pub(crate) const SSRF_BLOCKED_IP_LITERAL: &str = "ip_literal_host";
 pub(crate) const SSRF_BLOCKED_MISSING_HOST: &str = "missing_host";

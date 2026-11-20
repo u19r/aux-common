@@ -37,6 +37,14 @@ pub(super) struct IpcRequest<T> {
     pub command: IpcCommand<T>,
 }
 
+/// The authority fields of an [`IpcRequest`]. The server decodes these, and
+/// skips the command without materialising it, before it authenticates.
+#[derive(Deserialize)]
+pub(super) struct IpcAuthority {
+    pub version: u16,
+    pub auth_token: String,
+}
+
 #[derive(Serialize, Deserialize)]
 pub(super) enum IpcCommand<T> {
     Bind {

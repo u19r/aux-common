@@ -8,7 +8,7 @@ use bytes::Bytes;
 use futures_util::future::BoxFuture;
 
 use crate::{
-    batch::SealedBatch,
+    batch::{EnvelopeKey, QueueEnvelope},
     configuration::Deadline,
     constants::SQS_MAX_MESSAGE_BYTES,
     error::{ConfigurationError, QueueError},
@@ -75,15 +75,21 @@ pub struct ReceivedEnvelope {
 pub trait WriteQueue: Send + Sync + 'static {
     fn limits(&self) -> &QueueLimits;
 
+    /// Publishes an envelope the writer sealed with its [`EnvelopeKey`].
     fn publish(
         &self,
-        batch: SealedBatch,
+        envelope: QueueEnvelope,
         deadline: Deadline,
     ) -> BoxFuture<'static, Result<QueueReceipt, QueueError>>;
 }
 
 /// Replay consumer contract extending [`WriteQueue`].
 pub trait ReplayQueue: WriteQueue {
+    /// Whether [`ReplayQueue::quarantine`] has a destination. Replay requires
+    /// one: a poison envelope that cannot be quarantined would be redelivered
+    /// forever and, on a FIFO queue, block its whole message group.
+    fn has_quarantine_target(&self) -> bool;
+
     fn receive(
         &self,
         max_messages: usize,
@@ -104,9 +110,10 @@ pub trait ReplayQueue: WriteQueue {
     ) -> BoxFuture<'static, Result<(), QueueError>>;
 
     /// Persist the worker's versioned JSON quarantine record before removing
-    /// the source message. It contains the original opaque envelope as
-    /// base64 and known completed operation IDs; transport quotas apply to
-    /// this expanded body.
+    /// the source message. It contains the envelope's length and SHA-256, the
+    /// envelope as base64 (only a prefix, marked `truncated`, when the whole
+    /// envelope would exceed [`QueueLimits::max_envelope_bytes`]), and known
+    /// completed operation IDs.
     fn quarantine(
         &self,
         receipt_handle: &str,
@@ -116,10 +123,12 @@ pub trait ReplayQueue: WriteQueue {
     ) -> BoxFuture<'static, Result<(), QueueError>>;
 }
 
-/// Fallback queue configuration for a writer builder.
+/// Fallback queue configuration for a writer builder. The envelope key seals
+/// every queued batch; the replay worker must use the same key.
 #[derive(Clone)]
 pub struct QueueConfig {
     pub(crate) inner: QueueConfigKind,
+    pub(crate) key: EnvelopeKey,
 }
 
 #[derive(Clone)]
@@ -159,8 +168,9 @@ impl std::fmt::Debug for QueueConfig {
 
 impl QueueConfig {
     #[must_use]
-    pub fn sqs(queue_url: impl Into<String>) -> Self {
+    pub fn sqs(queue_url: impl Into<String>, key: EnvelopeKey) -> Self {
         Self {
+            key,
             inner: QueueConfigKind::Sqs {
                 queue_url: queue_url.into(),
                 endpoint: None,
@@ -173,9 +183,10 @@ impl QueueConfig {
     }
 
     #[must_use]
-    pub fn custom<Q: WriteQueue>(queue: Q) -> Self {
+    pub fn custom<Q: WriteQueue>(queue: Q, key: EnvelopeKey) -> Self {
         Self {
             inner: QueueConfigKind::Custom(Arc::new(queue)),
+            key,
         }
     }
 
@@ -368,17 +379,13 @@ impl WriteQueue for InMemoryQueue {
 
     fn publish(
         &self,
-        batch: SealedBatch,
+        envelope: QueueEnvelope,
         _deadline: Deadline,
     ) -> BoxFuture<'static, Result<QueueReceipt, QueueError>> {
         let limits = self.limits;
         let state = Arc::clone(&self.state);
         Box::pin(async move {
-            let envelope_bytes = batch
-                .to_envelope_bytes()
-                .map_err(|_| QueueError::Permanent {
-                    reason: "failed to encode sealed batch envelope",
-                })?;
+            let envelope_bytes = envelope.bytes().clone();
             if envelope_bytes.len() > limits.max_envelope_bytes() {
                 return Err(QueueError::EnvelopeTooLarge {
                     size: envelope_bytes.len(),
@@ -408,6 +415,10 @@ impl WriteQueue for InMemoryQueue {
 }
 
 impl ReplayQueue for InMemoryQueue {
+    fn has_quarantine_target(&self) -> bool {
+        true
+    }
+
     fn receive(
         &self,
         max_messages: usize,

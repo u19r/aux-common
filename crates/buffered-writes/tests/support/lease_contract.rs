@@ -18,7 +18,7 @@ where
     F: Fn(Duration) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = jiff::Timestamp::now().as_millisecond();
     let ttl = Duration::from_millis(100);
     let deadline = Deadline::after(Duration::from_secs(5));
     let capacity = BufferCapacity::default();

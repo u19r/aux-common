@@ -17,6 +17,10 @@ use serde_json::{Value, json};
 
 // CLI/SSO support is test infrastructure only. Credential JSON never enters
 // logs or files.
+fn envelope_key() -> buffered_writes::EnvelopeKey {
+    buffered_writes::EnvelopeKey::try_new([7; 32]).unwrap()
+}
+
 struct TestQueues {
     profile: String,
     region: String,
@@ -72,7 +76,7 @@ impl TestQueues {
     fn queue(&self, source: &str, quarantine: &str) -> SqsQueue {
         let credentials = self.aws(&["configure", "export-credentials", "--format", "process"]);
         SqsQueue::try_new_with_client(
-            QueueConfig::sqs(source)
+            QueueConfig::sqs(source, envelope_key())
                 .with_region(&self.region)
                 .with_quarantine_url(quarantine),
             CredentialSource::Static(AwsStaticCredentials {
@@ -176,8 +180,9 @@ async fn given_real_sqs_when_duplicate_batches_replay_then_effect_once_and_poiso
     let queue = resources.queue(&source, &quarantine);
     let batch = sealed_batch().await;
     let deadline = Deadline::after(Duration::from_secs(45));
-    queue.publish(batch.clone(), deadline).await.unwrap();
-    queue.publish(batch, deadline).await.unwrap();
+    let envelope = envelope_key().seal(batch).unwrap();
+    queue.publish(envelope.clone(), deadline).await.unwrap();
+    queue.publish(envelope, deadline).await.unwrap();
     let effects = Arc::new(Mutex::new(BTreeSet::new()));
     let observed = effects.clone();
     let sink = AtomicSink::try_new(SinkLimits::default(), move |attempt: WriteAttempt<u32>| {
@@ -188,7 +193,7 @@ async fn given_real_sqs_when_duplicate_batches_replay_then_effect_once_and_poiso
         async { Ok::<(), SinkError>(()) }
     })
     .unwrap();
-    let worker = ReplayWorker::builder("native-sqs/v1", queue.clone(), sink)
+    let worker = ReplayWorker::builder("native-sqs/v1", queue.clone(), envelope_key(), sink)
         .build()
         .unwrap();
     let mut delivered = 0;
