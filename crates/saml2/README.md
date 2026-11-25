@@ -11,14 +11,18 @@ The accepted XML Signature URIs are exactly
 `http://www.w3.org/2001/04/xmlenc#sha256`; URI parsing is case-sensitive and
 unsupported algorithms fail closed.
 
-Metadata requires future `validUntil` values on both an `EntitiesDescriptor`
-wrapper and the selected `EntityDescriptor`, a non-blank entity ID, exactly one
+Metadata `validUntil` is optional; when present on the `EntitiesDescriptor`
+wrapper or the selected `EntityDescriptor` it must be in the future. Metadata
+also requires a non-blank entity ID, exactly one
 HTTPS SSO location for the explicitly selected HTTP-POST or HTTP-Redirect request binding,
-and an X.509 signing certificate at the exact
-`KeyDescriptor` → `KeyInfo` → `X509Data` path. Encryption-only, omitted, or
+and an X.509 signing certificate under
+`KeyDescriptor` → `KeyInfo` → `X509Data`. Descriptive `KeyName`, subject,
+issuer-serial, SKI, and CRL hints are ignored. Encryption-only, omitted, or
 unknown key uses, ambiguous endpoints or key containers, remote
-`RetrievalMethod` keys, embedded metadata signatures, XInclude, and XML
-Encryption are rejected; certificate parsing never establishes trust.
+`RetrievalMethod` keys, XInclude, and XML Encryption are rejected.
+`UnverifiedMetadata` ignores an embedded metadata signature: trust comes from
+the caller importing that exact content and from certificate pins, and
+certificate parsing never establishes trust.
 
 Does not own tenant IDs, IdP persistence, metadata fetching, replay stores,
 assertion semantics, RelayState policy, or trust-anchor selection. Unsupported

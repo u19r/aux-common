@@ -407,33 +407,76 @@ impl UnverifiedElement {
         Ok(())
     }
 
+    /// Validate KeyInfo as descriptive key hints only (XMLDSig section 4.4).
+    ///
+    /// Trust comes exclusively from caller-supplied public keys, so the
+    /// certificate and name hints that IdPs add here are accepted and ignored.
+    /// Raw `KeyValue` material and remote `RetrievalMethod` references stay
+    /// rejected so no caller can mistake attacker-supplied keys for trust.
     fn validate_key_info(&self) -> Result<(), XmlSecurityError> {
-        let children = self.child_elements().collect::<Vec<_>>();
-        if children.len() != 1 {
+        let mut has_child = false;
+        for child in self.child_elements() {
+            has_child = true;
+            match ds_name(child) {
+                Some("KeyName") => child.validate_key_info_leaf()?,
+                Some("X509Data") => child.validate_x509_data()?,
+                _ => {
+                    return Err(XmlSecurityError::Signature {
+                        message: "only ds:KeyName and ds:X509Data are accepted in KeyInfo"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+        if !has_child {
             return Err(XmlSecurityError::Signature {
-                message: "KeyInfo must contain exactly one X509Data element".to_string(),
+                message: "KeyInfo must contain at least one key hint".to_string(),
             });
         }
-        for child in children {
-            if child.namespace() != Some(NS_DS) || child.name() != "X509Data" {
+        Ok(())
+    }
+
+    fn validate_x509_data(&self) -> Result<(), XmlSecurityError> {
+        let mut has_child = false;
+        for child in self.child_elements() {
+            has_child = true;
+            match ds_name(child) {
+                Some("X509Certificate" | "X509SubjectName" | "X509SKI" | "X509CRL") => {
+                    child.validate_key_info_leaf()?;
+                }
+                Some("X509IssuerSerial") => child.validate_x509_issuer_serial()?,
+                _ => {
+                    return Err(XmlSecurityError::Signature {
+                        message: "unsupported ds:X509Data child".to_string(),
+                    });
+                }
+            }
+        }
+        if !has_child {
+            return Err(XmlSecurityError::Signature {
+                message: "ds:X509Data must contain at least one child".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_x509_issuer_serial(&self) -> Result<(), XmlSecurityError> {
+        for child in self.child_elements() {
+            if !matches!(ds_name(child), Some("X509IssuerName" | "X509SerialNumber")) {
                 return Err(XmlSecurityError::Signature {
-                    message: "only ds:X509Data is accepted in KeyInfo".to_string(),
+                    message: "unsupported ds:X509IssuerSerial child".to_string(),
                 });
             }
-            let certificates = child.child_elements().collect::<Vec<_>>();
-            if certificates.len() != 1
-                || certificates[0].namespace() != Some(NS_DS)
-                || certificates[0].name() != "X509Certificate"
-            {
-                return Err(XmlSecurityError::Signature {
-                    message: "KeyInfo must contain exactly one ds:X509Certificate".to_string(),
-                });
-            }
-            if certificates[0].child_elements().next().is_some() {
-                return Err(XmlSecurityError::Signature {
-                    message: "ds:X509Certificate must not contain child elements".to_string(),
-                });
-            }
+            child.validate_key_info_leaf()?;
+        }
+        Ok(())
+    }
+
+    fn validate_key_info_leaf(&self) -> Result<(), XmlSecurityError> {
+        if self.child_elements().next().is_some() {
+            return Err(XmlSecurityError::Signature {
+                message: "KeyInfo leaf elements must not contain child elements".to_string(),
+            });
         }
         Ok(())
     }
@@ -657,4 +700,9 @@ impl UnverifiedElement {
         }
         Ok(decoded)
     }
+}
+
+/// The local name of an XML Signature namespace element, or `None` otherwise.
+fn ds_name(element: &UnverifiedElement) -> Option<&str> {
+    (element.namespace() == Some(NS_DS)).then(|| element.name())
 }

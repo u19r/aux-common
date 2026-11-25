@@ -571,7 +571,6 @@ fn given_metadata_with_invalid_root_or_required_fields_when_parsing_then_reject(
             "validUntil=\"2030-01-01T00:00:00Z\"",
             "validUntil=\"not-a-time\"",
         ),
-        valid.replace("validUntil=\"2030-01-01T00:00:00Z\"", ""),
         valid.replace(
             "entityID=\"https://idp.example.test/metadata\"",
             "entityID=\"\"",
@@ -643,13 +642,23 @@ fn given_expired_nested_entity_when_parsing_then_reject_even_with_live_wrapper()
 }
 
 #[test]
-fn given_nested_entity_without_valid_until_when_parsing_then_reject_unbounded_metadata() {
-    let nested = protocol_valid_metadata().replace(" validUntil=\"2030-01-01T00:00:00Z\"", "");
+fn given_metadata_without_valid_until_when_parsing_then_accept_unbounded_validity() {
+    // Given Okta-style metadata with no validUntil, alone and nested in a
+    // wrapper that also omits it.
+    let bare = protocol_valid_metadata().replace(" validUntil=\"2030-01-01T00:00:00Z\"", "");
     let wrapped = format!(
-        r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" validUntil="2030-01-01T00:00:00Z">{nested}</md:EntitiesDescriptor>"#
+        r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata">{bare}</md:EntitiesDescriptor>"#
     );
+    let far_future: Timestamp = "2999-01-01T00:00:00Z".parse().expect("timestamp");
 
-    assert!(UnverifiedMetadata::parse_unverified(&wrapped, NOW).is_err());
+    for xml in [bare, wrapped] {
+        // When parsing at any caller time.
+        let parsed = UnverifiedMetadata::parse_unverified(&xml, far_future)
+            .expect("metadata without validUntil must parse");
+
+        // Then the document is treated as having no expiry of its own.
+        assert_eq!(parsed.entity_id(), "https://idp.example.test/metadata");
+    }
 }
 
 #[test]
@@ -732,7 +741,7 @@ fn given_key_descriptor_without_use_when_parsing_then_reject_ambiguous_key_purpo
 }
 
 #[test]
-fn given_remote_signature_key_or_embedded_signature_when_parsing_then_reject() {
+fn given_remote_signature_key_when_parsing_then_reject() {
     let descriptor = format!(
         r#"<md:KeyDescriptor use="signing"><ds:KeyInfo><ds:RetrievalMethod URI="https://attacker.invalid/key"/><ds:X509Data><ds:X509Certificate>{TEST_CERTIFICATE_DER_B64}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor>"#
     );
@@ -743,12 +752,49 @@ fn given_remote_signature_key_or_embedded_signature_when_parsing_then_reject() {
         "entity",
     );
     assert!(UnverifiedMetadata::parse_unverified(&remote_key_metadata, NOW).is_err());
+}
 
-    let signed_metadata = protocol_valid_metadata().replace(
+#[test]
+fn given_entra_style_signed_metadata_when_parsing_unverified_then_ignore_signature() {
+    // Given federation metadata with an enveloped signature, as Entra ID and
+    // AD FS publish it, plus an unverifiable signature in the same position.
+    let (signed, _) = signed_metadata();
+    let unverifiable = protocol_valid_metadata().replace(
         "><md:IDPSSODescriptor",
         "><ds:Signature/><md:IDPSSODescriptor",
     );
-    assert!(UnverifiedMetadata::parse_unverified(&signed_metadata, NOW).is_err());
+
+    for xml in [signed, unverifiable] {
+        // When the administrator-imported document is parsed.
+        let parsed = UnverifiedMetadata::parse_unverified(&xml, NOW)
+            .expect("signed metadata must parse without signature use");
+
+        // Then the signature is ignored and trust still requires the pins.
+        assert_eq!(parsed.certificates().len(), 1);
+        let unrelated =
+            CertificateTrustPolicy::from_sha256_fingerprints(vec![[7_u8; 32]]).expect("policy");
+        assert_eq!(
+            parsed.validate_trust(&unrelated),
+            Err(SamlError::CertificateNotTrusted)
+        );
+    }
+}
+
+#[test]
+fn given_keycloak_style_key_hints_when_parsing_then_ignore_hints_and_keep_certificate() {
+    // Given KeyInfo that adds KeyName and X509SubjectName hints beside the
+    // certificate.
+    let key_info = format!(
+        r#"<ds:KeyInfo><ds:KeyName>kid-1</ds:KeyName><ds:X509Data><ds:X509SubjectName>CN=idp</ds:X509SubjectName><ds:X509Certificate>{TEST_CERTIFICATE_DER_B64}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"#
+    );
+
+    // When the metadata key is parsed.
+    let parsed = UnverifiedMetadata::parse_unverified(&metadata_with_key_info(&key_info), NOW)
+        .expect("descriptive key hints must be ignored");
+
+    // Then only the certificate is retained.
+    assert_eq!(parsed.certificates().len(), 1);
+    assert!(parsed.warnings().is_empty());
 }
 
 #[test]
@@ -820,7 +866,7 @@ fn given_attacker_certificate_in_unrelated_key_descriptor_child_when_parsing_the
 }
 
 #[test]
-fn given_multiple_x509_data_containers_when_parsing_then_reject_ambiguous_key_material() {
+fn given_multiple_x509_data_containers_when_parsing_then_collect_every_certificate() {
     let descriptor = format!(
         r#"<md:KeyDescriptor use="signing"><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{TEST_CERTIFICATE_DER_B64}</ds:X509Certificate></ds:X509Data><ds:X509Data><ds:X509Certificate>{TEST_CERTIFICATE_DER_B64}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor>"#
     );
@@ -831,7 +877,9 @@ fn given_multiple_x509_data_containers_when_parsing_then_reject_ambiguous_key_ma
         "entity",
     );
 
-    assert!(UnverifiedMetadata::parse_unverified(&metadata, NOW).is_err());
+    let parsed = UnverifiedMetadata::parse_unverified(&metadata, NOW)
+        .expect("each X509Data certificate is retained for pinning");
+    assert_eq!(parsed.certificates().len(), 1);
 }
 
 #[test]

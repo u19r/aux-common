@@ -975,7 +975,7 @@ fn given_empty_or_oversized_trusted_key_when_verifying_then_reject_before_rsa() 
 
 #[test]
 fn given_malformed_key_info_shapes_when_verifying_then_reject_embedded_key_material() {
-    // Given KeyInfo shapes outside the one explicit X509Data/X509Certificate
+    // Given KeyInfo shapes outside the descriptive KeyName/X509Data hint
     // profile.
     let (xml, public_key) = signed_test_document();
     let valid_key_info =
@@ -984,27 +984,32 @@ fn given_malformed_key_info_shapes_when_verifying_then_reject_embedded_key_mater
         (
             "empty key info",
             r#"<ds:KeyInfo/>"#,
-            "KeyInfo must contain exactly one X509Data element",
+            "KeyInfo must contain at least one key hint",
         ),
         (
             "wrong key info child",
             r#"<ds:KeyInfo><Wrong/></ds:KeyInfo>"#,
-            "only ds:X509Data is accepted in KeyInfo",
+            "only ds:KeyName and ds:X509Data are accepted in KeyInfo",
         ),
         (
             "missing certificate",
             r#"<ds:KeyInfo><ds:X509Data/></ds:KeyInfo>"#,
-            "KeyInfo must contain exactly one ds:X509Certificate",
+            "ds:X509Data must contain at least one child",
         ),
         (
-            "multiple certificates",
-            r#"<ds:KeyInfo><ds:X509Data><ds:X509Certificate/><ds:X509Certificate/></ds:X509Data></ds:KeyInfo>"#,
-            "KeyInfo must contain exactly one ds:X509Certificate",
+            "unknown x509 data child",
+            r#"<ds:KeyInfo><ds:X509Data><ds:Unknown/></ds:X509Data></ds:KeyInfo>"#,
+            "unsupported ds:X509Data child",
         ),
         (
             "nested certificate elements",
             r#"<ds:KeyInfo><ds:X509Data><ds:X509Certificate><ds:Nested/></ds:X509Certificate></ds:X509Data></ds:KeyInfo>"#,
-            "ds:X509Certificate must not contain child elements",
+            "KeyInfo leaf elements must not contain child elements",
+        ),
+        (
+            "unknown issuer serial child",
+            r#"<ds:KeyInfo><ds:X509Data><ds:X509IssuerSerial><ds:Unknown/></ds:X509IssuerSerial></ds:X509Data></ds:KeyInfo>"#,
+            "unsupported ds:X509IssuerSerial child",
         ),
     ];
 
@@ -1431,6 +1436,63 @@ fn given_attacker_key_material_or_second_key_info_when_verifying_then_reject() {
     assert!(matches!(
         super::VerifiedXmlDocument::verify_enveloped(&doubled, std::slice::from_ref(&public_key)),
         Err(XmlSecurityError::Signature { .. })
+    ));
+}
+
+#[test]
+fn given_descriptive_key_info_hints_when_verifying_then_ignore_them_and_use_trusted_keys() {
+    // Given KeyInfo hints emitted by common IdPs: Keycloak's KeyName, Google's
+    // X509SubjectName, issuer/serial and SKI hints, and certificate chains.
+    let (xml, public_key) = signed_test_document();
+    let cases = [
+        (
+            "keycloak key name",
+            r#"<ds:KeyInfo><ds:KeyName>kid-1</ds:KeyName><ds:X509Data><ds:X509Certificate>AA==</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"#,
+        ),
+        (
+            "google subject name",
+            r#"<ds:KeyInfo><ds:X509Data><ds:X509SubjectName>ST=California,C=US</ds:X509SubjectName><ds:X509Certificate>AA==</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"#,
+        ),
+        (
+            "issuer serial and ski",
+            r#"<ds:KeyInfo><ds:X509Data><ds:X509IssuerSerial><ds:X509IssuerName>CN=IdP</ds:X509IssuerName><ds:X509SerialNumber>12</ds:X509SerialNumber></ds:X509IssuerSerial><ds:X509SKI>AA==</ds:X509SKI></ds:X509Data></ds:KeyInfo>"#,
+        ),
+        (
+            "certificate chain",
+            r#"<ds:KeyInfo><ds:X509Data><ds:X509Certificate>AA==</ds:X509Certificate><ds:X509Certificate>AQ==</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"#,
+        ),
+        (
+            "key name only",
+            r#"<ds:KeyInfo><ds:KeyName>kid-1</ds:KeyName></ds:KeyInfo>"#,
+        ),
+    ];
+
+    for (label, key_info) in cases {
+        // When the hints accompany a signature made by the trusted key.
+        let candidate = append_to_signature(&xml, key_info);
+        let result = super::VerifiedXmlDocument::verify_enveloped(
+            &candidate,
+            std::slice::from_ref(&public_key),
+        );
+
+        // Then verification succeeds without using the embedded hints.
+        assert!(result.is_ok(), "case {label} was rejected: {result:?}");
+    }
+
+    // When the same hints accompany a document checked against another key.
+    let wrong_key = RsaKeyPair::generate(KeySize::Rsa2048)
+        .expect("generate wrong key")
+        .public_key()
+        .as_der()
+        .expect("encode wrong key")
+        .as_ref()
+        .to_vec();
+    let candidate = append_to_signature(&xml, cases[0].1);
+
+    // Then the embedded certificate never becomes a trust source.
+    assert!(matches!(
+        super::VerifiedXmlDocument::verify_enveloped(&candidate, &[wrong_key]),
+        Err(XmlSecurityError::SignatureVerification)
     ));
 }
 

@@ -137,11 +137,10 @@ impl UnverifiedMetadata {
         now: Timestamp,
         binding: MetadataSsoBinding,
     ) -> Result<Self, SamlError> {
-        if contains_element(root, NS_DS, "Signature") {
-            return Err(SamlError::Unsupported(
-                "signed metadata is not supported without caller verification".to_string(),
-            ));
-        }
+        // Federation metadata (Entra ID, AD FS) carries an enveloped
+        // ds:Signature. This parser never reads it: trust comes from the
+        // administrator importing this exact content and from the caller's
+        // certificate pins, not from the document signature.
         validate_valid_until(root, now, "metadata")?;
         let entity = find_entity_descriptor(root)?;
         if !std::ptr::eq(entity, root) {
@@ -253,9 +252,11 @@ fn validate_valid_until(
     now: Timestamp,
     element_name: &str,
 ) -> Result<(), SamlError> {
-    let valid_until = element
-        .attr("validUntil")
-        .ok_or_else(|| SamlError::InvalidInput(format!("{element_name} validUntil is required")))?;
+    // SAML Metadata 2.3.2 makes validUntil optional; absence means the
+    // document carries no expiry of its own.
+    let Some(valid_until) = element.attr("validUntil") else {
+        return Ok(());
+    };
     if !is_rfc3339_datetime(valid_until) {
         return Err(SamlError::InvalidInput(format!(
             "{element_name} validUntil is invalid"
@@ -266,7 +267,7 @@ fn validate_valid_until(
         .map_err(|_| SamlError::InvalidInput(format!("{element_name} validUntil is invalid")))?;
     if valid_until <= now {
         return Err(SamlError::InvalidInput(format!(
-            "{element_name} metadata is expired"
+            "{element_name} validUntil has passed"
         )));
     }
     Ok(())
@@ -377,65 +378,7 @@ fn extract_certificates(
                 "exactly one ds:KeyInfo is required for a signing KeyDescriptor".to_string(),
             ));
         }
-        let key_info = key_infos[0];
-        let x509_data = key_info
-            .child_elements()
-            .map(|child| {
-                if child.namespace() == Some(NS_DS) && child.name() == "RetrievalMethod" {
-                    return Err(SamlError::Unsupported(
-                        "remote XML Signature key retrieval is not supported".to_string(),
-                    ));
-                }
-                if child.namespace() == Some(NS_DS) && child.name() == "X509Data" {
-                    Ok(child)
-                } else {
-                    Err(SamlError::Unsupported(
-                        "ds:KeyInfo contains an unsupported child".to_string(),
-                    ))
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if x509_data.len() != 1 {
-            return Err(SamlError::InvalidInput(
-                "exactly one ds:X509Data is required for a signing KeyDescriptor".to_string(),
-            ));
-        }
-        let certificates = x509_data[0]
-            .child_elements()
-            .map(|element| {
-                if element.namespace() != Some(NS_DS) || element.name() != "X509Certificate" {
-                    return Err(SamlError::Unsupported(
-                        "ds:X509Data contains an unsupported child".to_string(),
-                    ));
-                }
-                if element.child_elements().next().is_some() {
-                    return Err(SamlError::InvalidInput(
-                        "X509Certificate must contain text only".to_string(),
-                    ));
-                }
-                let text = element
-                    .text_content()
-                    .ok_or_else(|| SamlError::InvalidInput("empty X509Certificate".to_string()))?;
-                let encoded = text.split_whitespace().collect::<String>();
-                let bytes = STANDARD
-                    .decode(encoded)
-                    .map_err(|_| SamlError::InvalidCertificate)?;
-                if bytes.is_empty() || bytes.len() > 64 * 1024 {
-                    return Err(SamlError::InvalidCertificate);
-                }
-                let (remainder, _) =
-                    X509Certificate::from_der(&bytes).map_err(|_| SamlError::InvalidCertificate)?;
-                if !remainder.is_empty() {
-                    return Err(SamlError::InvalidCertificate);
-                }
-                Ok(CertificateDer(bytes))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if certificates.is_empty() {
-            return Err(SamlError::InvalidInput(
-                "at least one X509Certificate is required".to_string(),
-            ));
-        }
+        let certificates = parse_key_info_certificates(key_infos[0])?;
         target.extend(certificates);
     }
     let mut certificates = signing;
@@ -452,9 +395,104 @@ fn extract_certificates(
     Ok(certificates)
 }
 
-fn contains_element(root: &xml_security::UnverifiedElement, namespace: &str, name: &str) -> bool {
-    (root.namespace() == Some(namespace) && root.name() == name)
-        || root
-            .child_elements()
-            .any(|child| contains_element(child, namespace, name))
+/// Collect the certificates in one KeyDescriptor's `ds:KeyInfo`.
+///
+/// Descriptive hints such as Keycloak's `ds:KeyName` or `ds:X509SubjectName`
+/// are ignored (XMLDSig section 4.4); only `ds:X509Certificate` values are
+/// retained, and remote key retrieval stays rejected.
+fn parse_key_info_certificates(
+    key_info: &xml_security::UnverifiedElement,
+) -> Result<Vec<CertificateDer>, SamlError> {
+    let mut certificates = Vec::new();
+    for child in key_info.child_elements() {
+        match ds_name(child) {
+            Some("X509Data") => {
+                for element in child.child_elements() {
+                    match ds_name(element) {
+                        Some("X509Certificate") => certificates.push(parse_certificate(element)?),
+                        Some("X509SubjectName" | "X509SKI" | "X509CRL") => {
+                            ensure_key_hint_leaf(element)?;
+                        }
+                        Some("X509IssuerSerial") => {
+                            for part in element.child_elements() {
+                                if !matches!(
+                                    ds_name(part),
+                                    Some("X509IssuerName" | "X509SerialNumber")
+                                ) {
+                                    return Err(SamlError::Unsupported(
+                                        "ds:X509IssuerSerial contains an unsupported child"
+                                            .to_string(),
+                                    ));
+                                }
+                                ensure_key_hint_leaf(part)?;
+                            }
+                        }
+                        _ => {
+                            return Err(SamlError::Unsupported(
+                                "ds:X509Data contains an unsupported child".to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+            Some("KeyName") => ensure_key_hint_leaf(child)?,
+            Some("RetrievalMethod") => {
+                return Err(SamlError::Unsupported(
+                    "remote XML Signature key retrieval is not supported".to_string(),
+                ));
+            }
+            _ => {
+                return Err(SamlError::Unsupported(
+                    "ds:KeyInfo contains an unsupported child".to_string(),
+                ));
+            }
+        }
+    }
+    if certificates.is_empty() {
+        return Err(SamlError::InvalidInput(
+            "at least one X509Certificate is required".to_string(),
+        ));
+    }
+    Ok(certificates)
+}
+
+fn parse_certificate(
+    element: &xml_security::UnverifiedElement,
+) -> Result<CertificateDer, SamlError> {
+    if element.child_elements().next().is_some() {
+        return Err(SamlError::InvalidInput(
+            "X509Certificate must contain text only".to_string(),
+        ));
+    }
+    let text = element
+        .text_content()
+        .ok_or_else(|| SamlError::InvalidInput("empty X509Certificate".to_string()))?;
+    let encoded = text.split_whitespace().collect::<String>();
+    let bytes = STANDARD
+        .decode(encoded)
+        .map_err(|_| SamlError::InvalidCertificate)?;
+    if bytes.is_empty() || bytes.len() > 64 * 1024 {
+        return Err(SamlError::InvalidCertificate);
+    }
+    let (remainder, _) =
+        X509Certificate::from_der(&bytes).map_err(|_| SamlError::InvalidCertificate)?;
+    if !remainder.is_empty() {
+        return Err(SamlError::InvalidCertificate);
+    }
+    Ok(CertificateDer(bytes))
+}
+
+/// Ignored hints still must be text-only so nested key material cannot hide
+/// inside them.
+fn ensure_key_hint_leaf(element: &xml_security::UnverifiedElement) -> Result<(), SamlError> {
+    if element.child_elements().next().is_some() {
+        return Err(SamlError::Unsupported(
+            "ds:KeyInfo hints must contain text only".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn ds_name(element: &xml_security::UnverifiedElement) -> Option<&str> {
+    (element.namespace() == Some(NS_DS)).then(|| element.name())
 }
